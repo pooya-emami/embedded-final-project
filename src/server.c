@@ -1,0 +1,242 @@
+#include <microhttpd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <pthread.h>
+
+#define PORT_HTTP 8080
+#define PORT_HTTPS 8443
+
+#define HTML_PATH "../html/template.html"
+
+// Shared MJPEG buffer (filled by your relay process)
+#define FRAME_BUF_SIZE 65536
+static unsigned char frame_buffer[FRAME_BUF_SIZE];
+static size_t frame_size = 0;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+
+// ---------- Telemetry ----------
+
+float read_cpu_temp() {
+    FILE *fp = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+    if (!fp) return -1;
+    int temp;
+    fscanf(fp, "%d", &temp);
+    fclose(fp);
+    return temp / 1000.0;
+}
+
+long read_free_mem() {
+    FILE *fp = fopen("/proc/meminfo", "r");
+    if (!fp) return -1;
+    char key[32];
+    long value;
+    while (fscanf(fp, "%s %ld", key, &value) != EOF) {
+        if (strcmp(key, "MemAvailable:") == 0) {
+            fclose(fp);
+            return value;
+        }
+    }
+    fclose(fp);
+    return -1;
+}
+
+float read_cpu_load() {
+    FILE *fp = fopen("/proc/stat", "r");
+    if (!fp) return -1;
+
+    long user, nice, system, idle;
+    fscanf(fp, "cpu %ld %ld %ld %ld", &user, &nice, &system, &idle);
+    fclose(fp);
+
+    static long prev_total = 0, prev_idle = 0;
+    long total = user + nice + system + idle;
+
+    long diff_total = total - prev_total;
+    long diff_idle  = idle - prev_idle;
+
+    prev_total = total;
+    prev_idle = idle;
+
+    if (diff_total == 0) return 0;
+    return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
+}
+
+// ---------- HTML loader ----------
+
+char *load_html_template() {
+    FILE *fp = fopen(HTML_PATH, "r");
+    if (!fp) {
+        fprintf(stderr, "Failed to open HTML template: %s\n", HTML_PATH);
+        return NULL;
+    }
+    fseek(fp, 0, SEEK_END);
+    long len = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+
+    char *buf = malloc(len + 1);
+    if (!buf) {
+        fclose(fp);
+        return NULL;
+    }
+    fread(buf, 1, len, fp);
+    buf[len] = '\0';
+    fclose(fp);
+    return buf;
+}
+
+// ---------- MJPEG callback ----------
+
+static ssize_t mjpeg_callback(void *cls, uint64_t pos,
+                              char *buf, size_t max)
+{
+    (void)cls;
+    (void)pos;
+
+    pthread_mutex_lock(&lock);
+
+    size_t n = frame_size;
+    if (n > max) n = max;
+
+    if (n > 0)
+        memcpy(buf, frame_buffer, n);
+
+    pthread_mutex_unlock(&lock);
+
+    return n;
+}
+
+// ---------- Handler ----------
+
+int handler(void *cls, struct MHD_Connection *conn,
+            const char *url, const char *method,
+            const char *version, const char *upload_data,
+            size_t *upload_data_size, void **ptr)
+{
+    (void)cls;
+    (void)method;
+    (void)version;
+    (void)upload_data;
+    (void)upload_data_size;
+    (void)ptr;
+
+    // HTTP → HTTPS redirect (for plain HTTP daemon)
+    if (strcmp(url, "/") == 0 && PORT_HTTP == 8080) {
+        const char *redir_html =
+            "<html><head><meta http-equiv='refresh' "
+            "content='0;url=https://localhost:8443/'/></head></html>";
+
+        struct MHD_Response *resp =
+            MHD_create_response_from_buffer(strlen(redir_html),
+                                            (void*)redir_html,
+                                            MHD_RESPMEM_PERSISTENT);
+
+        MHD_add_response_header(resp, "Location", "https://localhost:8443/");
+        return MHD_queue_response(conn, MHD_HTTP_MOVED_PERMANENTLY, resp);
+    }
+
+    // HTTPS dashboard
+    if (strcmp(url, "/") == 0) {
+        char *html = load_html_template();
+        if (!html) {
+            const char *err = "<html><body>Template error</body></html>";
+            struct MHD_Response *resp =
+                MHD_create_response_from_buffer(strlen(err),
+                                                (void*)err,
+                                                MHD_RESPMEM_PERSISTENT);
+            return MHD_queue_response(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, resp);
+        }
+
+        struct MHD_Response *resp =
+            MHD_create_response_from_buffer(strlen(html),
+                                            html,
+                                            MHD_RESPMEM_MUST_FREE);
+        return MHD_queue_response(conn, MHD_HTTP_OK, resp);
+    }
+
+    // Telemetry JSON
+    if (strcmp(url, "/telemetry") == 0) {
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}",
+                 read_cpu_temp(), read_free_mem(), read_cpu_load());
+
+        struct MHD_Response *resp =
+            MHD_create_response_from_buffer(strlen(buf),
+                                            buf,
+                                            MHD_RESPMEM_MUST_COPY);
+        MHD_add_response_header(resp, "Content-Type", "application/json");
+        return MHD_queue_response(conn, MHD_HTTP_OK, resp);
+    }
+
+    // MJPEG stream
+    if (strcmp(url, "/stream") == 0) {
+        struct MHD_Response *resp =
+            MHD_create_response_from_callback(
+                MHD_SIZE_UNKNOWN,
+                4096,
+                &mjpeg_callback,
+                NULL,
+                NULL);
+
+        MHD_add_response_header(resp, "Content-Type",
+            "multipart/x-mixed-replace; boundary=frame");
+
+        return MHD_queue_response(conn, MHD_HTTP_OK, resp);
+    }
+
+    // 404
+    struct MHD_Response *resp =
+        MHD_create_response_from_buffer(0, "", MHD_RESPMEM_PERSISTENT);
+    return MHD_queue_response(conn, MHD_HTTP_NOT_FOUND, resp);
+}
+
+// ---------- main ----------
+
+int main() {
+    // Load SSL certs
+    FILE *fkey = fopen("key.pem", "rb");
+    FILE *fcert = fopen("cert.pem", "rb");
+    if (!fkey || !fcert) {
+        fprintf(stderr, "Missing SSL cert.pem/key.pem\n");
+        return 1;
+    }
+
+    fseek(fkey, 0, SEEK_END);
+    size_t key_len = ftell(fkey);
+    fseek(fkey, 0, SEEK_SET);
+    char *key_buf = malloc(key_len);
+    fread(key_buf, 1, key_len, fkey);
+
+    fseek(fcert, 0, SEEK_END);
+    size_t cert_len = ftell(fcert);
+    fseek(fcert, 0, SEEK_SET);
+    char *cert_buf = malloc(cert_len);
+    fread(cert_buf, 1, cert_len, fcert);
+
+    fclose(fkey);
+    fclose(fcert);
+
+    struct MHD_Daemon *daemon =
+        MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_SSL,
+                         PORT_HTTPS,
+                         NULL, NULL,
+                         &handler, NULL,
+                         MHD_OPTION_HTTPS_MEM_KEY, key_buf,
+                         MHD_OPTION_HTTPS_MEM_CERT, cert_buf,
+                         MHD_OPTION_END);
+
+    if (!daemon) {
+        fprintf(stderr, "Failed to start HTTPS server\n");
+        return 1;
+    }
+
+    printf("HTTPS server running on port %d\n", PORT_HTTPS);
+    getchar();
+    MHD_stop_daemon(daemon);
+
+    free(key_buf);
+    free(cert_buf);
+    return 0;
+}
