@@ -5,13 +5,9 @@
 #include <unistd.h>
 #include <pthread.h>
 
-#define PORT_HTTP 8080
-#define PORT_HTTPS 8443
-
-#define HTML_PATH "../html/template.html"
+#include "server.h"
 
 // Shared MJPEG buffer (filled by your relay process)
-#define FRAME_BUF_SIZE 65536
 static unsigned char frame_buffer[FRAME_BUF_SIZE];
 static size_t frame_size = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
@@ -88,8 +84,8 @@ char *load_html_template() {
 
 // ---------- MJPEG callback ----------
 
-static ssize_t mjpeg_callback(void *cls, uint64_t pos,
-                              char *buf, size_t max)
+ssize_t mjpeg_callback(void *cls, uint64_t pos,
+                        char *buf, size_t max)
 {
     (void)cls;
     (void)pos;

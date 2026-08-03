@@ -5,10 +5,9 @@
 #include <arpa/inet.h>
 #include <pthread.h>
 
-#define PORT 9000
-#define BUF_SIZE 65536
+#include "mjpeg_relay.h"
 
-static unsigned char frame_buffer[BUF_SIZE];
+static unsigned char frame_buffer[RELAY_BUF_SIZE];
 static size_t frame_size = 0;
 pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
@@ -27,15 +26,15 @@ void *receiver_thread(void *arg) {
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
-    addr.sin_port = htons(PORT);
+    addr.sin_port = htons(RELAY_PORT);
 
     bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
     listen(server_fd, 1);
 
-    printf("MJPEG relay listening on port %d\n", PORT);
+    printf("MJPEG relay listening on port %d\n", RELAY_PORT);
 
-    unsigned char buf[BUF_SIZE];
-    unsigned char jpeg[BUF_SIZE];
+    unsigned char buf[RELAY_BUF_SIZE];
+    unsigned char jpeg[RELAY_BUF_SIZE];
     size_t jpeg_len = 0;
 
     while (1) {
@@ -43,7 +42,7 @@ void *receiver_thread(void *arg) {
         printf("Client connected\n");
 
         while (1) {
-            ssize_t n = read(client_fd, buf, BUF_SIZE);
+            ssize_t n = read(client_fd, buf, RELAY_BUF_SIZE);
             if (n <= 0) break;
 
             int soi = find_marker(buf, n, 0xFF, 0xD8);
@@ -53,7 +52,7 @@ void *receiver_thread(void *arg) {
                 jpeg_len = 0;
             }
 
-            if (jpeg_len + n < BUF_SIZE) {
+            if (jpeg_len + n < RELAY_BUF_SIZE) {
                 memcpy(jpeg + jpeg_len, buf, n);
                 jpeg_len += n;
             }
