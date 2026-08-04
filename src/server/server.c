@@ -7,12 +7,9 @@
 
 #include "server.h"
 
-// Shared MJPEG buffer (filled by your relay process)
 static unsigned char frame_buffer[FRAME_BUF_SIZE];
 static size_t frame_size = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-
-// ---------- Telemetry ----------
 
 float read_cpu_temp() {
     FILE *fp = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
@@ -59,8 +56,6 @@ float read_cpu_load() {
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
-// ---------- HTML loader ----------
-
 char *load_html_template() {
     FILE *fp = fopen(HTML_PATH, "r");
     if (!fp) {
@@ -82,8 +77,6 @@ char *load_html_template() {
     return buf;
 }
 
-// ---------- MJPEG callback ----------
-
 ssize_t mjpeg_callback(void *cls, uint64_t pos,
                         char *buf, size_t max)
 {
@@ -103,8 +96,6 @@ ssize_t mjpeg_callback(void *cls, uint64_t pos,
     return n;
 }
 
-// ---------- Handler ----------
-
 int handler(void *cls, struct MHD_Connection *conn,
             const char *url, const char *method,
             const char *version, const char *upload_data,
@@ -117,7 +108,7 @@ int handler(void *cls, struct MHD_Connection *conn,
     (void)upload_data_size;
     (void)ptr;
 
-    // HTTP → HTTPS redirect (for plain HTTP daemon)
+    // HTTP → HTTPS redirect
     if (strcmp(url, "/") == 0 && PORT_HTTP == 8080) {
         const char *redir_html =
             "<html><head><meta http-equiv='refresh' "
@@ -187,8 +178,6 @@ int handler(void *cls, struct MHD_Connection *conn,
         MHD_create_response_from_buffer(0, "", MHD_RESPMEM_PERSISTENT);
     return MHD_queue_response(conn, MHD_HTTP_NOT_FOUND, resp);
 }
-
-// ---------- main ----------
 
 int main() {
     // Load SSL certs
