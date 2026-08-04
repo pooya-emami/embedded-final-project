@@ -3,6 +3,7 @@
 #include <unistd.h>
 #include <string.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
 #include <pthread.h>
 
 #include "mjpeg_relay.h"
@@ -24,12 +25,31 @@ void *receiver_thread(void *arg) {
     struct sockaddr_in addr;
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket");
+        return NULL;
+    }
+
+    // Allow immediate re-bind after restart (avoids "Address already in use"
+    // from a socket still in TIME_WAIT after a previous run).
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
     addr.sin_port = htons(RELAY_PORT);
 
-    bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
-    listen(server_fd, 1);
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        close(server_fd);
+        return NULL;
+    }
+
+    if (listen(server_fd, 1) < 0) {
+        perror("listen");
+        close(server_fd);
+        return NULL;
+    }
 
     printf("MJPEG relay listening on port %d\n", RELAY_PORT);
 
