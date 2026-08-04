@@ -1,8 +1,8 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -std=gnu11
-LDFLAGS = -lpthread
+CFLAGS = -Wall -Wextra -O2 -std=gnu11 -I. -I../common
+LDFLAGS = -lpthread -lrt
 
-SRC = $(wildcard *.c)
+SRC = $(wildcard *.c) ../common/shared_frame.c
 OBJ = $(SRC:.c=.o)
 TARGET = mjpeg_relay
 

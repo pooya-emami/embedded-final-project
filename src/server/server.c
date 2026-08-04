@@ -6,10 +6,12 @@
 #include <pthread.h>
 
 #include "server.h"
+#include "shared_frame.h"
 
-static unsigned char frame_buffer[FRAME_BUF_SIZE];
-static size_t frame_size = 0;
-static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+// MJPEG frame buffer, shared with the relay process over POSIX shm.
+static shared_frame_t *g_frame;
+
+// ---------- Telemetry ----------
 
 float read_cpu_temp() {
     FILE *fp = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
@@ -56,6 +58,8 @@ float read_cpu_load() {
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
+// ---------- HTML loader ----------
+
 char *load_html_template() {
     FILE *fp = fopen(HTML_PATH, "r");
     if (!fp) {
@@ -77,24 +81,18 @@ char *load_html_template() {
     return buf;
 }
 
+// ---------- MJPEG callback ----------
+
 ssize_t mjpeg_callback(void *cls, uint64_t pos,
                         char *buf, size_t max)
 {
     (void)cls;
     (void)pos;
 
-    pthread_mutex_lock(&lock);
-
-    size_t n = frame_size;
-    if (n > max) n = max;
-
-    if (n > 0)
-        memcpy(buf, frame_buffer, n);
-
-    pthread_mutex_unlock(&lock);
-
-    return n;
+    return shared_frame_read(g_frame, (unsigned char *)buf, max);
 }
+
+// ---------- Handler ----------
 
 int handler(void *cls, struct MHD_Connection *conn,
             const char *url, const char *method,
@@ -108,7 +106,7 @@ int handler(void *cls, struct MHD_Connection *conn,
     (void)upload_data_size;
     (void)ptr;
 
-    // HTTP → HTTPS redirect
+    // HTTP → HTTPS redirect (for plain HTTP daemon)
     if (strcmp(url, "/") == 0 && PORT_HTTP == 8080) {
         const char *redir_html =
             "<html><head><meta http-equiv='refresh' "
@@ -179,7 +177,17 @@ int handler(void *cls, struct MHD_Connection *conn,
     return MHD_queue_response(conn, MHD_HTTP_NOT_FOUND, resp);
 }
 
+// ---------- main ----------
+
 int main() {
+    // Attach to the shared frame buffer. Works whether mjpeg_relay
+    // started first or not -- shared_frame_open() creates it if needed.
+    g_frame = shared_frame_open();
+    if (!g_frame) {
+        fprintf(stderr, "Failed to open shared frame buffer\n");
+        return 1;
+    }
+
     // Load SSL certs
     FILE *fkey = fopen("key.pem", "rb");
     FILE *fcert = fopen("cert.pem", "rb");

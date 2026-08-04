@@ -7,10 +7,9 @@
 #include <pthread.h>
 
 #include "mjpeg_relay.h"
+#include "shared_frame.h"
 
-static unsigned char frame_buffer[RELAY_BUF_SIZE];
-static size_t frame_size = 0;
-pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static shared_frame_t *g_frame;
 
 int find_marker(const unsigned char *buf, size_t len, unsigned char m1, unsigned char m2) {
     for (size_t i = 0; i + 1 < len; i++) {
@@ -21,6 +20,7 @@ int find_marker(const unsigned char *buf, size_t len, unsigned char m1, unsigned
 }
 
 void *receiver_thread(void *arg) {
+    (void)arg;
     int server_fd, client_fd;
     struct sockaddr_in addr;
 
@@ -78,11 +78,7 @@ void *receiver_thread(void *arg) {
             }
 
             if (eoi >= 0 && jpeg_len > 0) {
-                pthread_mutex_lock(&lock);
-                memcpy(frame_buffer, jpeg, jpeg_len);
-                frame_size = jpeg_len;
-                pthread_mutex_unlock(&lock);
-
+                shared_frame_write(g_frame, jpeg, jpeg_len);
                 jpeg_len = 0;
             }
         }
@@ -95,6 +91,12 @@ void *receiver_thread(void *arg) {
 }
 
 int main() {
+    g_frame = shared_frame_open();
+    if (!g_frame) {
+        fprintf(stderr, "Failed to open shared frame buffer\n");
+        return 1;
+    }
+
     pthread_t tid;
     pthread_create(&tid, NULL, receiver_thread, NULL);
     pthread_join(tid, NULL);
