@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -std=gnu11 -I. -I../common
-LDFLAGS = -lmicrohttpd -lssl -lcrypto -lsqlite3 -lmosquitto -lpthread -lrt
+LDFLAGS = -lmicrohttpd -lrt
 
 SRC = $(wildcard *.c) ../common/shared_frame.c
 OBJ = $(SRC:.c=.o)
