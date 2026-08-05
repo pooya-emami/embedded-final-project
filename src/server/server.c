@@ -10,58 +10,19 @@
 #include "server.h"
 #include "shared_frame.h"
 
+#define PORT 8080
+#define BUFFER_SIZE 65536
+#define TEMPLATE_PATH "../html/template.html"
+
 static shared_frame_t *g_frame;
 static unsigned char cached_frame[BUFFER_SIZE];
 static size_t cached_len = 0;
 static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile int running = 1;
 
-/* ---------- Telemetry ---------- */
-float read_cpu_temp(void) {
-    FILE *fp = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
-    if (!fp) return -1;
-    int temp;
-    fscanf(fp, "%d", &temp);
-    fclose(fp);
-    return temp / 1000.0;
-}
-
-long read_free_mem(void) {
-    FILE *fp = fopen("/proc/meminfo", "r");
-    if (!fp) return -1;
-    char key[32];
-    long value;
-    while (fscanf(fp, "%s %ld", key, &value) != EOF) {
-        if (strcmp(key, "MemAvailable:") == 0) {
-            fclose(fp);
-            return value;
-        }
-    }
-    fclose(fp);
-    return -1;
-}
-
-float read_cpu_load(void) {
-    FILE *fp = fopen("/proc/stat", "r");
-    if (!fp) return -1;
-    long user, nice, system, idle;
-    fscanf(fp, "cpu %ld %ld %ld %ld", &user, &nice, &system, &idle);
-    fclose(fp);
-
-    static long prev_total = 0, prev_idle = 0;
-    long total = user + nice + system + idle;
-    long diff_total = total - prev_total;
-    long diff_idle = idle - prev_idle;
-    prev_total = total;
-    prev_idle = idle;
-
-    if (diff_total == 0) return 0;
-    return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
-}
-
 /* ---------- Load HTML template ---------- */
-char *load_html_template(void) {
-    FILE *fp = fopen(HTML_PATH, "r");
+char *load_template(void) {
+    FILE *fp = fopen(TEMPLATE_PATH, "r");
     if (!fp) return NULL;
 
     fseek(fp, 0, SEEK_END);
@@ -69,14 +30,27 @@ char *load_html_template(void) {
     fseek(fp, 0, SEEK_SET);
 
     char *buf = malloc(len + 1);
-    if (!buf) {
-        fclose(fp);
-        return NULL;
-    }
     fread(buf, 1, len, fp);
     buf[len] = '\0';
     fclose(fp);
     return buf;
+}
+
+/* ---------- Frame updater thread ---------- */
+void *frame_updater(void *arg) {
+    (void)arg;
+    while (running) {
+        unsigned char buf[BUFFER_SIZE];
+        size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
+        if (len > 0) {
+            pthread_mutex_lock(&cache_mutex);
+            memcpy(cached_frame, buf, len);
+            cached_len = len;
+            pthread_mutex_unlock(&cache_mutex);
+        }
+        usleep(50000); // ~20 FPS
+    }
+    return NULL;
 }
 
 /* ---------- HTTP response ---------- */
@@ -100,7 +74,7 @@ void send_response(int client_fd, const char *status, const char *content_type,
 
 /* ---------- Send HTML page ---------- */
 void send_html(int client_fd) {
-    char *html = load_html_template();
+    char *html = load_template();
     if (!html) {
         const char *err = "Template load error";
         send_response(client_fd, "500 Internal Server Error", "text/plain",
@@ -112,49 +86,93 @@ void send_html(int client_fd) {
     free(html);
 }
 
-/* ---------- Send JPEG frame ---------- */
+/* ---------- Send JPEG frame (with retry) ---------- */
 void send_frame(int client_fd) {
-    pthread_mutex_lock(&cache_mutex);
-    if (cached_len == 0) {
+    unsigned char buffer[BUFFER_SIZE];
+    size_t len = 0;
+    int retries = 20; // Try 20 times (200ms total)
+    
+    // Try to get a frame, retry if empty
+    while (retries > 0) {
+        pthread_mutex_lock(&cache_mutex);
+        if (cached_len > 0) {
+            len = cached_len;
+            memcpy(buffer, cached_frame, len);
+            pthread_mutex_unlock(&cache_mutex);
+            break;
+        }
         pthread_mutex_unlock(&cache_mutex);
+        usleep(10000); // Wait 10ms
+        retries--;
+    }
+    
+    if (len == 0) {
         send_response(client_fd, "404 Not Found", "text/plain", "No frame", 8);
         return;
     }
 
-    unsigned char *copy = malloc(cached_len);
-    memcpy(copy, cached_frame, cached_len);
-    size_t len = cached_len;
-    pthread_mutex_unlock(&cache_mutex);
+    // Verify it's a valid JPEG
+    if (buffer[0] != 0xFF || buffer[1] != 0xD8) {
+        send_response(client_fd, "500 Internal Server Error", "text/plain", "Invalid JPEG", 12);
+        return;
+    }
 
+    unsigned char *copy = malloc(len);
+    memcpy(copy, buffer, len);
     send_response(client_fd, "200 OK", "image/jpeg", copy, len);
     free(copy);
 }
 
-/* ---------- Send telemetry ---------- */
+/* ---------- Telemetry ---------- */
 void send_telemetry(int client_fd) {
+    float temp = -1, cpu = 0;
+    long mem = -1;
+
+    FILE *fp = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+    if (fp) {
+        int t;
+        fscanf(fp, "%d", &t);
+        temp = t / 1000.0;
+        fclose(fp);
+    }
+
+    fp = fopen("/proc/meminfo", "r");
+    if (fp) {
+        char key[32];
+        long value;
+        while (fscanf(fp, "%s %ld", key, &value) != EOF) {
+            if (strcmp(key, "MemAvailable:") == 0) {
+                mem = value;
+                break;
+            }
+        }
+        fclose(fp);
+    }
+
+    fp = fopen("/proc/stat", "r");
+    if (fp) {
+        long user, nice, system, idle;
+        fscanf(fp, "cpu %ld %ld %ld %ld", &user, &nice, &system, &idle);
+        fclose(fp);
+
+        static long prev_total = 0, prev_idle = 0;
+        long total = user + nice + system + idle;
+        long diff_total = total - prev_total;
+        long diff_idle = idle - prev_idle;
+
+        prev_total = total;
+        prev_idle = idle;
+
+        if (diff_total > 0)
+            cpu = (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
+    }
+
     char buf[256];
     snprintf(buf, sizeof(buf),
         "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}",
-        read_cpu_temp(), read_free_mem(), read_cpu_load());
+        temp, mem, cpu);
 
     send_response(client_fd, "200 OK", "application/json", buf, strlen(buf));
-}
-
-/* ---------- Frame updater thread ---------- */
-void *frame_updater(void *arg) {
-    (void)arg;
-    while (running) {
-        unsigned char buf[BUFFER_SIZE];
-        size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
-        if (len > 0) {
-            pthread_mutex_lock(&cache_mutex);
-            memcpy(cached_frame, buf, len);
-            cached_len = len;
-            pthread_mutex_unlock(&cache_mutex);
-        }
-        usleep(50000); // ~20 FPS
-    }
-    return NULL;
 }
 
 /* ---------- Main server loop ---------- */
@@ -172,32 +190,20 @@ int main() {
     pthread_create(&updater, NULL, frame_updater, NULL);
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        perror("socket");
-        return 1;
-    }
-
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
-        .sin_port = htons(PORT_HTTP)
+        .sin_port = htons(PORT)
     };
 
-    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        perror("bind");
-        return 1;
-    }
+    bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
+    listen(server_fd, 10);
 
-    if (listen(server_fd, 10) < 0) {
-        perror("listen");
-        return 1;
-    }
-
-    printf("HTTP server running on port %d\n", PORT_HTTP);
-    printf("Open: http://192.168.137.100:%d/\n", PORT_HTTP);
+    printf("HTTP server running on port %d\n", PORT);
+    printf("Open: http://192.168.137.100:%d/\n", PORT);
     printf("Press Ctrl+C to stop\n");
 
     while (running) {
@@ -228,6 +234,5 @@ int main() {
     }
 
     close(server_fd);
-    printf("Server stopped\n");
     return 0;
 }
