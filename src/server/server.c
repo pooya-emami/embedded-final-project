@@ -7,28 +7,23 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
-#include "server.h"
 #include "shared_frame.h"
 
 #define PORT 8080
 #define BUFFER_SIZE 65536
-#define TEMPLATE_PATH "../html/template.html"
+#define HTML_PATH "../html/template.html"
 
 static shared_frame_t *g_frame;
-static unsigned char cached_frame[BUFFER_SIZE];
-static size_t cached_len = 0;
-static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
-static volatile int running = 1;
+static unsigned char current_frame[BUFFER_SIZE];
+static size_t current_len = 0;
+static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-/* ---------- Load HTML template ---------- */
-char *load_template(void) {
-    FILE *fp = fopen(TEMPLATE_PATH, "r");
+char *load_html() {
+    FILE *fp = fopen(HTML_PATH, "r");
     if (!fp) return NULL;
-
     fseek(fp, 0, SEEK_END);
     long len = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-
     char *buf = malloc(len + 1);
     fread(buf, 1, len, fp);
     buf[len] = '\0';
@@ -36,203 +31,138 @@ char *load_template(void) {
     return buf;
 }
 
-/* ---------- Frame updater thread ---------- */
 void *frame_updater(void *arg) {
     (void)arg;
-    while (running) {
+    while (1) {
         unsigned char buf[BUFFER_SIZE];
         size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
-        if (len > 0) {
-            pthread_mutex_lock(&cache_mutex);
-            memcpy(cached_frame, buf, len);
-            cached_len = len;
-            pthread_mutex_unlock(&cache_mutex);
+        if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
+            pthread_mutex_lock(&frame_mutex);
+            memcpy(current_frame, buf, len);
+            current_len = len;
+            pthread_mutex_unlock(&frame_mutex);
         }
-        usleep(50000); // ~20 FPS
+        usleep(50000);
     }
     return NULL;
 }
 
-/* ---------- HTTP response ---------- */
-void send_response(int client_fd, const char *status, const char *content_type,
-                   const void *data, size_t data_len) {
-    char header[512];
-    int header_len = snprintf(header, sizeof(header),
+void send_response(int fd, const char *status, const char *type, const void *data, size_t len) {
+    char header[256];
+    snprintf(header, sizeof(header),
         "HTTP/1.1 %s\r\n"
         "Content-Type: %s\r\n"
         "Content-Length: %zu\r\n"
         "Connection: close\r\n"
         "Cache-Control: no-cache\r\n"
         "\r\n",
-        status, content_type, data_len);
-
-    send(client_fd, header, header_len, 0);
-    if (data && data_len > 0) {
-        send(client_fd, data, data_len, 0);
-    }
+        status, type, len);
+    send(fd, header, strlen(header), 0);
+    if (data && len > 0) send(fd, data, len, 0);
 }
 
-/* ---------- Send HTML page ---------- */
-void send_html(int client_fd) {
-    char *html = load_template();
-    if (!html) {
-        const char *err = "Template load error";
-        send_response(client_fd, "500 Internal Server Error", "text/plain",
-                      err, strlen(err));
-        return;
-    }
-
-    send_response(client_fd, "200 OK", "text/html", html, strlen(html));
-    free(html);
-}
-
-/* ---------- Send JPEG frame (with retry) ---------- */
-void send_frame(int client_fd) {
-    unsigned char buffer[BUFFER_SIZE];
-    size_t len = 0;
-    int retries = 20; // Try 20 times (200ms total)
+void handle_request(int fd) {
+    char req[1024];
+    int n = read(fd, req, sizeof(req) - 1);
+    if (n <= 0) { close(fd); return; }
+    req[n] = '\0';
     
-    // Try to get a frame, retry if empty
-    while (retries > 0) {
-        pthread_mutex_lock(&cache_mutex);
-        if (cached_len > 0) {
-            len = cached_len;
-            memcpy(buffer, cached_frame, len);
-            pthread_mutex_unlock(&cache_mutex);
-            break;
-        }
-        pthread_mutex_unlock(&cache_mutex);
-        usleep(10000); // Wait 10ms
-        retries--;
-    }
+    char path[256];
+    sscanf(req, "%*s %255s", path);
     
-    if (len == 0) {
-        send_response(client_fd, "404 Not Found", "text/plain", "No frame", 8);
-        return;
-    }
-
-    // Verify it's a valid JPEG
-    if (buffer[0] != 0xFF || buffer[1] != 0xD8) {
-        send_response(client_fd, "500 Internal Server Error", "text/plain", "Invalid JPEG", 12);
-        return;
-    }
-
-    unsigned char *copy = malloc(len);
-    memcpy(copy, buffer, len);
-    send_response(client_fd, "200 OK", "image/jpeg", copy, len);
-    free(copy);
-}
-
-/* ---------- Telemetry ---------- */
-void send_telemetry(int client_fd) {
-    float temp = -1, cpu = 0;
-    long mem = -1;
-
-    FILE *fp = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
-    if (fp) {
-        int t;
-        fscanf(fp, "%d", &t);
-        temp = t / 1000.0;
-        fclose(fp);
-    }
-
-    fp = fopen("/proc/meminfo", "r");
-    if (fp) {
-        char key[32];
-        long value;
-        while (fscanf(fp, "%s %ld", key, &value) != EOF) {
-            if (strcmp(key, "MemAvailable:") == 0) {
-                mem = value;
-                break;
-            }
+    // Remove query string (?t=12345)
+    char *q = strchr(path, '?');
+    if (q) *q = '\0';
+    
+    // HTML page
+    if (strcmp(path, "/") == 0) {
+        char *html = load_html();
+        if (!html) {
+            send_response(fd, "500 Error", "text/plain", "Template error", 14);
+        } else {
+            send_response(fd, "200 OK", "text/html", html, strlen(html));
+            free(html);
         }
-        fclose(fp);
     }
-
-    fp = fopen("/proc/stat", "r");
-    if (fp) {
-        long user, nice, system, idle;
-        fscanf(fp, "cpu %ld %ld %ld %ld", &user, &nice, &system, &idle);
-        fclose(fp);
-
-        static long prev_total = 0, prev_idle = 0;
-        long total = user + nice + system + idle;
-        long diff_total = total - prev_total;
-        long diff_idle = idle - prev_idle;
-
-        prev_total = total;
-        prev_idle = idle;
-
-        if (diff_total > 0)
-            cpu = (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
+    // Frame (for /frame)
+    else if (strcmp(path, "/frame") == 0) {
+        pthread_mutex_lock(&frame_mutex);
+        if (current_len == 0) {
+            pthread_mutex_unlock(&frame_mutex);
+            send_response(fd, "404 Not Found", "text/plain", "No frame", 8);
+        } else {
+            unsigned char *copy = malloc(current_len);
+            memcpy(copy, current_frame, current_len);
+            size_t len = current_len;
+            pthread_mutex_unlock(&frame_mutex);
+            send_response(fd, "200 OK", "image/jpeg", copy, len);
+            free(copy);
+        }
     }
-
-    char buf[256];
-    snprintf(buf, sizeof(buf),
-        "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}",
-        temp, mem, cpu);
-
-    send_response(client_fd, "200 OK", "application/json", buf, strlen(buf));
+    // Stream (for /stream)
+    else if (strcmp(path, "/stream") == 0) {
+        pthread_mutex_lock(&frame_mutex);
+        if (current_len == 0) {
+            pthread_mutex_unlock(&frame_mutex);
+            send_response(fd, "404 Not Found", "text/plain", "No frame", 8);
+        } else {
+            unsigned char *copy = malloc(current_len);
+            memcpy(copy, current_frame, current_len);
+            size_t len = current_len;
+            pthread_mutex_unlock(&frame_mutex);
+            send_response(fd, "200 OK", "image/jpeg", copy, len);
+            free(copy);
+        }
+    }
+    // Telemetry
+    else if (strcmp(path, "/telemetry") == 0) {
+        float temp = -1;
+        FILE *f = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+        if (f) { int t; fscanf(f, "%d", &t); temp = t/1000.0; fclose(f); }
+        
+        long mem = -1;
+        f = fopen("/proc/meminfo", "r");
+        if (f) { char k[32]; long v; while(fscanf(f, "%s %ld", k, &v)!=EOF){if(strcmp(k,"MemAvailable:")==0){mem=v;break;}} fclose(f); }
+        
+        float cpu = 0;
+        f = fopen("/proc/stat", "r");
+        if (f) { long u,n,s,i; fscanf(f, "cpu %ld %ld %ld %ld", &u,&n,&s,&i); fclose(f); static long pt=0,pi=0; long t=u+n+s+i; long dt=t-pt, di=i-pi; pt=t; pi=i; if(dt>0) cpu=(1.0f-((float)di/dt))*100.0f; }
+        
+        char buf[256];
+        snprintf(buf, sizeof(buf), "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}", temp, mem, cpu);
+        send_response(fd, "200 OK", "application/json", buf, strlen(buf));
+    }
+    else {
+        send_response(fd, "404 Not Found", "text/plain", "Not Found", 9);
+    }
+    close(fd);
 }
 
-/* ---------- Main server loop ---------- */
 int main() {
-    printf("Starting Security System Server...\n");
-
+    printf("Starting Security Server...\n");
+    
     g_frame = shared_frame_open();
-    if (!g_frame) {
-        fprintf(stderr, "Failed to open shared frame\n");
-        return 1;
-    }
-    printf("Shared frame opened\n");
-
+    if (!g_frame) { printf("Failed to open shared frame\n"); return 1; }
+    
     pthread_t updater;
     pthread_create(&updater, NULL, frame_updater, NULL);
-
-    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    
+    int server = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
-    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = INADDR_ANY,
-        .sin_port = htons(PORT)
-    };
-
-    bind(server_fd, (struct sockaddr*)&addr, sizeof(addr));
-    listen(server_fd, 10);
-
-    printf("HTTP server running on port %d\n", PORT);
-    printf("Open: http://192.168.137.100:%d/\n", PORT);
+    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    
+    struct sockaddr_in addr = {.sin_family=AF_INET, .sin_addr.s_addr=INADDR_ANY, .sin_port=htons(PORT)};
+    bind(server, (struct sockaddr*)&addr, sizeof(addr));
+    listen(server, 10);
+    
+    printf("Server running on http://192.168.137.100:8080/\n");
     printf("Press Ctrl+C to stop\n");
-
-    while (running) {
-        struct sockaddr_in client_addr;
-        socklen_t client_len = sizeof(client_addr);
-        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
-        if (client_fd < 0) continue;
-
-        char req[1024];
-        ssize_t n = read(client_fd, req, sizeof(req) - 1);
-        if (n > 0) {
-            req[n] = '\0';
-
-            char method[16], path[256];
-            if (sscanf(req, "%15s %255s", method, path) == 2) {
-                if (strcmp(path, "/") == 0)
-                    send_html(client_fd);
-                else if (strncmp(path, "/frame", 6) == 0)
-                    send_frame(client_fd);
-                else if (strcmp(path, "/telemetry") == 0)
-                    send_telemetry(client_fd);
-                else
-                    send_response(client_fd, "404 Not Found", "text/plain", "Not Found", 9);
-            }
-        }
-
-        close(client_fd);
+    
+    while (1) {
+        struct sockaddr_in client;
+        socklen_t len = sizeof(client);
+        int fd = accept(server, (struct sockaddr*)&client, &len);
+        if (fd >= 0) handle_request(fd);
     }
-
-    close(server_fd);
     return 0;
 }
