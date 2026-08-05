@@ -9,7 +9,7 @@ TARGET = server
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
-    	$(CC) $(OBJ) -o $@ $(LDFLAGS)
+	$(CC) $(OBJ) -o $@ $(LDFLAGS)
 
 clean:
-   	 rm -f $(OBJ) $(TARGET)
+	rm -f $(OBJ) $(TARGET)
