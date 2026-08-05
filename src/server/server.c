@@ -45,7 +45,8 @@ static char *load_html(void) {
         return NULL;
     }
 
-    fread(buf, 1, len, fp);
+    size_t r = fread(buf, 1, len, fp);
+    (void)r;
     buf[len] = '\0';
     fclose(fp);
     return buf;
@@ -56,7 +57,10 @@ static float read_temp(void) {
     if (!f) return -1;
 
     int t = 0;
-    fscanf(f, "%d", &t);
+    if (fscanf(f, "%d", &t) != 1) {
+        fclose(f);
+        return -1;
+    }
     fclose(f);
     return t / 1000.0f;
 }
@@ -84,7 +88,10 @@ static float read_cpu_usage(void) {
     if (!f) return 0;
 
     long u, n, s, i;
-    fscanf(f, "cpu %ld %ld %ld %ld", &u, &n, &s, &i);
+    if (fscanf(f, "cpu %ld %ld %ld %ld", &u, &n, &s, &i) != 4) {
+        fclose(f);
+        return 0;
+    }
     fclose(f);
 
     static long prev_total = 0;
@@ -153,6 +160,7 @@ static void send_redirect(int fd) {
     send(fd, msg, strlen(msg), 0);
 }
 
+__attribute__((unused))
 static void handle_request(int fd) {
     char req[1024];
     int n = read(fd, req, sizeof(req) - 1);
