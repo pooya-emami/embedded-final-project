@@ -117,6 +117,7 @@ ssize_t mjpeg_callback(void *cls, uint64_t pos, char *buf, size_t max) {
     // Check if we have enough space
     if (total_len > max) {
         printf("ERROR: Buffer too small! Need %zu, have %zu\n", total_len, max);
+        // Try to return partial data? No, just return error and let it retry
         return -1;
     }
     
@@ -192,7 +193,7 @@ int handler(void *cls, struct MHD_Connection *conn,
         struct MHD_Response *resp =
             MHD_create_response_from_callback(
                 MHD_SIZE_UNKNOWN,  // Unknown size for streaming
-                4096,              // Buffer size
+                SHM_FRAME_BUF_SIZE, // Use the same size as frame buffer (65536)
                 &mjpeg_callback,
                 NULL,
                 NULL);
