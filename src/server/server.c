@@ -1,19 +1,23 @@
-#include <microhttpd.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "server.h"
 #include "shared_frame.h"
 
-// MJPEG frame buffer, shared with the relay process over POSIX shm.
 static shared_frame_t *g_frame;
+static unsigned char cached_frame[BUFFER_SIZE];
+static size_t cached_len = 0;
+static pthread_mutex_t cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+static volatile int running = 1;
 
-// ---------- Telemetry ----------
-
-float read_cpu_temp() {
+/* ---------- Telemetry ---------- */
+float read_cpu_temp(void) {
     FILE *fp = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
     if (!fp) return -1;
     int temp;
@@ -22,7 +26,7 @@ float read_cpu_temp() {
     return temp / 1000.0;
 }
 
-long read_free_mem() {
+long read_free_mem(void) {
     FILE *fp = fopen("/proc/meminfo", "r");
     if (!fp) return -1;
     char key[32];
@@ -37,20 +41,17 @@ long read_free_mem() {
     return -1;
 }
 
-float read_cpu_load() {
+float read_cpu_load(void) {
     FILE *fp = fopen("/proc/stat", "r");
     if (!fp) return -1;
-
     long user, nice, system, idle;
     fscanf(fp, "cpu %ld %ld %ld %ld", &user, &nice, &system, &idle);
     fclose(fp);
 
     static long prev_total = 0, prev_idle = 0;
     long total = user + nice + system + idle;
-
     long diff_total = total - prev_total;
-    long diff_idle  = idle - prev_idle;
-
+    long diff_idle = idle - prev_idle;
     prev_total = total;
     prev_idle = idle;
 
@@ -58,14 +59,11 @@ float read_cpu_load() {
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
-// ---------- HTML loader ----------
-
-char *load_html_template() {
+/* ---------- Load HTML template ---------- */
+char *load_html_template(void) {
     FILE *fp = fopen(HTML_PATH, "r");
-    if (!fp) {
-        fprintf(stderr, "Failed to open HTML template: %s\n", HTML_PATH);
-        return NULL;
-    }
+    if (!fp) return NULL;
+
     fseek(fp, 0, SEEK_END);
     long len = ftell(fp);
     fseek(fp, 0, SEEK_SET);
@@ -81,197 +79,155 @@ char *load_html_template() {
     return buf;
 }
 
-// ---------- MJPEG callback ----------
-
-ssize_t mjpeg_callback(void *cls, uint64_t pos, char *buf, size_t max) {
-    (void)cls;
-    (void)pos;
-    
-    static unsigned char frame_buffer[SHM_FRAME_BUF_SIZE];
-    static size_t current_len = 0;
-    static int has_frame = 0;
-    static int frame_count = 0;
-    
-    // If we don't have a frame, read one from shared memory
-    if (!has_frame) {
-        current_len = shared_frame_read(g_frame, frame_buffer, SHM_FRAME_BUF_SIZE);
-        if (current_len > 0) {
-            frame_count++;
-            printf("Frame %d: Read %zu bytes from shared memory\n", frame_count, current_len);
-            has_frame = 1;
-        } else {
-            // No frame available yet
-            usleep(10000);  // Wait 10ms
-            return 0;
-        }
-    }
-    
-    // Format: --frame\r\nContent-Type: image/jpeg\r\nContent-Length: X\r\n\r\n
-    char header[128];
+/* ---------- HTTP response ---------- */
+void send_response(int client_fd, const char *status, const char *content_type,
+                   const void *data, size_t data_len) {
+    char header[512];
     int header_len = snprintf(header, sizeof(header),
-        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
-        current_len);
-    
-    size_t total_len = header_len + current_len + 2;  // +2 for trailing \r\n
-    
-    // Check if we have enough space
-    if (total_len > max) {
-        printf("ERROR: Buffer too small! Need %zu, have %zu\n", total_len, max);
-        // Try to return partial data? No, just return error and let it retry
-        return -1;
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: %s\r\n"
+        "Content-Length: %zu\r\n"
+        "Connection: close\r\n"
+        "Cache-Control: no-cache\r\n"
+        "\r\n",
+        status, content_type, data_len);
+
+    send(client_fd, header, header_len, 0);
+    if (data && data_len > 0) {
+        send(client_fd, data, data_len, 0);
     }
-    
-    // Copy header
-    memcpy(buf, header, header_len);
-    
-    // Copy frame data
-    memcpy(buf + header_len, frame_buffer, current_len);
-    
-    // Add trailing \r\n
-    buf[header_len + current_len] = '\r';
-    buf[header_len + current_len + 1] = '\n';
-    
-    // Mark frame as consumed
-    has_frame = 0;
-    
-    return total_len;
 }
 
-// ---------- Handler ----------
+/* ---------- Send HTML page ---------- */
+void send_html(int client_fd) {
+    char *html = load_html_template();
+    if (!html) {
+        const char *err = "Template load error";
+        send_response(client_fd, "500 Internal Server Error", "text/plain",
+                      err, strlen(err));
+        return;
+    }
 
-int handler(void *cls, struct MHD_Connection *conn,
-            const char *url, const char *method,
-            const char *version, const char *upload_data,
-            size_t *upload_data_size, void **ptr)
-{
-    (void)cls;
-    (void)method;
-    (void)version;
-    (void)upload_data;
-    (void)upload_data_size;
-    (void)ptr;
+    send_response(client_fd, "200 OK", "text/html", html, strlen(html));
+    free(html);
+}
 
-    // Serve HTML page
-    if (strcmp(url, "/") == 0) {
-        char *html = load_html_template();
-        if (!html) {
-            const char *err = "<html><body>Template error</body></html>";
-            struct MHD_Response *resp =
-                MHD_create_response_from_buffer(strlen(err),
-                                                (void*)err,
-                                                MHD_RESPMEM_PERSISTENT);
-            return MHD_queue_response(conn, MHD_HTTP_INTERNAL_SERVER_ERROR, resp);
+/* ---------- Send JPEG frame ---------- */
+void send_frame(int client_fd) {
+    pthread_mutex_lock(&cache_mutex);
+    if (cached_len == 0) {
+        pthread_mutex_unlock(&cache_mutex);
+        send_response(client_fd, "404 Not Found", "text/plain", "No frame", 8);
+        return;
+    }
+
+    unsigned char *copy = malloc(cached_len);
+    memcpy(copy, cached_frame, cached_len);
+    size_t len = cached_len;
+    pthread_mutex_unlock(&cache_mutex);
+
+    send_response(client_fd, "200 OK", "image/jpeg", copy, len);
+    free(copy);
+}
+
+/* ---------- Send telemetry ---------- */
+void send_telemetry(int client_fd) {
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}",
+        read_cpu_temp(), read_free_mem(), read_cpu_load());
+
+    send_response(client_fd, "200 OK", "application/json", buf, strlen(buf));
+}
+
+/* ---------- Frame updater thread ---------- */
+void *frame_updater(void *arg) {
+    (void)arg;
+    while (running) {
+        unsigned char buf[BUFFER_SIZE];
+        size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
+        if (len > 0) {
+            pthread_mutex_lock(&cache_mutex);
+            memcpy(cached_frame, buf, len);
+            cached_len = len;
+            pthread_mutex_unlock(&cache_mutex);
         }
-
-        struct MHD_Response *resp =
-            MHD_create_response_from_buffer(strlen(html),
-                                            html,
-                                            MHD_RESPMEM_MUST_FREE);
-        MHD_add_response_header(resp, "Content-Type", "text/html");
-        return MHD_queue_response(conn, MHD_HTTP_OK, resp);
+        usleep(50000); // ~20 FPS
     }
-
-    // Telemetry JSON
-    if (strcmp(url, "/telemetry") == 0) {
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                 "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}",
-                 read_cpu_temp(), read_free_mem(), read_cpu_load());
-
-        struct MHD_Response *resp =
-            MHD_create_response_from_buffer(strlen(buf),
-                                            buf,
-                                            MHD_RESPMEM_MUST_COPY);
-        MHD_add_response_header(resp, "Content-Type", "application/json");
-        return MHD_queue_response(conn, MHD_HTTP_OK, resp);
-    }
-
-    // MJPEG stream
-    if (strcmp(url, "/stream") == 0) {
-        printf("Stream requested by client\n");
-        
-        struct MHD_Response *resp =
-            MHD_create_response_from_callback(
-                MHD_SIZE_UNKNOWN,  // Unknown size for streaming
-                SHM_FRAME_BUF_SIZE, // Use the same size as frame buffer (65536)
-                &mjpeg_callback,
-                NULL,
-                NULL);
-
-        // Add required headers for MJPEG streaming
-        MHD_add_response_header(resp, "Cache-Control", "no-cache, no-store, must-revalidate");
-        MHD_add_response_header(resp, "Pragma", "no-cache");
-        MHD_add_response_header(resp, "Expires", "0");
-        MHD_add_response_header(resp, "Connection", "close");
-        MHD_add_response_header(resp, "Content-Type", 
-            "multipart/x-mixed-replace; boundary=frame");
-
-        return MHD_queue_response(conn, MHD_HTTP_OK, resp);
-    }
-
-    // 404
-    struct MHD_Response *resp =
-        MHD_create_response_from_buffer(0, "", MHD_RESPMEM_PERSISTENT);
-    return MHD_queue_response(conn, MHD_HTTP_NOT_FOUND, resp);
+    return NULL;
 }
 
-// ---------- main ----------
-
+/* ---------- Main server loop ---------- */
 int main() {
-    // Attach to the shared frame buffer
+    printf("Starting Security System Server...\n");
+
     g_frame = shared_frame_open();
     if (!g_frame) {
-        fprintf(stderr, "Failed to open shared frame buffer\n");
+        fprintf(stderr, "Failed to open shared frame\n");
         return 1;
     }
-    printf("Shared frame buffer opened\n");
+    printf("Shared frame opened\n");
 
-    // Load SSL certs
-    FILE *fkey = fopen("key.pem", "rb");
-    FILE *fcert = fopen("cert.pem", "rb");
-    if (!fkey || !fcert) {
-        fprintf(stderr, "Missing SSL cert.pem/key.pem\n");
-        fprintf(stderr, "Generate with: openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj \"/CN=your_student_id\"\n");
-        return 1;
-    }
+    pthread_t updater;
+    pthread_create(&updater, NULL, frame_updater, NULL);
 
-    fseek(fkey, 0, SEEK_END);
-    size_t key_len = ftell(fkey);
-    fseek(fkey, 0, SEEK_SET);
-    char *key_buf = malloc(key_len);
-    fread(key_buf, 1, key_len, fkey);
-
-    fseek(fcert, 0, SEEK_END);
-    size_t cert_len = ftell(fcert);
-    fseek(fcert, 0, SEEK_SET);
-    char *cert_buf = malloc(cert_len);
-    fread(cert_buf, 1, cert_len, fcert);
-
-    fclose(fkey);
-    fclose(fcert);
-
-    struct MHD_Daemon *daemon =
-        MHD_start_daemon(MHD_USE_SELECT_INTERNALLY | MHD_USE_SSL,
-                         PORT_HTTPS,
-                         NULL, NULL,
-                         &handler, NULL,
-                         MHD_OPTION_HTTPS_MEM_KEY, key_buf,
-                         MHD_OPTION_HTTPS_MEM_CERT, cert_buf,
-                         MHD_OPTION_END);
-
-    if (!daemon) {
-        fprintf(stderr, "Failed to start HTTPS server\n");
+    int server_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (server_fd < 0) {
+        perror("socket");
         return 1;
     }
 
-    printf("HTTPS server running on port %d\n", PORT_HTTPS);
-    printf("Open: https://192.168.137.100:8443/\n");
-    printf("Press Enter to stop...\n");
-    
-    getchar();
-    MHD_stop_daemon(daemon);
+    int opt = 1;
+    setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    free(key_buf);
-    free(cert_buf);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = INADDR_ANY,
+        .sin_port = htons(PORT_HTTP)
+    };
+
+    if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        perror("bind");
+        return 1;
+    }
+
+    if (listen(server_fd, 10) < 0) {
+        perror("listen");
+        return 1;
+    }
+
+    printf("HTTP server running on port %d\n", PORT_HTTP);
+    printf("Open: http://192.168.137.100:%d/\n", PORT_HTTP);
+    printf("Press Ctrl+C to stop\n");
+
+    while (running) {
+        struct sockaddr_in client_addr;
+        socklen_t client_len = sizeof(client_addr);
+        int client_fd = accept(server_fd, (struct sockaddr*)&client_addr, &client_len);
+        if (client_fd < 0) continue;
+
+        char req[1024];
+        ssize_t n = read(client_fd, req, sizeof(req) - 1);
+        if (n > 0) {
+            req[n] = '\0';
+
+            char method[16], path[256];
+            if (sscanf(req, "%15s %255s", method, path) == 2) {
+                if (strcmp(path, "/") == 0)
+                    send_html(client_fd);
+                else if (strncmp(path, "/frame", 6) == 0)
+                    send_frame(client_fd);
+                else if (strcmp(path, "/telemetry") == 0)
+                    send_telemetry(client_fd);
+                else
+                    send_response(client_fd, "404 Not Found", "text/plain", "Not Found", 9);
+            }
+        }
+
+        close(client_fd);
+    }
+
+    close(server_fd);
+    printf("Server stopped\n");
     return 0;
 }

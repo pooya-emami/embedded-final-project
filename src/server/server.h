@@ -4,34 +4,30 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
-#include <microhttpd.h>
 
 #define PORT_HTTP      8080
 #define PORT_HTTPS     8443
 #define HTML_PATH      "../html/template.html"
+#define BUFFER_SIZE    65536
 
 /* ---- Telemetry ---- */
 float read_cpu_temp(void);
 long  read_free_mem(void);
 float read_cpu_load(void);
 
-/* ---- HTML template loader ----
- * Returns a malloc'd, NUL-terminated buffer with the template contents.
- * Caller owns the memory (MHD_RESPMEM_MUST_FREE takes care of this when
- * handed straight to MHD_create_response_from_buffer). Returns NULL on
- * failure. */
+/* ---- HTTP Response ---- */
+void send_response(int client_fd, const char *status, const char *content_type,
+                   const void *data, size_t data_len);
+
+/* ---- HTML template loader ---- */
 char *load_html_template(void);
 
-/* ---- MJPEG streaming callback ----
- * Matches MHD_ContentReaderCallback; used with
- * MHD_create_response_from_callback() for the /stream endpoint. */
-ssize_t mjpeg_callback(void *cls, uint64_t pos, char *buf, size_t max);
+/* ---- Frame functions ---- */
+void send_frame(int client_fd);
+void send_html(int client_fd);
+void send_telemetry(int client_fd);
 
-/* ---- Main HTTP/HTTPS request handler ----
- * Matches MHD_AccessHandlerCallback; registered with MHD_start_daemon(). */
-int handler(void *cls, struct MHD_Connection *conn,
-            const char *url, const char *method,
-            const char *version, const char *upload_data,
-            size_t *upload_data_size, void **ptr);
+/* ---- Frame updater thread ---- */
+void *frame_updater(void *arg);
 
 #endif /* SERVER_H */

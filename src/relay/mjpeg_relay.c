@@ -102,7 +102,7 @@ void *receiver_thread(void *arg) {
 
             if (eoi >= 0 && jpeg_len > 0) {
                 frame_count++;
-                printf("✅ Complete JPEG frame #%d received, size: %zu\n", frame_count, jpeg_len);
+                printf("Complete JPEG frame #%d received, size: %zu\n", frame_count, jpeg_len);
                 shared_frame_write(g_frame, jpeg, jpeg_len);
                 jpeg_len = 0;
             }
