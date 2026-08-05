@@ -83,42 +83,56 @@ char *load_html_template() {
 
 // ---------- MJPEG callback ----------
 
-ssize_t mjpeg_callback(void *cls, uint64_t pos,
-                        char *buf, size_t max)
-{
+ssize_t mjpeg_callback(void *cls, uint64_t pos, char *buf, size_t max) {
     (void)cls;
     (void)pos;
-
+    
     static unsigned char frame_buffer[SHM_FRAME_BUF_SIZE];
     static size_t current_len = 0;
     static int has_frame = 0;
+    static int frame_count = 0;
     
+    // If we don't have a frame, read one from shared memory
     if (!has_frame) {
         current_len = shared_frame_read(g_frame, frame_buffer, SHM_FRAME_BUF_SIZE);
-        if (current_len == 0) {
-            usleep(10000);
+        if (current_len > 0) {
+            frame_count++;
+            printf("Frame %d: Read %zu bytes from shared memory\n", frame_count, current_len);
+            has_frame = 1;
+        } else {
+            // No frame available yet
+            usleep(10000);  // Wait 10ms
             return 0;
         }
-        has_frame = 1;
     }
     
+    // Format: --frame\r\nContent-Type: image/jpeg\r\nContent-Length: X\r\n\r\n
     char header[128];
     int header_len = snprintf(header, sizeof(header),
         "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
         current_len);
     
-    size_t total_len = header_len + current_len + 2;
+    size_t total_len = header_len + current_len + 2;  // +2 for trailing \r\n
     
+    // Check if we have enough space
     if (total_len > max) {
+        printf("ERROR: Buffer too small! Need %zu, have %zu\n", total_len, max);
         return -1;
     }
     
+    // Copy header
     memcpy(buf, header, header_len);
+    
+    // Copy frame data
     memcpy(buf + header_len, frame_buffer, current_len);
+    
+    // Add trailing \r\n
     buf[header_len + current_len] = '\r';
     buf[header_len + current_len + 1] = '\n';
     
+    // Mark frame as consumed
     has_frame = 0;
+    
     return total_len;
 }
 
@@ -173,19 +187,22 @@ int handler(void *cls, struct MHD_Connection *conn,
 
     // MJPEG stream
     if (strcmp(url, "/stream") == 0) {
+        printf("Stream requested by client\n");
+        
         struct MHD_Response *resp =
             MHD_create_response_from_callback(
-                MHD_SIZE_UNKNOWN,
-                4096,
+                MHD_SIZE_UNKNOWN,  // Unknown size for streaming
+                4096,              // Buffer size
                 &mjpeg_callback,
                 NULL,
                 NULL);
 
+        // Add required headers for MJPEG streaming
         MHD_add_response_header(resp, "Cache-Control", "no-cache, no-store, must-revalidate");
         MHD_add_response_header(resp, "Pragma", "no-cache");
         MHD_add_response_header(resp, "Expires", "0");
         MHD_add_response_header(resp, "Connection", "close");
-        MHD_add_response_header(resp, "Content-Type",
+        MHD_add_response_header(resp, "Content-Type", 
             "multipart/x-mixed-replace; boundary=frame");
 
         return MHD_queue_response(conn, MHD_HTTP_OK, resp);
@@ -206,12 +223,14 @@ int main() {
         fprintf(stderr, "Failed to open shared frame buffer\n");
         return 1;
     }
+    printf("Shared frame buffer opened\n");
 
     // Load SSL certs
     FILE *fkey = fopen("key.pem", "rb");
     FILE *fcert = fopen("cert.pem", "rb");
     if (!fkey || !fcert) {
         fprintf(stderr, "Missing SSL cert.pem/key.pem\n");
+        fprintf(stderr, "Generate with: openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj \"/CN=your_student_id\"\n");
         return 1;
     }
 
@@ -246,6 +265,7 @@ int main() {
 
     printf("HTTPS server running on port %d\n", PORT_HTTPS);
     printf("Open: https://192.168.137.100:8443/\n");
+    printf("Press Enter to stop...\n");
     
     getchar();
     MHD_stop_daemon(daemon);
