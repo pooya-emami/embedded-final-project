@@ -81,7 +81,6 @@ void *receiver_thread(void *arg) {
                 break;
             }
 
-            // Append to jpeg buffer
             if (jpeg_len + n < RELAY_BUF_SIZE) {
                 memcpy(jpeg + jpeg_len, buf, n);
                 jpeg_len += n;
@@ -91,18 +90,15 @@ void *receiver_thread(void *arg) {
                 continue;
             }
 
-            // Look for complete JPEG (SOI to EOI)
             int soi = find_marker(jpeg, jpeg_len, 0xFF, 0xD8);
             int eoi = find_marker(jpeg, jpeg_len, 0xFF, 0xD9);
 
             if (soi >= 0 && eoi > soi) {
-                // Found complete frame
                 frame_count++;
                 size_t frame_size = eoi + 2; // Include EOI marker
                 printf("Frame #%d: %zu bytes\n", frame_count, frame_size);
                 shared_frame_write(g_frame, jpeg + soi, frame_size - soi);
 
-                // Remove processed data from buffer
                 if (frame_size < jpeg_len) {
                     memmove(jpeg, jpeg + frame_size, jpeg_len - frame_size);
                     jpeg_len -= frame_size;

@@ -1,0 +1,17 @@
+[Unit]
+Description=Embedded Web Server
+After=network.target relay.service
+Requires=relay.service
+
+[Service]
+Type=simple
+User=orangepi
+WorkingDirectory=/home/orangepi/embedded-proj/src/server
+ExecStart=/usr/local/bin/server
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

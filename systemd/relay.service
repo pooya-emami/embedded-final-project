@@ -1,0 +1,16 @@
+[Unit]
+Description=MJPEG Relay Service
+After=network.target
+
+[Service]
+Type=simple
+User=orangepi
+WorkingDirectory=/home/orangepi/embedded-proj/src/relay
+ExecStart=/usr/local/bin/mjpeg_relay
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
