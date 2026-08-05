@@ -4,20 +4,12 @@
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
-#include <signal.h>
 
 #include "server.h"
 #include "shared_frame.h"
 
 // MJPEG frame buffer, shared with the relay process over POSIX shm.
 static shared_frame_t *g_frame;
-static int keep_running = 1;
-
-// ---------- Signal handler ----------
-void handle_signal(int sig) {
-    (void)sig;
-    keep_running = 0;
-}
 
 // ---------- Telemetry ----------
 
@@ -96,54 +88,37 @@ ssize_t mjpeg_callback(void *cls, uint64_t pos,
 {
     (void)cls;
     (void)pos;
-    
+
     static unsigned char frame_buffer[SHM_FRAME_BUF_SIZE];
-    static size_t current_frame_len = 0;
+    static size_t current_len = 0;
     static int has_frame = 0;
-    static int frame_ready = 0;
     
-    // If we don't have a frame ready, try to read one
-    if (!frame_ready) {
-        current_frame_len = shared_frame_read(g_frame, frame_buffer, SHM_FRAME_BUF_SIZE);
-        if (current_frame_len > 0) {
-            has_frame = 1;
-            frame_ready = 1;
-        } else {
-            // No frame available, wait a bit
-            usleep(10000); // 10ms
+    if (!has_frame) {
+        current_len = shared_frame_read(g_frame, frame_buffer, SHM_FRAME_BUF_SIZE);
+        if (current_len == 0) {
+            usleep(10000);
             return 0;
         }
+        has_frame = 1;
     }
     
-    // Format the multipart response
-    // Boundary: --frame\r\nContent-Type: image/jpeg\r\nContent-Length: X\r\n\r\n
     char header[128];
     int header_len = snprintf(header, sizeof(header),
         "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
-        current_frame_len);
+        current_len);
     
-    // Calculate total size needed: header + frame + \r\n
-    size_t total_len = header_len + current_frame_len + 2;
+    size_t total_len = header_len + current_len + 2;
     
-    // Check if we have enough space in the buffer
     if (total_len > max) {
-        // Buffer too small, return error
         return -1;
     }
     
-    // Copy header
     memcpy(buf, header, header_len);
+    memcpy(buf + header_len, frame_buffer, current_len);
+    buf[header_len + current_len] = '\r';
+    buf[header_len + current_len + 1] = '\n';
     
-    // Copy frame data
-    memcpy(buf + header_len, frame_buffer, current_frame_len);
-    
-    // Add trailing \r\n
-    buf[header_len + current_frame_len] = '\r';
-    buf[header_len + current_frame_len + 1] = '\n';
-    
-    // Mark frame as consumed
-    frame_ready = 0;
-    
+    has_frame = 0;
     return total_len;
 }
 
@@ -161,22 +136,7 @@ int handler(void *cls, struct MHD_Connection *conn,
     (void)upload_data_size;
     (void)ptr;
 
-    // HTTP → HTTPS redirect (for plain HTTP daemon)
-    if (strcmp(url, "/") == 0 && PORT_HTTP == 8080) {
-        const char *redir_html =
-            "<html><head><meta http-equiv='refresh' "
-            "content='0;url=https://localhost:8443/'/></head></html>";
-
-        struct MHD_Response *resp =
-            MHD_create_response_from_buffer(strlen(redir_html),
-                                            (void*)redir_html,
-                                            MHD_RESPMEM_PERSISTENT);
-
-        MHD_add_response_header(resp, "Location", "https://localhost:8443/");
-        return MHD_queue_response(conn, MHD_HTTP_MOVED_PERMANENTLY, resp);
-    }
-
-    // HTTPS dashboard
+    // Serve HTML page
     if (strcmp(url, "/") == 0) {
         char *html = load_html_template();
         if (!html) {
@@ -215,21 +175,19 @@ int handler(void *cls, struct MHD_Connection *conn,
     if (strcmp(url, "/stream") == 0) {
         struct MHD_Response *resp =
             MHD_create_response_from_callback(
-                MHD_SIZE_UNKNOWN,  // Unknown size for streaming
-                4096,              // Buffer size
+                MHD_SIZE_UNKNOWN,
+                4096,
                 &mjpeg_callback,
                 NULL,
                 NULL);
 
-        // Add required headers for MJPEG streaming
         MHD_add_response_header(resp, "Cache-Control", "no-cache, no-store, must-revalidate");
         MHD_add_response_header(resp, "Pragma", "no-cache");
         MHD_add_response_header(resp, "Expires", "0");
         MHD_add_response_header(resp, "Connection", "close");
-        MHD_add_response_header(resp, "Content-Type", 
+        MHD_add_response_header(resp, "Content-Type",
             "multipart/x-mixed-replace; boundary=frame");
-        MHD_add_response_header(resp, "Content-Transfer-Encoding", "binary");
-        
+
         return MHD_queue_response(conn, MHD_HTTP_OK, resp);
     }
 
@@ -242,12 +200,7 @@ int handler(void *cls, struct MHD_Connection *conn,
 // ---------- main ----------
 
 int main() {
-    // Register signal handlers
-    signal(SIGINT, handle_signal);
-    signal(SIGTERM, handle_signal);
-    
-    // Attach to the shared frame buffer. Works whether mjpeg_relay
-    // started first or not -- shared_frame_open() creates it if needed.
+    // Attach to the shared frame buffer
     g_frame = shared_frame_open();
     if (!g_frame) {
         fprintf(stderr, "Failed to open shared frame buffer\n");
@@ -259,23 +212,20 @@ int main() {
     FILE *fcert = fopen("cert.pem", "rb");
     if (!fkey || !fcert) {
         fprintf(stderr, "Missing SSL cert.pem/key.pem\n");
-        fprintf(stderr, "Generate with: openssl req -x509 -newkey rsa:2048 -nodes -keyout key.pem -out cert.pem -days 365 -subj \"/CN=your_student_id\"\n");
         return 1;
     }
 
     fseek(fkey, 0, SEEK_END);
     size_t key_len = ftell(fkey);
     fseek(fkey, 0, SEEK_SET);
-    char *key_buf = malloc(key_len + 1);
+    char *key_buf = malloc(key_len);
     fread(key_buf, 1, key_len, fkey);
-    key_buf[key_len] = '\0';
 
     fseek(fcert, 0, SEEK_END);
     size_t cert_len = ftell(fcert);
     fseek(fcert, 0, SEEK_SET);
-    char *cert_buf = malloc(cert_len + 1);
+    char *cert_buf = malloc(cert_len);
     fread(cert_buf, 1, cert_len, fcert);
-    cert_buf[cert_len] = '\0';
 
     fclose(fkey);
     fclose(fcert);
@@ -291,25 +241,16 @@ int main() {
 
     if (!daemon) {
         fprintf(stderr, "Failed to start HTTPS server\n");
-        free(key_buf);
-        free(cert_buf);
         return 1;
     }
 
     printf("HTTPS server running on port %d\n", PORT_HTTPS);
-    printf("Access the stream at: https://localhost:%d/stream\n", PORT_HTTPS);
-    printf("Access the dashboard at: https://localhost:%d/\n", PORT_HTTPS);
-    printf("Press Ctrl+C to stop the server\n");
+    printf("Open: https://192.168.137.100:8443/\n");
     
-    // Keep the server running until signal
-    while (keep_running) {
-        sleep(1);
-    }
-    
+    getchar();
     MHD_stop_daemon(daemon);
 
     free(key_buf);
     free(cert_buf);
-    printf("Server stopped.\n");
     return 0;
 }
