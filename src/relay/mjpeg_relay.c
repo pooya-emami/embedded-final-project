@@ -45,7 +45,7 @@ void *receiver_thread(void *arg) {
         return NULL;
     }
 
-    if (listen(server_fd, 5) < 0) {  // Increased backlog
+    if (listen(server_fd, 5) < 0) {
         perror("listen");
         close(server_fd);
         return NULL;
@@ -68,6 +68,8 @@ void *receiver_thread(void *arg) {
         printf("Client connected from %s:%d\n", 
                inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 
+        jpeg_len = 0;
+
         while (1) {
             ssize_t n = read(client_fd, buf, RELAY_BUF_SIZE);
             if (n <= 0) {
@@ -79,32 +81,34 @@ void *receiver_thread(void *arg) {
                 break;
             }
 
-            // Debug: show received data
-            printf("Received %zd bytes from client\n", n);
-            printf("First 4 bytes: %02x %02x %02x %02x\n", 
-                   buf[0], buf[1], buf[2], buf[3]);
-
-            int soi = find_marker(buf, n, 0xFF, 0xD8);
-            int eoi = find_marker(buf, n, 0xFF, 0xD9);
-
-            if (soi >= 0) {
-                printf("Found SOI at offset %d\n", soi);
-                jpeg_len = 0;
-            }
-
+            // Append to jpeg buffer
             if (jpeg_len + n < RELAY_BUF_SIZE) {
                 memcpy(jpeg + jpeg_len, buf, n);
                 jpeg_len += n;
             } else {
-                printf("WARNING: Buffer overflow! Resetting.\n");
+                printf("Buffer full, resetting\n");
                 jpeg_len = 0;
+                continue;
             }
 
-            if (eoi >= 0 && jpeg_len > 0) {
+            // Look for complete JPEG (SOI to EOI)
+            int soi = find_marker(jpeg, jpeg_len, 0xFF, 0xD8);
+            int eoi = find_marker(jpeg, jpeg_len, 0xFF, 0xD9);
+
+            if (soi >= 0 && eoi > soi) {
+                // Found complete frame
                 frame_count++;
-                printf("Complete JPEG frame #%d received, size: %zu\n", frame_count, jpeg_len);
-                shared_frame_write(g_frame, jpeg, jpeg_len);
-                jpeg_len = 0;
+                size_t frame_size = eoi + 2; // Include EOI marker
+                printf("Frame #%d: %zu bytes\n", frame_count, frame_size);
+                shared_frame_write(g_frame, jpeg + soi, frame_size - soi);
+
+                // Remove processed data from buffer
+                if (frame_size < jpeg_len) {
+                    memmove(jpeg, jpeg + frame_size, jpeg_len - frame_size);
+                    jpeg_len -= frame_size;
+                } else {
+                    jpeg_len = 0;
+                }
             }
         }
 
