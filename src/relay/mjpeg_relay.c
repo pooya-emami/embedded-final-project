@@ -5,6 +5,7 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <pthread.h>
+#include <errno.h>
 
 #include "mjpeg_relay.h"
 #include "shared_frame.h"
@@ -23,6 +24,7 @@ void *receiver_thread(void *arg) {
     (void)arg;
     int server_fd, client_fd;
     struct sockaddr_in addr;
+    socklen_t addr_len = sizeof(addr);
 
     server_fd = socket(AF_INET, SOCK_STREAM, 0);
     if (server_fd < 0) {
@@ -30,8 +32,6 @@ void *receiver_thread(void *arg) {
         return NULL;
     }
 
-    // Allow immediate re-bind after restart (avoids "Address already in use"
-    // from a socket still in TIME_WAIT after a previous run).
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -45,7 +45,7 @@ void *receiver_thread(void *arg) {
         return NULL;
     }
 
-    if (listen(server_fd, 1) < 0) {
+    if (listen(server_fd, 5) < 0) {  // Increased backlog
         perror("listen");
         close(server_fd);
         return NULL;
@@ -56,28 +56,53 @@ void *receiver_thread(void *arg) {
     unsigned char buf[RELAY_BUF_SIZE];
     unsigned char jpeg[RELAY_BUF_SIZE];
     size_t jpeg_len = 0;
+    int frame_count = 0;
 
     while (1) {
-        client_fd = accept(server_fd, NULL, NULL);
-        printf("Client connected\n");
+        client_fd = accept(server_fd, (struct sockaddr*)&addr, &addr_len);
+        if (client_fd < 0) {
+            perror("accept");
+            continue;
+        }
+        
+        printf("Client connected from %s:%d\n", 
+               inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 
         while (1) {
             ssize_t n = read(client_fd, buf, RELAY_BUF_SIZE);
-            if (n <= 0) break;
+            if (n <= 0) {
+                if (n == 0) {
+                    printf("Client closed connection\n");
+                } else {
+                    perror("read");
+                }
+                break;
+            }
+
+            // Debug: show received data
+            printf("Received %zd bytes from client\n", n);
+            printf("First 4 bytes: %02x %02x %02x %02x\n", 
+                   buf[0], buf[1], buf[2], buf[3]);
 
             int soi = find_marker(buf, n, 0xFF, 0xD8);
             int eoi = find_marker(buf, n, 0xFF, 0xD9);
 
             if (soi >= 0) {
+                printf("Found SOI at offset %d\n", soi);
                 jpeg_len = 0;
             }
 
             if (jpeg_len + n < RELAY_BUF_SIZE) {
                 memcpy(jpeg + jpeg_len, buf, n);
                 jpeg_len += n;
+            } else {
+                printf("WARNING: Buffer overflow! Resetting.\n");
+                jpeg_len = 0;
             }
 
             if (eoi >= 0 && jpeg_len > 0) {
+                frame_count++;
+                printf("✅ Complete JPEG frame #%d received, size: %zu\n", frame_count, jpeg_len);
                 shared_frame_write(g_frame, jpeg, jpeg_len);
                 jpeg_len = 0;
             }
@@ -91,14 +116,22 @@ void *receiver_thread(void *arg) {
 }
 
 int main() {
+    printf("Starting MJPEG Relay...\n");
+    
     g_frame = shared_frame_open();
     if (!g_frame) {
         fprintf(stderr, "Failed to open shared frame buffer\n");
         return 1;
     }
+    printf("Shared frame buffer opened successfully\n");
 
     pthread_t tid;
-    pthread_create(&tid, NULL, receiver_thread, NULL);
+    if (pthread_create(&tid, NULL, receiver_thread, NULL) != 0) {
+        perror("pthread_create");
+        return 1;
+    }
+
+    printf("Relay thread started. Press Ctrl+C to stop.\n");
     pthread_join(tid, NULL);
     return 0;
 }
