@@ -9,7 +9,6 @@
 #define PORT_HTTP      8080
 #define PORT_HTTPS     8443
 #define HTML_PATH      "../html/template.html"
-#define FRAME_BUF_SIZE 65536
 
 /* ---- Telemetry ---- */
 float read_cpu_temp(void);
