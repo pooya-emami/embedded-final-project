@@ -20,6 +20,7 @@
 #define BUFFER_SIZE 65536
 #define HTML_PATH "../html/template.html"
 #define MAX_HISTORY 5
+#define FRAME_SKIP 6
 
 static shared_frame_t *g_frame;
 static unsigned char current_frame[BUFFER_SIZE];
@@ -42,11 +43,6 @@ static float cached_cpu = 0;
 static time_t last_telemetry_update = 0;
 static pthread_mutex_t telemetry_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-typedef struct {
-    SSL *ssl;
-    int fd;
-} stream_client_t;
-
 static void signal_handler(int sig) {
     (void)sig;
     running = 0;
@@ -66,8 +62,7 @@ static char *load_html(void) {
         return NULL;
     }
 
-    size_t r = fread(buf, 1, len, fp);
-    (void)r;
+    fread(buf, 1, len, fp);
     buf[len] = '\0';
     fclose(fp);
     return buf;
@@ -78,10 +73,7 @@ static float read_temp(void) {
     if (!f) return -1;
 
     int t = 0;
-    if (fscanf(f, "%d", &t) != 1) {
-        fclose(f);
-        return -1;
-    }
+    fscanf(f, "%d", &t);
     fclose(f);
     return t / 1000.0f;
 }
@@ -109,10 +101,7 @@ static float read_cpu_usage(void) {
     if (!f) return 0;
 
     long u, n, s, i;
-    if (fscanf(f, "cpu %ld %ld %ld %ld", &u, &n, &s, &i) != 4) {
-        fclose(f);
-        return 0;
-    }
+    fscanf(f, "cpu %ld %ld %ld %ld", &u, &n, &s, &i);
     fclose(f);
 
     static long prev_total = 0;
@@ -167,11 +156,23 @@ void add_history(int count, float temp) {
 void *frame_updater(void *arg) {
     (void)arg;
 
+    int raw_counter = 0;
+
     while (running) {
         unsigned char buf[BUFFER_SIZE];
         size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
 
-        if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
+        if (len == 0) {
+            usleep(20000);
+            continue;
+        }
+
+        raw_counter++;
+
+        if (raw_counter % FRAME_SKIP != 0)
+            continue;
+
+        if (buf[0] == 0xFF && buf[1] == 0xD8) {
             pthread_mutex_lock(&frame_mutex);
             memcpy(current_frame, buf, len);
             current_len = len;
@@ -181,56 +182,6 @@ void *frame_updater(void *arg) {
         usleep(20000);
     }
 
-    return NULL;
-}
-
-static void *mjpeg_stream_thread(void *arg) {
-    stream_client_t *client = (stream_client_t *)arg;
-    SSL *ssl = client->ssl;
-    int fd = client->fd;
-    free(client);
-
-    const char *mjpeg_header =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: close\r\n"
-        "\r\n";
-
-    if (SSL_write(ssl, mjpeg_header, strlen(mjpeg_header)) <= 0) {
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    while (running) {
-        pthread_mutex_lock(&frame_mutex);
-        size_t len = current_len;
-        unsigned char *copy = (len > 0) ? malloc(len) : NULL;
-        if (copy) memcpy(copy, current_frame, len);
-        pthread_mutex_unlock(&frame_mutex);
-
-        if (!copy) {
-            usleep(50000);
-            continue;
-        }
-
-        char part_hdr[128];
-        int hlen = snprintf(part_hdr, sizeof(part_hdr),
-            "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
-            len);
-
-        int ok = (SSL_write(ssl, part_hdr, hlen) > 0) &&
-                 (SSL_write(ssl, copy, (int)len) > 0) &&
-                 (SSL_write(ssl, "\r\n", 2) > 0);
-        free(copy);
-
-        if (!ok) break;
-        usleep(100000);
-    }
-
-    SSL_free(ssl);
-    close(fd);
     return NULL;
 }
 
@@ -300,16 +251,29 @@ static void handle_https(int fd) {
     }
 
     if (strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) {
-        stream_client_t *client = malloc(sizeof(stream_client_t));
-        if (client) {
-            client->ssl = ssl;
-            client->fd = fd;
-            pthread_t tid;
-            if (pthread_create(&tid, NULL, mjpeg_stream_thread, client) == 0) {
-                pthread_detach(tid);
-                return;
-            }
-            free(client);
+        pthread_mutex_lock(&frame_mutex);
+        size_t len = current_len;
+        unsigned char *copy = NULL;
+
+        if (len > 0) {
+            copy = malloc(len);
+            if (copy) memcpy(copy, current_frame, len);
+        }
+        pthread_mutex_unlock(&frame_mutex);
+
+        if (copy && len > 0) {
+            char header[256];
+            snprintf(header, sizeof(header),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: image/jpeg\r\n"
+                "Content-Length: %zu\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                len);
+            SSL_write(ssl, header, strlen(header));
+            SSL_write(ssl, copy, len);
+            free(copy);
         }
         SSL_free(ssl);
         close(fd);
@@ -454,7 +418,7 @@ static void handle_https(int fd) {
     close(fd);
 }
 
-static SSL_CTX *init_ssl() {
+static SSL_CTX *init_ssl(void) {
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
@@ -473,7 +437,7 @@ static SSL_CTX *init_ssl() {
     return ctx;
 }
 
-int main() {
+int main(void) {
     printf("Starting Security Server...\n");
 
     signal(SIGINT, signal_handler);
@@ -543,6 +507,7 @@ int main() {
     printf("HTTPS on %d\n", PORT_HTTPS);
     printf("Open: https://192.168.137.100:8443/\n");
     printf("API endpoints available at /api/v1/*\n");
+    printf("Frame skip: 1 out of %d frames (%.1f fps)\n", FRAME_SKIP, 30.0/FRAME_SKIP);
 
     while (running) {
         fd_set fds;
