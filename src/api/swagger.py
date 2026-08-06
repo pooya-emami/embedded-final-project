@@ -3,8 +3,7 @@
 from fastapi import FastAPI, Response
 from fastapi.responses import RedirectResponse
 import requests
-import json
-import uvicorn
+import urllib3
 
 app = FastAPI(
     title="Embedded Security System API",
@@ -13,115 +12,71 @@ app = FastAPI(
 )
 
 BASE_URL = "https://localhost:8443"
-
 VERIFY_SSL = False
 
-import urllib3
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 @app.get("/", include_in_schema=False)
 async def root():
-    """Redirect to Swagger UI"""
     return RedirectResponse(url="/docs")
 
-@app.get("/api/v1/telemetry")
+@app.get("/api/v1/telemetry", tags=["Telemetry"])
 async def get_telemetry():
-    """
-    Get CPU temperature, free memory, and CPU load.
-    
-    Returns:
-        - temp: CPU temperature in Celsius
-        - mem: Free memory in KB
-        - cpu: CPU load percentage
-    """
+    """Get CPU temperature, free memory, and CPU load."""
     try:
-        resp = requests.get(f"{BASE_URL}/api/v1/telemetry", verify=VERIFY_SSL)
+        resp = requests.get(f"{BASE_URL}/api/v1/telemetry", verify=VERIFY_SSL, timeout=5)
         return resp.json()
     except Exception as e:
         return {"error": str(e), "temp": -1, "mem": -1, "cpu": -1}
 
-@app.get("/api/v1/stream")
+@app.get("/api/v1/stream", tags=["Stream"])
 async def get_stream():
-    """
-    Get live MJPEG stream frame.
-    
-    Returns:
-        JPEG image of the current frame
-    """
+    """Get live MJPEG stream frame."""
     try:
-        resp = requests.get(f"{BASE_URL}/api/v1/stream", verify=VERIFY_SSL)
+        resp = requests.get(f"{BASE_URL}/api/v1/stream", verify=VERIFY_SSL, timeout=5)
         return Response(content=resp.content, media_type="image/jpeg")
     except Exception as e:
         return {"error": str(e)}
 
-@app.get("/api/v1/persons")
+@app.get("/api/v1/persons", tags=["Detection"])
 async def get_persons():
-    """
-    Get current person count with timestamp and temperature.
-    
-    Returns:
-        - count: Number of people detected
-        - timestamp: Unix timestamp
-        - temp: CPU temperature at detection time
-    """
+    """Get current person count with timestamp."""
     try:
-        resp = requests.get(f"{BASE_URL}/api/v1/persons", verify=VERIFY_SSL)
+        resp = requests.get(f"{BASE_URL}/api/v1/persons", verify=VERIFY_SSL, timeout=5)
         return resp.json()
     except Exception as e:
-        return {"error": str(e), "count": 0}
+        return {"error": str(e), "count": 0, "timestamp": 0}
 
-@app.get("/api/v1/history")
+@app.get("/api/v1/history", tags=["Detection"])
 async def get_history():
-    """
-    Get detection history (last 5 records).
-    
-    Returns:
-        Array of detection records with:
-        - count: People detected
-        - timestamp: Unix timestamp
-        - temp: CPU temperature
-    """
+    """Get detection history (last 5 records)."""
     try:
-        resp = requests.get(f"{BASE_URL}/api/v1/history", verify=VERIFY_SSL)
+        resp = requests.get(f"{BASE_URL}/api/v1/history", verify=VERIFY_SSL, timeout=5)
         return resp.json()
     except Exception as e:
         return {"error": str(e), "history": []}
 
-@app.post("/api/v1/command")
+@app.post("/api/v1/command", tags=["System"])
 async def post_command(cmd: dict):
-    """
-    Execute a system command.
-    
-    Request body:
-        {
-            "cmd": "reboot" | "shutdown" | "restart"
-        }
-    
-    Returns:
-        - status: success or error
-        - cmd: The command executed
-    """
+    """Execute a system command."""
     try:
         resp = requests.post(f"{BASE_URL}/api/v1/command", 
                             json=cmd, 
-                            verify=VERIFY_SSL)
+                            verify=VERIFY_SSL, 
+                            timeout=5)
         return resp.json()
     except Exception as e:
         return {"error": str(e), "status": "failed"}
 
-@app.get("/api/v1/health")
+@app.get("/api/v1/health", tags=["System"])
 async def health_check():
-    """
-    Health check endpoint.
-    
-    Returns:
-        - status: ok if server is running
-    """
+    """Health check endpoint."""
     try:
-        resp = requests.get(f"{BASE_URL}/", verify=VERIFY_SSL)
+        resp = requests.get(f"{BASE_URL}/", verify=VERIFY_SSL, timeout=5)
         return {"status": "ok", "message": "Server is running"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000) 
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

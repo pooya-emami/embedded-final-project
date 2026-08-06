@@ -28,7 +28,6 @@ static volatile int running = 1;
 
 static SSL_CTX *ssl_ctx = NULL;
 
-// History storage for persons detection
 typedef struct {
     int count;
     time_t timestamp;
@@ -124,7 +123,6 @@ static float read_cpu_usage(void) {
 static void add_history(int count, float temp) {
     pthread_mutex_lock(&history_mutex);
     
-    // Shift records
     if (history_count >= MAX_HISTORY) {
         memmove(&history[0], &history[1], (MAX_HISTORY - 1) * sizeof(detection_record_t));
         history_count = MAX_HISTORY - 1;
@@ -156,27 +154,6 @@ static void *frame_updater(void *arg) {
     }
 
     return NULL;
-}
-
-static void send_response(int fd, const char *status,
-                          const char *type,
-                          const void *data,
-                          size_t len)
-{
-    char header[256];
-    snprintf(header, sizeof(header),
-        "HTTP/1.1 %s\r\n"
-        "Content-Type: %s\r\n"
-        "Content-Length: %zu\r\n"
-        "Connection: close\r\n"
-        "Cache-Control: no-cache\r\n"
-        "\r\n",
-        status, type, len);
-
-    send(fd, header, strlen(header), 0);
-
-    if (data && len > 0)
-        send(fd, data, len, 0);
 }
 
 static void send_redirect(int fd) {
@@ -325,20 +302,17 @@ static void handle_https(int fd) {
     }
 
     else if (strcmp(path, "/api/v1/persons") == 0) {
+        int count = (rand() % 4);
         float temp = read_temp();
-        int count = 0; 
-        
-
-        count = (rand() % 4); 
         
         if (count > 0) {
             add_history(count, temp);
         }
 
-        char json[256];
+        char json[128];
         snprintf(json, sizeof(json),
-                 "{\"count\":%d,\"timestamp\":%ld,\"temp\":%.2f}",
-                 count, time(NULL), temp);
+                 "{\"count\":%d,\"timestamp\":%ld}",
+                 count, time(NULL));
 
         char header[512];
         snprintf(header, sizeof(header),
@@ -386,10 +360,9 @@ static void handle_https(int fd) {
 
     else if (strcmp(path, "/api/v1/command") == 0) {
         if (strcmp(method, "POST") == 0) {
-
             char *body = strstr(req, "\r\n\r\n");
             if (body) {
-                body += 4; // Skip the \r\n\r\n
+                body += 4;
                 if (strstr(body, "reboot")) {
                     const char *resp = 
                         "HTTP/1.1 200 OK\r\n"
@@ -399,7 +372,6 @@ static void handle_https(int fd) {
                         "\r\n"
                         "{\"status\":\"success\",\"cmd\":\"reboot\"}";
                     SSL_write(ssl, resp, strlen(resp));
-                    
                 } else {
                     const char *resp = 
                         "HTTP/1.1 400 Bad Request\r\n"
