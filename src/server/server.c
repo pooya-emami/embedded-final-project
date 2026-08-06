@@ -62,7 +62,8 @@ static char *load_html(void) {
         return NULL;
     }
 
-    fread(buf, 1, len, fp);
+    size_t r = fread(buf, 1, len, fp);
+    (void)r;
     buf[len] = '\0';
     fclose(fp);
     return buf;
