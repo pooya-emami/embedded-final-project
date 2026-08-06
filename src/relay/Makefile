@@ -6,8 +6,6 @@ SRC = $(wildcard *.c) ../common/shared_frame.c
 OBJ = $(SRC:.c=.o)
 TARGET = mjpeg_relay
 
-.PHONY: all clean
-
 all: $(TARGET)
 
 $(TARGET): $(OBJ)
@@ -18,3 +16,11 @@ $(TARGET): $(OBJ)
 
 clean:
 	rm -f $(OBJ) $(TARGET)
+
+run: $(TARGET)
+	./$(TARGET)
+
+debug: CFLAGS += -g -DDEBUG -O0
+debug: clean $(TARGET)
+
+.PHONY: all clean run debug

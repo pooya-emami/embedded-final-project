@@ -1,0 +1,17 @@
+[Unit]
+Description=FastAPI Wrapper Service
+After=network.target server.service
+Requires=server.service
+
+[Service]
+Type=simple
+User=orangepi
+WorkingDirectory=/home/orangepi/embedded-proj
+ExecStart=/usr/bin/python3 /usr/local/bin/api_wrapper.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

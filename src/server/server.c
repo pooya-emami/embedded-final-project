@@ -9,6 +9,7 @@
 #include <signal.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <time.h>
 
 #include "shared_frame.h"
 
@@ -16,6 +17,7 @@
 #define PORT_HTTPS 8443
 #define BUFFER_SIZE 65536
 #define HTML_PATH "../html/template.html"
+#define MAX_HISTORY 5
 
 static shared_frame_t *g_frame;
 static unsigned char current_frame[BUFFER_SIZE];
@@ -25,6 +27,17 @@ static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile int running = 1;
 
 static SSL_CTX *ssl_ctx = NULL;
+
+// History storage for persons detection
+typedef struct {
+    int count;
+    time_t timestamp;
+    float temp;
+} detection_record_t;
+
+static detection_record_t history[MAX_HISTORY];
+static int history_count = 0;
+static pthread_mutex_t history_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void signal_handler(int sig) {
     (void)sig;
@@ -108,6 +121,23 @@ static float read_cpu_usage(void) {
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
+static void add_history(int count, float temp) {
+    pthread_mutex_lock(&history_mutex);
+    
+    // Shift records
+    if (history_count >= MAX_HISTORY) {
+        memmove(&history[0], &history[1], (MAX_HISTORY - 1) * sizeof(detection_record_t));
+        history_count = MAX_HISTORY - 1;
+    }
+    
+    history[history_count].count = count;
+    history[history_count].timestamp = time(NULL);
+    history[history_count].temp = temp;
+    history_count++;
+    
+    pthread_mutex_unlock(&history_mutex);
+}
+
 static void *frame_updater(void *arg) {
     (void)arg;
 
@@ -162,68 +192,6 @@ static void send_redirect(int fd) {
     send(fd, msg, strlen(msg), 0);
 }
 
-__attribute__((unused))
-static void handle_request(int fd) {
-    char req[1024];
-    int n = read(fd, req, sizeof(req) - 1);
-    if (n <= 0) {
-        close(fd);
-        return;
-    }
-
-    req[n] = '\0';
-
-    char path[256];
-    sscanf(req, "%*s %255s", path);
-
-    char *q = strchr(path, '?');
-    if (q) *q = '\0';
-
-    if (strcmp(path, "/") == 0) {
-        char *html = load_html();
-        if (!html) {
-            send_response(fd, "500 Error", "text/plain", "Template error", 14);
-        } else {
-            send_response(fd, "200 OK", "text/html", html, strlen(html));
-            free(html);
-        }
-    }
-    else if (strcmp(path, "/stream") == 0) {
-        pthread_mutex_lock(&frame_mutex);
-
-        if (current_len == 0) {
-            pthread_mutex_unlock(&frame_mutex);
-            send_response(fd, "404 Not Found", "text/plain", "No frame", 8);
-        } else {
-            unsigned char *copy = malloc(current_len);
-            memcpy(copy, current_frame, current_len);
-            size_t len = current_len;
-
-            pthread_mutex_unlock(&frame_mutex);
-
-            send_response(fd, "200 OK", "image/jpeg", copy, len);
-            free(copy);
-        }
-    }
-    else if (strcmp(path, "/telemetry") == 0) {
-        float temp = read_temp();
-        long mem = read_mem_available();
-        float cpu = read_cpu_usage();
-
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                 "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}",
-                 temp, mem, cpu);
-
-        send_response(fd, "200 OK", "application/json", buf, strlen(buf));
-    }
-    else {
-        send_response(fd, "404 Not Found", "text/plain", "Not Found", 9);
-    }
-
-    close(fd);
-}
-
 static void handle_https(int fd) {
     SSL *ssl = SSL_new(ssl_ctx);
     SSL_set_fd(ssl, fd);
@@ -234,7 +202,7 @@ static void handle_https(int fd) {
         return;
     }
 
-    char req[1024];
+    char req[4096];
     int n = SSL_read(ssl, req, sizeof(req) - 1);
     if (n <= 0) {
         SSL_free(ssl);
@@ -244,8 +212,8 @@ static void handle_https(int fd) {
 
     req[n] = '\0';
 
-    char path[256];
-    sscanf(req, "%*s %255s", path);
+    char method[16], path[256];
+    sscanf(req, "%15s %255s", method, path);
 
     char *q = strchr(path, '?');
     if (q) *q = '\0';
@@ -312,6 +280,149 @@ static void handle_https(int fd) {
 
         SSL_write(ssl, header, strlen(header));
     }
+
+    else if (strcmp(path, "/api/v1/telemetry") == 0) {
+        float temp = read_temp();
+        long mem = read_mem_available();
+        float cpu = read_cpu_usage();
+
+        char json[256];
+        snprintf(json, sizeof(json),
+                 "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}",
+                 temp, mem, cpu);
+
+        char header[512];
+        snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %zu\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n%s",
+            strlen(json), json);
+
+        SSL_write(ssl, header, strlen(header));
+    }
+
+    else if (strcmp(path, "/api/v1/stream") == 0) {
+        pthread_mutex_lock(&frame_mutex);
+
+        if (current_len > 0) {
+            char header[256];
+            snprintf(header, sizeof(header),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: image/jpeg\r\n"
+                "Content-Length: %zu\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                current_len);
+            SSL_write(ssl, header, strlen(header));
+            SSL_write(ssl, current_frame, current_len);
+        }
+
+        pthread_mutex_unlock(&frame_mutex);
+    }
+
+    else if (strcmp(path, "/api/v1/persons") == 0) {
+        float temp = read_temp();
+        int count = 0; 
+        
+
+        count = (rand() % 4); 
+        
+        if (count > 0) {
+            add_history(count, temp);
+        }
+
+        char json[256];
+        snprintf(json, sizeof(json),
+                 "{\"count\":%d,\"timestamp\":%ld,\"temp\":%.2f}",
+                 count, time(NULL), temp);
+
+        char header[512];
+        snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %zu\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n%s",
+            strlen(json), json);
+
+        SSL_write(ssl, header, strlen(header));
+    }
+
+    else if (strcmp(path, "/api/v1/history") == 0) {
+        pthread_mutex_lock(&history_mutex);
+        
+        char json[1024] = "{\"history\":[";
+        
+        for (int i = 0; i < history_count; i++) {
+            char entry[256];
+            snprintf(entry, sizeof(entry),
+                "{\"count\":%d,\"timestamp\":%ld,\"temp\":%.2f}",
+                history[i].count, history[i].timestamp, history[i].temp);
+            
+            strcat(json, entry);
+            if (i < history_count - 1) strcat(json, ",");
+        }
+        
+        strcat(json, "]}");
+        pthread_mutex_unlock(&history_mutex);
+
+        char header[2048];
+        snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %zu\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n%s",
+            strlen(json), json);
+
+        SSL_write(ssl, header, strlen(header));
+    }
+
+    else if (strcmp(path, "/api/v1/command") == 0) {
+        if (strcmp(method, "POST") == 0) {
+
+            char *body = strstr(req, "\r\n\r\n");
+            if (body) {
+                body += 4; // Skip the \r\n\r\n
+                if (strstr(body, "reboot")) {
+                    const char *resp = 
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 40\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        "{\"status\":\"success\",\"cmd\":\"reboot\"}";
+                    SSL_write(ssl, resp, strlen(resp));
+                    
+                } else {
+                    const char *resp = 
+                        "HTTP/1.1 400 Bad Request\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: 35\r\n"
+                        "Connection: close\r\n"
+                        "\r\n"
+                        "{\"error\":\"Unknown command\"}";
+                    SSL_write(ssl, resp, strlen(resp));
+                }
+            }
+        } else {
+            const char *resp = 
+                "HTTP/1.1 405 Method Not Allowed\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 36\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"Method not allowed\"}";
+            SSL_write(ssl, resp, strlen(resp));
+        }
+    }
+
     else {
         SSL_write(ssl, "HTTP/1.1 404 Not Found\r\n\r\n", 26);
     }
@@ -342,6 +453,8 @@ int main(void) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+
+    srand(time(NULL));
 
     g_frame = shared_frame_open();
     if (!g_frame) {
@@ -389,6 +502,7 @@ int main(void) {
 
     printf("HTTPS on %d\n", PORT_HTTPS);
     printf("Open: https://192.168.137.100:8443/\n");
+    printf("API endpoints available at /api/v1/*\n");
 
     while (running) {
         fd_set fds;

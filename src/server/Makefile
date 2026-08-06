@@ -11,5 +11,16 @@ all: $(TARGET)
 $(TARGET): $(OBJ)
 	$(CC) $(OBJ) -o $@ $(LDFLAGS)
 
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 clean:
 	rm -f $(OBJ) $(TARGET)
+
+run: $(TARGET)
+	./$(TARGET)
+
+debug: CFLAGS += -g -DDEBUG -O0
+debug: clean $(TARGET)
+
+.PHONY: all clean run debug
