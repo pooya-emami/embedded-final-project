@@ -148,7 +148,7 @@ static void *telemetry_updater(void *arg) {
     return NULL;
 }
 
-static void add_history(int count, float temp) {
+void add_history(int count, float temp) {
     pthread_mutex_lock(&history_mutex);
     
     if (history_count >= MAX_HISTORY) {
@@ -164,7 +164,7 @@ static void add_history(int count, float temp) {
     pthread_mutex_unlock(&history_mutex);
 }
 
-static void *frame_updater(void *arg) {
+void *frame_updater(void *arg) {
     (void)arg;
 
     while (running) {
@@ -240,7 +240,7 @@ static void set_socket_timeout(int fd, int seconds) {
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
-static void send_redirect(int fd) {
+void send_redirect(int fd) {
     const char *msg =
         "HTTP/1.1 301 Moved Permanently\r\n"
         "Location: https://192.168.137.100:8443/\r\n"
@@ -454,7 +454,7 @@ static void handle_https(int fd) {
     close(fd);
 }
 
-static SSL_CTX *init_ssl(void) {
+static SSL_CTX *init_ssl() {
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
@@ -473,7 +473,7 @@ static SSL_CTX *init_ssl(void) {
     return ctx;
 }
 
-int main(void) {
+int main() {
     printf("Starting Security Server...\n");
 
     signal(SIGINT, signal_handler);
