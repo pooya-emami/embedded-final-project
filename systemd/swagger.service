@@ -1,5 +1,5 @@
 [Unit]
-Description=FastAPI Wrapper Service
+Description=FastAPI Swagger Service
 After=network.target server.service
 Requires=server.service
 
@@ -7,7 +7,7 @@ Requires=server.service
 Type=simple
 User=orangepi
 WorkingDirectory=/home/orangepi/embedded-proj
-ExecStart=/usr/bin/python3 /usr/local/bin/api_wrapper.py
+ExecStart=/usr/bin/python3 /usr/local/bin/swagger.py
 Restart=always
 RestartSec=5
 StandardOutput=journal
