@@ -6,12 +6,10 @@ Requires=server.service
 [Service]
 Type=simple
 User=orangepi
-WorkingDirectory=/home/orangepi/embedded-proj
-ExecStart=/usr/bin/python3 /usr/local/bin/swagger.py
+WorkingDirectory=/home/orangepi/embedded-proj/src/api
+ExecStart=/usr/bin/python3 /home/orangepi/embedded-proj/src/api/swagger.py
 Restart=always
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
