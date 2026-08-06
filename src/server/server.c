@@ -153,9 +153,11 @@ static void send_redirect(int fd) {
     const char *msg =
         "HTTP/1.1 301 Moved Permanently\r\n"
         "Location: https://192.168.137.100:8443/\r\n"
-        "Content-Length: 0\r\n"
+        "Content-Type: text/html\r\n"
+        "Content-Length: 24\r\n"
         "Connection: close\r\n"
-        "\r\n";
+        "\r\n"
+        "<html>Redirecting...</html>";
 
     send(fd, msg, strlen(msg), 0);
 }
