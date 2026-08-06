@@ -10,6 +10,7 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <time.h>
+#include <stdint.h>
 
 #include "shared_frame.h"
 
@@ -183,6 +184,12 @@ static void *frame_updater(void *arg) {
     return NULL;
 }
 
+static void set_socket_timeout(int fd, int seconds) {
+    struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
 static void send_redirect(int fd) {
     const char *msg =
         "HTTP/1.1 301 Moved Permanently\r\n"
@@ -222,7 +229,6 @@ static void handle_https(int fd) {
     char *q = strchr(path, '?');
     if (q) *q = '\0';
 
-    // HTML page - use cached version
     if (strcmp(path, "/") == 0) {
         if (html_cache) {
             char header[512];
@@ -241,30 +247,39 @@ static void handle_https(int fd) {
     }
 
     else if (strcmp(path, "/stream") == 0) {
-        pthread_mutex_lock(&frame_mutex);
-        size_t len = current_len;
-        pthread_mutex_unlock(&frame_mutex);
-        
-        if (len > 0) {
-            unsigned char *copy = malloc(len);
-            if (copy) {
+        const char *mjpeg_header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        if (SSL_write(ssl, mjpeg_header, strlen(mjpeg_header)) > 0) {
+            while (running) {
                 pthread_mutex_lock(&frame_mutex);
-                memcpy(copy, current_frame, len);
+                size_t len = current_len;
+                unsigned char *copy = (len > 0) ? malloc(len) : NULL;
+                if (copy) memcpy(copy, current_frame, len);
                 pthread_mutex_unlock(&frame_mutex);
-                
-                char header[256];
-                snprintf(header, sizeof(header),
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: image/jpeg\r\n"
-                    "Content-Length: %zu\r\n"
-                    "Cache-Control: no-cache\r\n"
-                    "Connection: close\r\n"
-                    "\r\n",
+
+                if (!copy) {
+                    usleep(50000);
+                    continue;
+                }
+
+                char part_hdr[128];
+                int hlen = snprintf(part_hdr, sizeof(part_hdr),
+                    "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
                     len);
 
-                SSL_write(ssl, header, strlen(header));
-                SSL_write(ssl, copy, len);
+                int ok = (SSL_write(ssl, part_hdr, hlen) > 0) &&
+                         (SSL_write(ssl, copy, (int)len) > 0) &&
+                         (SSL_write(ssl, "\r\n", 2) > 0);
                 free(copy);
+
+                if (!ok) break; 
+
+                usleep(100000); 
             }
         }
     }
@@ -320,30 +335,39 @@ static void handle_https(int fd) {
     }
 
     else if (strcmp(path, "/api/v1/stream") == 0) {
-        pthread_mutex_lock(&frame_mutex);
-        size_t len = current_len;
-        pthread_mutex_unlock(&frame_mutex);
-        
-        if (len > 0) {
-            unsigned char *copy = malloc(len);
-            if (copy) {
+        const char *mjpeg_header =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n";
+
+        if (SSL_write(ssl, mjpeg_header, strlen(mjpeg_header)) > 0) {
+            while (running) {
                 pthread_mutex_lock(&frame_mutex);
-                memcpy(copy, current_frame, len);
+                size_t len = current_len;
+                unsigned char *copy = (len > 0) ? malloc(len) : NULL;
+                if (copy) memcpy(copy, current_frame, len);
                 pthread_mutex_unlock(&frame_mutex);
-                
-                char header[256];
-                snprintf(header, sizeof(header),
-                    "HTTP/1.1 200 OK\r\n"
-                    "Content-Type: image/jpeg\r\n"
-                    "Content-Length: %zu\r\n"
-                    "Cache-Control: no-cache\r\n"
-                    "Connection: close\r\n"
-                    "\r\n",
+
+                if (!copy) {
+                    usleep(50000);
+                    continue;
+                }
+
+                char part_hdr[128];
+                int hlen = snprintf(part_hdr, sizeof(part_hdr),
+                    "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\n\r\n",
                     len);
 
-                SSL_write(ssl, header, strlen(header));
-                SSL_write(ssl, copy, len);
+                int ok = (SSL_write(ssl, part_hdr, hlen) > 0) &&
+                         (SSL_write(ssl, copy, (int)len) > 0) &&
+                         (SSL_write(ssl, "\r\n", 2) > 0);
                 free(copy);
+
+                if (!ok) break;
+
+                usleep(100000);
             }
         }
     }
@@ -452,6 +476,12 @@ static void handle_https(int fd) {
     close(fd);
 }
 
+static void *client_thread(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    handle_https(fd);
+    return NULL;
+}
+
 static SSL_CTX *init_ssl(void) {
     SSL_library_init();
     SSL_load_error_strings();
@@ -549,6 +579,7 @@ int main(void) {
         if (FD_ISSET(http_fd, &fds)) {
             int fd = accept(http_fd, NULL, NULL);
             if (fd >= 0) {
+                set_socket_timeout(fd, 5);
                 send_redirect(fd);
                 close(fd);
             }
@@ -556,8 +587,16 @@ int main(void) {
 
         if (FD_ISSET(https_fd, &fds)) {
             int fd = accept(https_fd, NULL, NULL);
-            if (fd >= 0)
-                handle_https(fd);
+            if (fd >= 0) {
+                set_socket_timeout(fd, 10);
+
+                pthread_t tid;
+                if (pthread_create(&tid, NULL, client_thread, (void *)(intptr_t)fd) == 0) {
+                    pthread_detach(tid);
+                } else {
+                    close(fd);
+                }
+            }
         }
     }
 

@@ -34,19 +34,18 @@
 
 <h1>Embedded Security System – Pooya Emami</h1>
 
-<!-- Live stream -->
+<!-- Live stream: this is a persistent multipart/x-mixed-replace connection.
+     The browser keeps ONE connection open and swaps frames as they arrive,
+     no polling / no repeated handshakes needed. --> 
 <img id="stream" src="/stream" width="480" alt="Live Stream">
 
 <h3>Telemetry</h3>
 <div id="tele">Loading...</div>
 
 <script>
-// Force image refresh every 200ms
-function refreshStream() {
-    var img = document.getElementById('stream');
-    // Add timestamp to force reload
-    img.src = '/stream?t=' + new Date().getTime();
-}
+// No more manual refresh loop for the stream -- the <img> tag above is
+// pointed at the multipart MJPEG endpoint and updates itself as new
+// frames arrive over the single open connection.
 
 function updateTelemetry() {
     fetch('/telemetry')
@@ -62,8 +61,6 @@ function updateTelemetry() {
         });
 }
 
-// Start the stream refresh
-setInterval(refreshStream, 200);
 setInterval(updateTelemetry, 2000);
 updateTelemetry();
 </script>
