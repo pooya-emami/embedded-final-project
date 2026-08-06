@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include <time.h>
 
 #define PORT_HTTP   8080
 #define PORT_HTTPS  8443
