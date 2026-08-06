@@ -73,7 +73,10 @@ static float read_temp(void) {
     if (!f) return -1;
 
     int t = 0;
-    fscanf(f, "%d", &t);
+    if (fscanf(f, "%d", &t) != 1) {
+        fclose(f);
+        return -1;
+    }
     fclose(f);
     return t / 1000.0f;
 }
@@ -101,7 +104,10 @@ static float read_cpu_usage(void) {
     if (!f) return 0;
 
     long u, n, s, i;
-    fscanf(f, "cpu %ld %ld %ld %ld", &u, &n, &s, &i);
+    if (fscanf(f, "cpu %ld %ld %ld %ld", &u, &n, &s, &i) != 4) {
+        fclose(f);
+        return 0;
+    }
     fclose(f);
 
     static long prev_total = 0;
