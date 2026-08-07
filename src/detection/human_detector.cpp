@@ -13,6 +13,7 @@
 
 // Dummy detection - replace with YOLO later
 static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
+    (void)img320;
     return { cv::Rect(80, 80, 160, 160) };  // fake box
 }
 
@@ -22,7 +23,7 @@ extern "C" DetectionResult process_frame(
     int output_width,
     int output_height
 ) {
-    DetectionResult result = {0};
+    DetectionResult result = {};
 
     // Step 1: Decode JPEG → Mat
     std::vector<uint8_t> buf(jpeg_data, jpeg_data + jpeg_len);
