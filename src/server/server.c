@@ -17,7 +17,7 @@
 #include "shared_frame.h"
 
 extern "C" {
-    #include "detector.hpp"
+    #include "human_detector.hpp"
 }
 
 #define BUFFER_SIZE 65536
