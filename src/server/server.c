@@ -17,11 +17,6 @@
 #include "shared_frame.h"
 #include "human_detector.hpp"
 
-
-#define BUFFER_SIZE 65536
-#define HTML_PATH "../html/template.html"
-#define CONFIG_PATH "server.conf"
-
 int g_frame_interval_ms = DEFAULT_FRAME_INTERVAL_MS;
 int g_frame_width = DEFAULT_FRAME_WIDTH;
 int g_frame_height = DEFAULT_FRAME_HEIGHT;

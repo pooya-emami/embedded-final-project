@@ -6,7 +6,9 @@
 #include <sys/types.h>
 #include <time.h>
 
-#define CONFIG_PATH "/usr/local/bin/server.conf"
+#define BUFFER_SIZE 65536
+#define HTML_PATH "../html/template.html"
+#define CONFIG_PATH "server.conf"
 
 // Default values (used if config file not found)
 #define DEFAULT_FRAME_INTERVAL_MS 100
