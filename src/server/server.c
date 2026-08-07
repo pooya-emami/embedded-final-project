@@ -15,10 +15,8 @@
 
 #include "server.h"
 #include "shared_frame.h"
+#include "human_detector.hpp"
 
-extern "C" {
-    #include "human_detector.hpp"
-}
 
 #define BUFFER_SIZE 65536
 #define HTML_PATH "../html/template.html"
