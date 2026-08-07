@@ -56,7 +56,6 @@ void *receiver_thread(void *arg) {
     unsigned char buf[RELAY_BUF_SIZE];
     unsigned char jpeg[RELAY_BUF_SIZE];
     size_t jpeg_len = 0;
-    int frame_count = 0;
 
     while (1) {
         client_fd = accept(server_fd, (struct sockaddr*)&addr, &addr_len);
@@ -94,9 +93,7 @@ void *receiver_thread(void *arg) {
             int eoi = find_marker(jpeg, jpeg_len, 0xFF, 0xD9);
 
             if (soi >= 0 && eoi > soi) {
-                frame_count++;
-                size_t frame_size = eoi + 2; 
-                printf("Frame #%d: %zu bytes\n", frame_count, frame_size);
+                size_t frame_size = eoi + 2;
                 shared_frame_write(g_frame, jpeg + soi, frame_size - soi);
 
                 if (frame_size < jpeg_len) {
