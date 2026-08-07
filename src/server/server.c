@@ -19,7 +19,7 @@
 #include "shared_frame.h"
 #include "human_detector.hpp"
 
-#define MAX_EVENTS 32
+#define MAX_EVENTS 64
 #define MJPEG_BOUNDARY "mjpegframe"
 
 int g_frame_interval_ms = DEFAULT_FRAME_INTERVAL_MS;
@@ -34,15 +34,18 @@ int g_watchdog_timeout_ms = DEFAULT_WATCHDOG_TIMEOUT_MS;
 
 static shared_frame_t *g_frame;
 
-// Double buffering for zero-copy frame access
+// Triple buffering for zero-copy frame access
 typedef struct {
     unsigned char buf[BUFFER_SIZE];
     size_t len;
+    volatile int ready;
 } frame_buffer_t;
 
-static frame_buffer_t g_buffers[2];
-static volatile int g_active_idx = 0;
-static pthread_rwlock_t frame_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+static frame_buffer_t g_buffers[3];
+static volatile int g_write_idx = 0;
+static volatile int g_read_idx = 0;
+static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t frame_cond = PTHREAD_COND_INITIALIZER;
 
 static volatile sig_atomic_t running = 1;
 static SSL_CTX *ssl_ctx = NULL;
@@ -148,6 +151,7 @@ static void signal_handler(int sig) {
         return;
     }
     running = 0;
+    pthread_cond_broadcast(&frame_cond);
 }
 
 static char *load_html(size_t *out_len) {
@@ -252,17 +256,17 @@ void *frame_updater(void *arg) {
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
             
-            int next_idx = 1 - g_active_idx;
-            size_t copy_len = res.jpeg_length > BUFFER_SIZE ? BUFFER_SIZE : res.jpeg_length;
-            
-            if (res.jpeg_output && copy_len > 0) {
-                memcpy(g_buffers[next_idx].buf, res.jpeg_output, copy_len);
-                g_buffers[next_idx].len = copy_len;
-
-                // Atomic buffer swap using Write Lock
-                pthread_rwlock_wrlock(&frame_rwlock);
-                g_active_idx = next_idx;
-                pthread_rwlock_unlock(&frame_rwlock);
+            if (res.jpeg_output && res.jpeg_length > 0) {
+                int idx = g_write_idx;
+                size_t copy_len = res.jpeg_length > BUFFER_SIZE ? BUFFER_SIZE : res.jpeg_length;
+                
+                pthread_mutex_lock(&frame_mutex);
+                memcpy(g_buffers[idx].buf, res.jpeg_output, copy_len);
+                g_buffers[idx].len = copy_len;
+                g_buffers[idx].ready = 1;
+                g_write_idx = (g_write_idx + 1) % 3;
+                pthread_cond_signal(&frame_cond);
+                pthread_mutex_unlock(&frame_mutex);
             }
 
             free_detection_result(&res);
@@ -290,6 +294,85 @@ static void handle_http_redirect(int fd) {
         "<html>Redirecting...</html>";
     send(fd, redir, strlen(redir), 0);
     close(fd);
+}
+
+// MJPEG streaming thread per client - fully non-blocking
+static void *mjpeg_streamer_thread(void *arg) {
+    SSL *ssl = (SSL*)arg;
+    
+    const char *mjpeg_hdr = 
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=" MJPEG_BOUNDARY "\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n";
+    
+    if (SSL_write(ssl, mjpeg_hdr, strlen(mjpeg_hdr)) <= 0) {
+        SSL_free(ssl);
+        return NULL;
+    }
+
+    int last_idx = -1;
+    
+    while (running) {
+        pthread_mutex_lock(&frame_mutex);
+        
+        // Wait for new frame or timeout
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 1;  // 1 second timeout
+        
+        int ret = pthread_cond_timedwait(&frame_cond, &frame_mutex, &ts);
+        
+        if (ret == ETIMEDOUT || !running) {
+            pthread_mutex_unlock(&frame_mutex);
+            break;
+        }
+        
+        // Find the latest ready frame
+        int read_idx = g_read_idx;
+        int found = 0;
+        
+        // Check if there's a newer frame
+        for (int i = 0; i < 3; i++) {
+            int idx = (g_read_idx + i) % 3;
+            if (g_buffers[idx].ready && idx != last_idx) {
+                read_idx = idx;
+                found = 1;
+                break;
+            }
+        }
+        
+        if (!found) {
+            pthread_mutex_unlock(&frame_mutex);
+            continue;
+        }
+        
+        size_t len = g_buffers[read_idx].len;
+        
+        if (len > 0) {
+            char frame_hdr[256];
+            int hlen = snprintf(frame_hdr, sizeof(frame_hdr),
+                "--" MJPEG_BOUNDARY "\r\n"
+                "Content-Type: image/jpeg\r\n"
+                "Content-Length: %zu\r\n"
+                "\r\n", len);
+            
+            pthread_mutex_unlock(&frame_mutex);
+            
+            // Send frame (non-blocking SSL)
+            if (SSL_write(ssl, frame_hdr, hlen) <= 0) break;
+            if (SSL_write(ssl, g_buffers[read_idx].buf, len) <= 0) break;
+            
+            last_idx = read_idx;
+            g_read_idx = (read_idx + 1) % 3;
+        } else {
+            pthread_mutex_unlock(&frame_mutex);
+        }
+    }
+    
+    SSL_free(ssl);
+    return NULL;
 }
 
 static void handle_https_client(int fd) {
@@ -326,7 +409,21 @@ static void handle_https_client(int fd) {
     char *q = strchr(path, '?');
     if (q) *q = '\0';
 
-    // HTTP/HTTPS endpoint routing
+    // Check if this is a streaming request
+    if ((strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) && 
+        mjpeg_streaming_enabled) {
+        // Spawn dedicated streaming thread
+        pthread_t stream_thread;
+        if (pthread_create(&stream_thread, NULL, mjpeg_streamer_thread, ssl) == 0) {
+            pthread_detach(stream_thread);
+        } else {
+            SSL_free(ssl);
+            close(fd);
+        }
+        return;
+    }
+
+    // Regular HTTP/HTTPS request handling
     if (strcmp(path, "/") == 0) {
         if (html_cache) {
             char header[512];
@@ -342,49 +439,14 @@ static void handle_https_client(int fd) {
         }
     } 
     else if (strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) {
-        if (mjpeg_streaming_enabled) {
-            // MJPEG Multipart Stream
-            const char *mjpeg_hdr = 
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: multipart/x-mixed-replace; boundary=" MJPEG_BOUNDARY "\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Connection: close\r\n"
-                "\r\n";
-            SSL_write(ssl, mjpeg_hdr, strlen(mjpeg_hdr));
-
-            while (running) {
-                pthread_rwlock_rdlock(&frame_rwlock);
-                int idx = g_active_idx;
-                size_t len = g_buffers[idx].len;
-                
-                if (len > 0) {
-                    char frame_hdr[256];
-                    int hlen = snprintf(frame_hdr, sizeof(frame_hdr),
-                        "--" MJPEG_BOUNDARY "\r\n"
-                        "Content-Type: image/jpeg\r\n"
-                        "Content-Length: %zu\r\n"
-                        "\r\n", len);
-                    
-                    if (SSL_write(ssl, frame_hdr, hlen) <= 0) {
-                        pthread_rwlock_unlock(&frame_rwlock);
-                        break;
-                    }
-                    if (SSL_write(ssl, g_buffers[idx].buf, len) <= 0) {
-                        pthread_rwlock_unlock(&frame_rwlock);
-                        break;
-                    }
-                }
-                pthread_rwlock_unlock(&frame_rwlock);
-                
-                // ~30 FPS
-                usleep(33000);
-            }
-        } else {
-            // Single JPEG fallback
-            pthread_rwlock_rdlock(&frame_rwlock);
-            int idx = g_active_idx;
-            size_t len = g_buffers[idx].len;
-            
+        // Single JPEG fallback when MJPEG is disabled
+        pthread_mutex_lock(&frame_mutex);
+        int idx = g_read_idx;
+        size_t len = g_buffers[idx].len;
+        int ready = g_buffers[idx].ready;
+        pthread_mutex_unlock(&frame_mutex);
+        
+        if (ready && len > 0) {
             char header[256];
             int hlen = snprintf(header, sizeof(header),
                 "HTTP/1.1 200 OK\r\n"
@@ -393,10 +455,8 @@ static void handle_https_client(int fd) {
                 "Cache-Control: no-cache\r\n"
                 "Connection: close\r\n"
                 "\r\n", len);
-            
             SSL_write(ssl, header, hlen);
-            if (len > 0) SSL_write(ssl, g_buffers[idx].buf, len);
-            pthread_rwlock_unlock(&frame_rwlock);
+            SSL_write(ssl, g_buffers[idx].buf, len);
         }
     } 
     else if (strcmp(path, "/telemetry") == 0 || strcmp(path, "/api/v1/telemetry") == 0) {
@@ -526,9 +586,7 @@ static SSL_CTX *init_ssl(void) {
         "ECDHE-ECDSA-AES128-GCM-SHA256:"
         "ECDHE-RSA-AES128-GCM-SHA256:"
         "ECDHE-ECDSA-CHACHA20-POLY1305:"
-        "ECDHE-RSA-CHACHA20-POLY1305:"
-        "ECDHE-ECDSA-AES256-GCM-SHA384:"
-        "ECDHE-RSA-AES256-GCM-SHA384");
+        "ECDHE-RSA-CHACHA20-POLY1305");
 
     if (SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM) <= 0) {
         ERR_print_errors_fp(stderr);
@@ -594,6 +652,12 @@ int main(void) {
         printf("Failed to open shared frame\n");
         free(history);
         return 1;
+    }
+
+    // Initialize buffers
+    for (int i = 0; i < 3; i++) {
+        g_buffers[i].len = 0;
+        g_buffers[i].ready = 0;
     }
 
     pthread_t updater, telemetry_thread;
