@@ -1,10 +1,11 @@
-#include "detector.hpp"
 #include <opencv2/opencv.hpp>
 #include <iostream>
 #include <chrono>
 #include <sstream>
 #include <iomanip>
 #include <cstdlib>
+
+#include "human_detector.hpp"
 
 // Dummy detection - replace with YOLO later
 static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
