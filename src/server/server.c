@@ -20,7 +20,7 @@
 #define BUFFER_SIZE 65536
 #define HTML_PATH "../html/template.html"
 #define MAX_HISTORY 5
-#define FRAME_SKIP 6
+#define FRAME_INTERVAL_MS 100  // 10 fps (100ms between frames)
 
 static shared_frame_t *g_frame;
 static unsigned char current_frame[BUFFER_SIZE];
@@ -163,34 +163,34 @@ void add_history(int count, float temp) {
 void *frame_updater(void *arg) {
     (void)arg;
 
-    int raw_counter = 0;
+    const long interval_ms = FRAME_INTERVAL_MS;   // e.g., 100 ms
+    struct timespec next_time;
+    clock_gettime(CLOCK_MONOTONIC, &next_time);
 
     while (running) {
         unsigned char buf[BUFFER_SIZE];
         size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
 
-        if (len == 0) {
-            usleep(20000);
-            continue;
-        }
-
-        raw_counter++;
-
-        if (raw_counter % FRAME_SKIP != 0)
-            continue;
-
-        if (buf[0] == 0xFF && buf[1] == 0xD8) {
+        if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             pthread_mutex_lock(&frame_mutex);
             memcpy(current_frame, buf, len);
             current_len = len;
             pthread_mutex_unlock(&frame_mutex);
         }
 
-        usleep(20000);
+        next_time.tv_nsec += interval_ms * 1000000L;
+
+        while (next_time.tv_nsec >= 1000000000L) {
+            next_time.tv_nsec -= 1000000000L;
+            next_time.tv_sec += 1;
+        }
+
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_time, NULL);
     }
 
     return NULL;
 }
+
 
 static void set_socket_timeout(int fd, int seconds) {
     struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
@@ -514,7 +514,7 @@ int main(void) {
     printf("HTTPS on %d\n", PORT_HTTPS);
     printf("Open: https://192.168.137.100:8443/\n");
     printf("API endpoints available at /api/v1/*\n");
-    printf("Frame skip: 1 out of %d frames (%.1f fps)\n", FRAME_SKIP, 30.0/FRAME_SKIP);
+    printf("Frame capture: %d ms interval (%.1f fps)\n", FRAME_INTERVAL_MS, 1000.0/FRAME_INTERVAL_MS);
 
     while (running) {
         fd_set fds;
