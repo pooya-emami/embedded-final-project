@@ -1,10 +1,10 @@
 CC = gcc
 CXX = g++
-CFLAGS = -Wall -Wextra -O2 -std=gnu11 -I. -I../common
-CXXFLAGS = -Wall -Wextra -O2 -std=c++11 -I. -I../common `pkg-config --cflags opencv4`
+CFLAGS = -Wall -Wextra -O2 -std=gnu11 -I. -I../common -I../detection
+CXXFLAGS = -Wall -Wextra -O2 -std=c++11 -I. -I../common -I../detection `pkg-config --cflags opencv4`
 LDFLAGS = -lpthread -lrt -lssl -lcrypto `pkg-config --libs opencv4`
 
-SRC = server.c ../common/shared_frame.c human_detector.cpp
+SRC = server.c ../common/shared_frame.c ../detection/human_detector.cpp
 OBJ = server.o shared_frame.o human_detector.o
 TARGET = server
 
@@ -19,7 +19,7 @@ server.o: server.c
 shared_frame.o: ../common/shared_frame.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-human_detector.o: human_detector.cpp
+human_detector.o: ../detection/human_detector.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
 clean:
