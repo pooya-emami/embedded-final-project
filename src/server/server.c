@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/epoll.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
@@ -12,10 +13,14 @@
 #include <time.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <errno.h>
 
 #include "server.h"
 #include "shared_frame.h"
 #include "human_detector.hpp"
+
+#define MAX_EVENTS 32
+#define MJPEG_BOUNDARY "mjpegframe"
 
 int g_frame_interval_ms = DEFAULT_FRAME_INTERVAL_MS;
 int g_frame_width = DEFAULT_FRAME_WIDTH;
@@ -28,12 +33,18 @@ int g_min_interval_ms = DEFAULT_MIN_INTERVAL_MS;
 int g_watchdog_timeout_ms = DEFAULT_WATCHDOG_TIMEOUT_MS;
 
 static shared_frame_t *g_frame;
-static unsigned char current_frame[BUFFER_SIZE];
-static size_t current_len = 0;
 
-static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
-static volatile int running = 1;
+// Double buffering for zero-copy frame access
+typedef struct {
+    unsigned char buf[BUFFER_SIZE];
+    size_t len;
+} frame_buffer_t;
 
+static frame_buffer_t g_buffers[2];
+static volatile int g_active_idx = 0;
+static pthread_rwlock_t frame_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+
+static volatile sig_atomic_t running = 1;
 static SSL_CTX *ssl_ctx = NULL;
 
 static detection_record_t *history = NULL;
@@ -41,6 +52,7 @@ static int history_count = 0;
 static pthread_mutex_t history_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static char *html_cache = NULL;
+static size_t html_cache_len = 0;
 
 static float cached_temp = -1;
 static long cached_mem = -1;
@@ -48,13 +60,13 @@ static float cached_cpu = 0;
 static pthread_mutex_t telemetry_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static int current_interval_ms = 100;
+static int mjpeg_streaming_enabled = 1;
 
 static void trim(char *str) {
     char *start = str;
-    char *end;
     while (isspace((unsigned char)*start)) start++;
     if (*start == 0) { str[0] = '\0'; return; }
-    end = start + strlen(start) - 1;
+    char *end = start + strlen(start) - 1;
     while (end > start && isspace((unsigned char)*end)) end--;
     end[1] = '\0';
     if (start != str) memmove(str, start, strlen(start) + 1);
@@ -112,6 +124,9 @@ void load_config(const char *filename) {
         } else if (strcmp(key, "WATCHDOG_TIMEOUT_MS") == 0) {
             g_watchdog_timeout_ms = atoi(value);
             loaded++;
+        } else if (strcmp(key, "MJPEG_STREAMING") == 0) {
+            mjpeg_streaming_enabled = atoi(value);
+            loaded++;
         }
     }
     
@@ -135,7 +150,7 @@ static void signal_handler(int sig) {
     running = 0;
 }
 
-static char *load_html(void) {
+static char *load_html(size_t *out_len) {
     FILE *fp = fopen(HTML_PATH, "r");
     if (!fp) return NULL;
     fseek(fp, 0, SEEK_END);
@@ -147,14 +162,15 @@ static char *load_html(void) {
     (void)r;
     buf[len] = '\0';
     fclose(fp);
+    if (out_len) *out_len = len;
     return buf;
 }
 
 static float read_temp(void) {
     FILE *f = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
-    if (!f) return -1;
+    if (!f) return -1.0f;
     int t = 0;
-    if (fscanf(f, "%d", &t) != 1) { fclose(f); return -1; }
+    if (fscanf(f, "%d", &t) != 1) { fclose(f); return -1.0f; }
     fclose(f);
     return t / 1000.0f;
 }
@@ -173,40 +189,38 @@ static long read_mem_available(void) {
 
 static float read_cpu_usage(void) {
     FILE *f = fopen("/proc/stat", "r");
-    if (!f) return 0;
+    if (!f) return 0.0f;
     long u, n, s, i;
-    if (fscanf(f, "cpu %ld %ld %ld %ld", &u, &n, &s, &i) != 4) { fclose(f); return 0; }
+    if (fscanf(f, "cpu %ld %ld %ld %ld", &u, &n, &s, &i) != 4) { fclose(f); return 0.0f; }
     fclose(f);
-    static long prev_total = 0;
-    static long prev_idle = 0;
+    static long prev_total = 0, prev_idle = 0;
     long total = u + n + s + i;
     long diff_total = total - prev_total;
     long diff_idle = i - prev_idle;
     prev_total = total;
     prev_idle = i;
-    if (diff_total <= 0) return 0;
+    if (diff_total <= 0) return 0.0f;
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
 static void *telemetry_updater(void *arg) {
     (void)arg;
     while (running) {
+        float t = read_temp();
+        long m = read_mem_available();
+        float c = read_cpu_usage();
+
         pthread_mutex_lock(&telemetry_mutex);
-        cached_temp = read_temp();
-        cached_mem = read_mem_available();
-        cached_cpu = read_cpu_usage();
+        cached_temp = t;
+        cached_mem = m;
+        cached_cpu = c;
         pthread_mutex_unlock(&telemetry_mutex);
-        
-        if (cached_temp > g_temp_throttle_c && g_frame_interval_ms < g_min_interval_ms) {
-            printf("[THERMAL] Temp %.1f°C > %d°C, throttling to %dms\n", 
-                   cached_temp, g_temp_throttle_c, g_min_interval_ms);
+
+        if (cached_temp > g_temp_throttle_c && current_interval_ms < g_min_interval_ms) {
             current_interval_ms = g_min_interval_ms;
         } else if (cached_temp <= g_temp_throttle_c - 5 && current_interval_ms != g_frame_interval_ms) {
             current_interval_ms = g_frame_interval_ms;
-            printf("[THERMAL] Temp %.1f°C, restoring to %dms\n", 
-                   cached_temp, current_interval_ms);
         }
-        
         sleep(2);
     }
     return NULL;
@@ -227,48 +241,46 @@ void add_history(int count, float temp) {
 
 void *frame_updater(void *arg) {
     (void)arg;
-
     struct timespec next_time;
     clock_gettime(CLOCK_MONOTONIC, &next_time);
 
+    unsigned char buf[BUFFER_SIZE];
+
     while (running) {
-        unsigned char buf[BUFFER_SIZE];
         size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
 
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
-            pthread_mutex_lock(&frame_mutex);
-            size_t copy_len = res.jpeg_length;
-            if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
+            
+            int next_idx = 1 - g_active_idx;
+            size_t copy_len = res.jpeg_length > BUFFER_SIZE ? BUFFER_SIZE : res.jpeg_length;
+            
+            if (res.jpeg_output && copy_len > 0) {
+                memcpy(g_buffers[next_idx].buf, res.jpeg_output, copy_len);
+                g_buffers[next_idx].len = copy_len;
 
-            memcpy(current_frame, res.jpeg_output, copy_len);
-            current_len = copy_len;
-            pthread_mutex_unlock(&frame_mutex);
+                // Atomic buffer swap using Write Lock
+                pthread_rwlock_wrlock(&frame_rwlock);
+                g_active_idx = next_idx;
+                pthread_rwlock_unlock(&frame_rwlock);
+            }
+
             free_detection_result(&res);
         }
 
         long interval = current_interval_ms;
         next_time.tv_nsec += interval * 1000000L;
-
         while (next_time.tv_nsec >= 1000000000L) {
             next_time.tv_nsec -= 1000000000L;
             next_time.tv_sec += 1;
         }
-
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_time, NULL);
     }
-
     return NULL;
 }
 
-static void set_socket_timeout(int fd, int seconds) {
-    struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-}
-
-void send_redirect(int fd) {
-    const char *msg =
+static void handle_http_redirect(int fd) {
+    const char *redir = 
         "HTTP/1.1 301 Moved Permanently\r\n"
         "Location: https://192.168.137.100:8443/\r\n"
         "Content-Type: text/html\r\n"
@@ -276,13 +288,18 @@ void send_redirect(int fd) {
         "Connection: close\r\n"
         "\r\n"
         "<html>Redirecting...</html>";
-
-    send(fd, msg, strlen(msg), 0);
+    send(fd, redir, strlen(redir), 0);
+    close(fd);
 }
 
-static void handle_https(int fd) {
+static void handle_https_client(int fd) {
     SSL *ssl = SSL_new(ssl_ctx);
+    if (!ssl) { close(fd); return; }
     SSL_set_fd(ssl, fd);
+
+    struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     if (SSL_accept(ssl) <= 0) {
         SSL_free(ssl);
@@ -297,66 +314,92 @@ static void handle_https(int fd) {
         close(fd);
         return;
     }
-
     req[n] = '\0';
 
-    char method[16], path[256];
-    sscanf(req, "%15s %255s", method, path);
-
+    char method[16], path[512];
+    if (sscanf(req, "%15s %511s", method, path) != 2) {
+        SSL_free(ssl);
+        close(fd);
+        return;
+    }
+    
     char *q = strchr(path, '?');
     if (q) *q = '\0';
 
+    // HTTP/HTTPS endpoint routing
     if (strcmp(path, "/") == 0) {
         if (html_cache) {
             char header[512];
-            snprintf(header, sizeof(header),
+            int hlen = snprintf(header, sizeof(header),
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: text/html\r\n"
                 "Content-Length: %zu\r\n"
                 "Cache-Control: no-cache\r\n"
                 "Connection: close\r\n"
-                "\r\n",
-                strlen(html_cache));
-
-            SSL_write(ssl, header, strlen(header));
-            SSL_write(ssl, html_cache, strlen(html_cache));
+                "\r\n", html_cache_len);
+            SSL_write(ssl, header, hlen);
+            SSL_write(ssl, html_cache, html_cache_len);
         }
-        SSL_free(ssl);
-        close(fd);
-        return;
-    }
+    } 
+    else if (strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) {
+        if (mjpeg_streaming_enabled) {
+            // MJPEG Multipart Stream
+            const char *mjpeg_hdr = 
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: multipart/x-mixed-replace; boundary=" MJPEG_BOUNDARY "\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: close\r\n"
+                "\r\n";
+            SSL_write(ssl, mjpeg_hdr, strlen(mjpeg_hdr));
 
-    if (strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) {
-        pthread_mutex_lock(&frame_mutex);
-        size_t len = current_len;
-        unsigned char *copy = NULL;
-
-        if (len > 0) {
-            copy = malloc(len);
-            if (copy) memcpy(copy, current_frame, len);
-        }
-        pthread_mutex_unlock(&frame_mutex);
-
-        if (copy && len > 0) {
+            while (running) {
+                pthread_rwlock_rdlock(&frame_rwlock);
+                int idx = g_active_idx;
+                size_t len = g_buffers[idx].len;
+                
+                if (len > 0) {
+                    char frame_hdr[256];
+                    int hlen = snprintf(frame_hdr, sizeof(frame_hdr),
+                        "--" MJPEG_BOUNDARY "\r\n"
+                        "Content-Type: image/jpeg\r\n"
+                        "Content-Length: %zu\r\n"
+                        "\r\n", len);
+                    
+                    if (SSL_write(ssl, frame_hdr, hlen) <= 0) {
+                        pthread_rwlock_unlock(&frame_rwlock);
+                        break;
+                    }
+                    if (SSL_write(ssl, g_buffers[idx].buf, len) <= 0) {
+                        pthread_rwlock_unlock(&frame_rwlock);
+                        break;
+                    }
+                }
+                pthread_rwlock_unlock(&frame_rwlock);
+                
+                // ~30 FPS
+                usleep(33000);
+            }
+        } else {
+            // Single JPEG fallback
+            pthread_rwlock_rdlock(&frame_rwlock);
+            int idx = g_active_idx;
+            size_t len = g_buffers[idx].len;
+            
             char header[256];
-            snprintf(header, sizeof(header),
+            int hlen = snprintf(header, sizeof(header),
                 "HTTP/1.1 200 OK\r\n"
                 "Content-Type: image/jpeg\r\n"
                 "Content-Length: %zu\r\n"
                 "Cache-Control: no-cache\r\n"
                 "Connection: close\r\n"
-                "\r\n",
-                len);
-            SSL_write(ssl, header, strlen(header));
-            SSL_write(ssl, copy, len);
-            free(copy);
+                "\r\n", len);
+            
+            SSL_write(ssl, header, hlen);
+            if (len > 0) SSL_write(ssl, g_buffers[idx].buf, len);
+            pthread_rwlock_unlock(&frame_rwlock);
         }
-        SSL_free(ssl);
-        close(fd);
-        return;
-    }
-
-    if (strcmp(path, "/telemetry") == 0 || strcmp(path, "/api/v1/telemetry") == 0) {
+    } 
+    else if (strcmp(path, "/telemetry") == 0 || strcmp(path, "/api/v1/telemetry") == 0) {
         pthread_mutex_lock(&telemetry_mutex);
         float temp = cached_temp;
         long mem = cached_mem;
@@ -364,134 +407,110 @@ static void handle_https(int fd) {
         pthread_mutex_unlock(&telemetry_mutex);
 
         char json[256];
-        snprintf(json, sizeof(json),
-                 "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}",
-                 temp, mem, cpu);
-
+        int jlen = snprintf(json, sizeof(json), 
+            "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}", temp, mem, cpu);
         char header[512];
-        snprintf(header, sizeof(header),
+        int hlen = snprintf(header, sizeof(header),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
-            "Content-Length: %zu\r\n"
+            "Content-Length: %d\r\n"
             "Cache-Control: no-cache\r\n"
             "Connection: close\r\n"
-            "\r\n%s",
-            strlen(json), json);
-
-        SSL_write(ssl, header, strlen(header));
-        SSL_free(ssl);
-        close(fd);
-        return;
+            "\r\n", jlen);
+        SSL_write(ssl, header, hlen);
+        SSL_write(ssl, json, jlen);
     }
-
-    if (strcmp(path, "/api/v1/persons") == 0) {
-        int count = (rand() % 4);
+    else if (strcmp(path, "/api/v1/persons") == 0) {
+        int count = rand() % 4;
         pthread_mutex_lock(&telemetry_mutex);
         float temp = cached_temp;
         pthread_mutex_unlock(&telemetry_mutex);
         
-        if (count > 0) {
-            add_history(count, temp);
-        }
+        if (count > 0) add_history(count, temp);
 
         char json[128];
-        snprintf(json, sizeof(json),
-                 "{\"count\":%d,\"timestamp\":%ld}",
-                 count, time(NULL));
-
+        int jlen = snprintf(json, sizeof(json), 
+            "{\"count\":%d,\"timestamp\":%ld}", count, time(NULL));
         char header[512];
-        snprintf(header, sizeof(header),
+        int hlen = snprintf(header, sizeof(header),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
-            "Content-Length: %zu\r\n"
+            "Content-Length: %d\r\n"
             "Cache-Control: no-cache\r\n"
             "Connection: close\r\n"
-            "\r\n%s",
-            strlen(json), json);
-
-        SSL_write(ssl, header, strlen(header));
-        SSL_free(ssl);
-        close(fd);
-        return;
+            "\r\n", jlen);
+        SSL_write(ssl, header, hlen);
+        SSL_write(ssl, json, jlen);
     }
-
-    if (strcmp(path, "/api/v1/history") == 0) {
+    else if (strcmp(path, "/api/v1/history") == 0) {
         pthread_mutex_lock(&history_mutex);
-        
-        char json[1024];
+        char json[2048];
         char *p = json;
         p += sprintf(p, "{\"history\":[");
-        
         for (int i = 0; i < history_count; i++) {
-            p += sprintf(p, "{\"count\":%d,\"timestamp\":%ld,\"temp\":%.2f}",
-                         history[i].count, history[i].timestamp, history[i].temp);
-            if (i < history_count - 1) {
-                p += sprintf(p, ",");
-            }
+            p += sprintf(p, "{\"count\":%d,\"timestamp\":%ld,\"temp\":%.2f}%s",
+                         history[i].count, history[i].timestamp, history[i].temp,
+                         (i < history_count - 1) ? "," : "");
         }
-        
         p += sprintf(p, "]}");
         pthread_mutex_unlock(&history_mutex);
 
-        char header[2048];
-        snprintf(header, sizeof(header),
+        int jlen = strlen(json);
+        char header[512];
+        int hlen = snprintf(header, sizeof(header),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
-            "Content-Length: %zu\r\n"
+            "Content-Length: %d\r\n"
             "Cache-Control: no-cache\r\n"
             "Connection: close\r\n"
-            "\r\n%s",
-            strlen(json), json);
-
-        SSL_write(ssl, header, strlen(header));
-        SSL_free(ssl);
-        close(fd);
-        return;
+            "\r\n", jlen);
+        SSL_write(ssl, header, hlen);
+        SSL_write(ssl, json, jlen);
     }
-
-    if (strcmp(path, "/api/v1/command") == 0) {
-        if (strcmp(method, "POST") == 0) {
-            char *body = strstr(req, "\r\n\r\n");
-            if (body) {
-                body += 4;
-                if (strstr(body, "reboot")) {
-                    const char *resp = 
-                        "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Content-Length: 40\r\n"
-                        "Connection: close\r\n"
-                        "\r\n"
-                        "{\"status\":\"success\",\"cmd\":\"reboot\"}";
-                    SSL_write(ssl, resp, strlen(resp));
-                } else {
-                    const char *resp = 
-                        "HTTP/1.1 400 Bad Request\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Content-Length: 35\r\n"
-                        "Connection: close\r\n"
-                        "\r\n"
-                        "{\"error\":\"Unknown command\"}";
-                    SSL_write(ssl, resp, strlen(resp));
-                }
+    else if (strcmp(path, "/api/v1/command") == 0 && strcmp(method, "POST") == 0) {
+        char *body = strstr(req, "\r\n\r\n");
+        if (body) {
+            body += 4;
+            if (strstr(body, "reboot")) {
+                const char *resp = 
+                    "HTTP/1.1 200 OK\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 40\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "{\"status\":\"success\",\"cmd\":\"reboot\"}";
+                SSL_write(ssl, resp, strlen(resp));
+            } else {
+                const char *resp = 
+                    "HTTP/1.1 400 Bad Request\r\n"
+                    "Content-Type: application/json\r\n"
+                    "Content-Length: 35\r\n"
+                    "Connection: close\r\n"
+                    "\r\n"
+                    "{\"error\":\"Unknown command\"}";
+                SSL_write(ssl, resp, strlen(resp));
             }
-        } else {
-            const char *resp = 
-                "HTTP/1.1 405 Method Not Allowed\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: 36\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "{\"error\":\"Method not allowed\"}";
-            SSL_write(ssl, resp, strlen(resp));
         }
-        SSL_free(ssl);
-        close(fd);
-        return;
+    }
+    else {
+        const char *not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        SSL_write(ssl, not_found, strlen(not_found));
     }
 
-    SSL_write(ssl, "HTTP/1.1 404 Not Found\r\n\r\n", 26);
     SSL_free(ssl);
     close(fd);
+}
+
+typedef struct {
+    int fd;
+} client_worker_arg_t;
+
+static void *https_worker_thread(void *arg) {
+    client_worker_arg_t *carg = (client_worker_arg_t*)arg;
+    int fd = carg->fd;
+    free(carg);
+    handle_https_client(fd);
+    return NULL;
 }
 
 static SSL_CTX *init_ssl(void) {
@@ -502,26 +521,45 @@ static SSL_CTX *init_ssl(void) {
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) return NULL;
 
-    if (SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM) <= 0)
-        return NULL;
+    // Optimize cipher suite for embedded systems
+    SSL_CTX_set_cipher_list(ctx, 
+        "ECDHE-ECDSA-AES128-GCM-SHA256:"
+        "ECDHE-RSA-AES128-GCM-SHA256:"
+        "ECDHE-ECDSA-CHACHA20-POLY1305:"
+        "ECDHE-RSA-CHACHA20-POLY1305:"
+        "ECDHE-ECDSA-AES256-GCM-SHA384:"
+        "ECDHE-RSA-AES256-GCM-SHA384");
 
-    if (SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM) <= 0)
+    if (SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx);
         return NULL;
+    }
+
+    if (SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM) <= 0) {
+        ERR_print_errors_fp(stderr);
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
 
     SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
+    SSL_CTX_set_session_id_context(ctx, (const unsigned char*)"server", 6);
 
     return ctx;
 }
 
 int main(void) {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = signal_handler;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    signal(SIGPIPE, SIG_IGN);
+
     printf("Starting Security Server...\n");
     printf("Config path: %s\n", CONFIG_PATH);
 
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
-    signal(SIGHUP, signal_handler);
-
-    // Load config
     load_config(CONFIG_PATH);
     current_interval_ms = g_frame_interval_ms;
 
@@ -532,6 +570,7 @@ int main(void) {
     printf("Max history: %d\n", g_max_history);
     printf("Thermal throttle: %d°C, min interval: %dms\n", g_temp_throttle_c, g_min_interval_ms);
     printf("Watchdog timeout: %dms\n", g_watchdog_timeout_ms);
+    printf("MJPEG Streaming: %s\n", mjpeg_streaming_enabled ? "ON" : "OFF (fallback)");
     printf("Send SIGHUP (kill -HUP %d) to reload config\n", getpid());
     printf("========================\n\n");
 
@@ -543,100 +582,141 @@ int main(void) {
         return 1;
     }
 
-    html_cache = load_html();
+    html_cache = load_html(&html_cache_len);
     if (!html_cache) {
         printf("Warning: Failed to load HTML template\n");
     } else {
-        printf("HTML template loaded (%zu bytes)\n", strlen(html_cache));
+        printf("HTML template loaded (%zu bytes)\n", html_cache_len);
     }
 
     g_frame = shared_frame_open();
     if (!g_frame) {
         printf("Failed to open shared frame\n");
+        free(history);
         return 1;
     }
 
-    pthread_t updater;
-    pthread_create(&updater, NULL, frame_updater, NULL);
-
-    pthread_t telemetry_thread;
-    pthread_create(&telemetry_thread, NULL, telemetry_updater, NULL);
+    pthread_t updater, telemetry_thread;
+    if (pthread_create(&updater, NULL, frame_updater, NULL) != 0) {
+        perror("pthread_create updater");
+        return 1;
+    }
+    if (pthread_create(&telemetry_thread, NULL, telemetry_updater, NULL) != 0) {
+        perror("pthread_create telemetry");
+        return 1;
+    }
 
     ssl_ctx = init_ssl();
     if (!ssl_ctx) {
         printf("SSL init failed. Generate cert.pem and key.pem\n");
         return 1;
     }
-
     printf("SSL initialized\n");
 
     int http_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int https_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(http_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+    setsockopt(https_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = INADDR_ANY,
-        .sin_port = htons(g_port_http)
+    struct sockaddr_in addr_http = { 
+        .sin_family = AF_INET, 
+        .sin_addr.s_addr = INADDR_ANY, 
+        .sin_port = htons(g_port_http) 
+    };
+    struct sockaddr_in addr_https = { 
+        .sin_family = AF_INET, 
+        .sin_addr.s_addr = INADDR_ANY, 
+        .sin_port = htons(g_port_https) 
     };
 
-    if (bind(http_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (bind(http_fd, (struct sockaddr *)&addr_http, sizeof(addr_http)) < 0) {
         perror("bind http");
         return 1;
     }
-    listen(http_fd, 10);
-    printf("HTTP on %d (redirects to HTTPS)\n", g_port_http);
-
-    int https_fd = socket(AF_INET, SOCK_STREAM, 0);
-    setsockopt(https_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
-    struct sockaddr_in addr_https = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = INADDR_ANY,
-        .sin_port = htons(g_port_https)
-    };
-
     if (bind(https_fd, (struct sockaddr *)&addr_https, sizeof(addr_https)) < 0) {
         perror("bind https");
         return 1;
     }
-    listen(https_fd, 10);
 
+    if (listen(http_fd, 128) < 0) {
+        perror("listen http");
+        return 1;
+    }
+    if (listen(https_fd, 128) < 0) {
+        perror("listen https");
+        return 1;
+    }
+
+    int epfd = epoll_create1(0);
+    if (epfd < 0) {
+        perror("epoll_create1");
+        return 1;
+    }
+
+    struct epoll_event ev, events[MAX_EVENTS];
+
+    ev.events = EPOLLIN;
+    ev.data.fd = http_fd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, http_fd, &ev);
+
+    ev.events = EPOLLIN;
+    ev.data.fd = https_fd;
+    epoll_ctl(epfd, EPOLL_CTL_ADD, https_fd, &ev);
+
+    printf("HTTP on %d (redirects to HTTPS)\n", g_port_http);
     printf("HTTPS on %d\n", g_port_https);
     printf("Open: https://192.168.137.100:%d/\n", g_port_https);
+    printf("\nServer running... press Ctrl+C to terminate cleanly.\n");
 
     while (running) {
-        fd_set fds;
-        FD_ZERO(&fds);
-        FD_SET(http_fd, &fds);
-        FD_SET(https_fd, &fds);
-
-        int max_fd = (https_fd > http_fd) ? https_fd : http_fd;
-        select(max_fd + 1, &fds, NULL, NULL, NULL);
-
-        if (FD_ISSET(http_fd, &fds)) {
-            int fd = accept(http_fd, NULL, NULL);
-            if (fd >= 0) {
-                set_socket_timeout(fd, 5);
-                send_redirect(fd);
-                close(fd);
-            }
+        int nfds = epoll_wait(epfd, events, MAX_EVENTS, 100);
+        if (nfds < 0) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait");
+            break;
         }
 
-        if (FD_ISSET(https_fd, &fds)) {
-            int fd = accept(https_fd, NULL, NULL);
-            if (fd >= 0) {
-                set_socket_timeout(fd, 10);
-                handle_https(fd);
+        for (int i = 0; i < nfds; i++) {
+            int fd = events[i].data.fd;
+            if (fd == http_fd) {
+                int client = accept(http_fd, NULL, NULL);
+                if (client >= 0) {
+                    handle_http_redirect(client);
+                }
+            } else if (fd == https_fd) {
+                int client = accept(https_fd, NULL, NULL);
+                if (client >= 0) {
+                    pthread_t t;
+                    client_worker_arg_t *carg = malloc(sizeof(client_worker_arg_t));
+                    if (carg) {
+                        carg->fd = client;
+                        if (pthread_create(&t, NULL, https_worker_thread, carg) == 0) {
+                            pthread_detach(t);
+                        } else {
+                            free(carg);
+                            close(client);
+                        }
+                    } else {
+                        close(client);
+                    }
+                }
             }
         }
     }
 
+    printf("\nShutting down server gracefully...\n");
+    close(epfd);
     close(http_fd);
     close(https_fd);
-    SSL_CTX_free(ssl_ctx);
-    free(html_cache);
-    free(history);
 
+    pthread_join(updater, NULL);
+    pthread_join(telemetry_thread, NULL);
+
+    if (ssl_ctx) SSL_CTX_free(ssl_ctx);
+    if (html_cache) free(html_cache);
+    if (history) free(history);
+
+    printf("Server shutdown complete.\n");
     return 0;
 }

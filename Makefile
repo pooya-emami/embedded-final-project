@@ -16,7 +16,7 @@ clean:
 
 install: all
 	sudo mkdir -p $(INSTALL_DIR)
-	sudo cp src/server/$(CONFIG_FILE) $(INSTALL_DIR)/server.conf
+	# sudo cp src/server/$(CONFIG_FILE) $(INSTALL_DIR)/server.conf
 	sudo install -m 755 src/server/server $(INSTALL_DIR)/server
 	sudo install -m 755 src/relay/mjpeg_relay $(INSTALL_DIR)/mjpeg_relay
 	

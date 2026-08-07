@@ -14,54 +14,190 @@
             background: #222;
             color: #fff;
             padding: 10px;
+            border-radius: 5px;
+        }
+        #container {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        #stream-container {
+            background: #000;
+            border-radius: 5px;
+            overflow: hidden;
+            box-shadow: 0 0 10px rgba(0,0,0,0.3);
+        }
+        #stream-container img {
+            display: block;
+            width: 640px;
+            height: auto;
         }
         #tele {
             background: #fff;
-            padding: 10px;
-            margin-top: 15px;
+            padding: 20px;
             border-radius: 5px;
-            width: 300px;
-            box-shadow: 0 0 5px rgba(0,0,0,0.2);
+            min-width: 250px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.2);
         }
-        img {
-            border: 3px solid #333;
+        #tele h3 {
+            margin-top: 0;
+            color: #333;
+        }
+        #tele .value {
+            font-weight: bold;
+            color: #0066cc;
+        }
+        #tele .label {
+            color: #666;
+        }
+        .status {
+            padding: 10px;
             border-radius: 5px;
-            max-width: 640px;
+            margin: 10px 0;
+        }
+        .status.active {
+            background: #d4edda;
+            color: #155724;
+        }
+        #persons {
+            font-size: 24px;
+            font-weight: bold;
+            color: #28a745;
+        }
+        #status-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #28a745;
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.3; }
+        }
+        .footer {
+            margin-top: 20px;
+            color: #666;
+            font-size: 12px;
         }
     </style>
 </head>
 <body>
 
-<h1>Embedded Security System – Pooya Emami</h1>
+<h1>🔒 Embedded Security System – Pooya Emami</h1>
+<p><strong>Student ID:</strong> 404300409</p>
 
-<img id="stream" src="/stream" width="480" alt="Live Stream">
+<div id="container">
+    <div id="stream-container">
+        <img id="stream" src="/stream" alt="Live Stream">
+    </div>
 
-<h3>Telemetry</h3>
-<div id="tele">Loading...</div>
+    <div id="tele">
+        <h3>📊 System Telemetry</h3>
+        <div id="status-indicator"></div> <span style="margin-left: 5px;">Live</span>
+        <hr>
+        <p><span class="label">👤 Persons Detected:</span> <span id="persons" class="value">0</span></p>
+        <p><span class="label">🌡️ CPU Temperature:</span> <span id="temp" class="value">--</span> °C</p>
+        <p><span class="label">💾 Free Memory:</span> <span id="mem" class="value">--</span> kB</p>
+        <p><span class="label">⚡ CPU Load:</span> <span id="cpu" class="value">--</span> %</p>
+        <p><span class="label">📅 Last Update:</span> <span id="time" class="value">--</span></p>
+        <hr>
+        <div id="history">
+            <h4>📜 Recent Detections</h4>
+            <ul id="history-list" style="list-style: none; padding: 0;">
+                <li style="color: #999;">No detections yet</li>
+            </ul>
+        </div>
+    </div>
+</div>
+
+<div class="footer">
+    <p>🔄 MJPEG Streaming | Auto-refresh every 2s | <span id="fps-display">FPS: --</span></p>
+</div>
 
 <script>
-function refreshStream() {
-    document.getElementById('stream').src = '/stream?' + Date.now();
-}
-
+// Update telemetry every 2 seconds
 function updateTelemetry() {
     fetch('/telemetry')
         .then(response => response.json())
         .then(data => {
-            document.getElementById('tele').innerHTML =
-                "CPU Temp: " + data.temp + " °C<br>" +
-                "Free Memory: " + data.mem + " kB<br>" +
-                "CPU Load: " + data.cpu + " %";
+            document.getElementById('temp').textContent = data.temp.toFixed(1);
+            document.getElementById('mem').textContent = data.mem;
+            document.getElementById('cpu').textContent = data.cpu.toFixed(1);
+            document.getElementById('time').textContent = new Date().toLocaleTimeString();
+        })
+        .catch(() => {
+            document.getElementById('temp').textContent = '--';
+            document.getElementById('mem').textContent = '--';
+            document.getElementById('cpu').textContent = '--';
+        });
+}
+
+// Update person count separately
+function updatePersons() {
+    fetch('/api/v1/persons')
+        .then(response => response.json())
+        .then(data => {
+            document.getElementById('persons').textContent = data.count;
         })
         .catch(() => {});
 }
 
-setInterval(refreshStream, 500);
-setInterval(updateTelemetry, 2000);
-updateTelemetry();
+// Update history
+function updateHistory() {
+    fetch('/api/v1/history')
+        .then(response => response.json())
+        .then(data => {
+            const list = document.getElementById('history-list');
+            if (data.history && data.history.length > 0) {
+                list.innerHTML = data.history.map(h => 
+                    `<li>👤 ${h.count} people at ${new Date(h.timestamp * 1000).toLocaleTimeString()}</li>`
+                ).join('');
+            } else {
+                list.innerHTML = '<li style="color: #999;">No detections yet</li>';
+            }
+        })
+        .catch(() => {});
+}
 
+// Update FPS from stream metadata (optional)
+let frameCount = 0;
+let lastFpsUpdate = Date.now();
+
+// Monitor stream loading
+document.getElementById('stream').addEventListener('load', function() {
+    frameCount++;
+    const now = Date.now();
+    if (now - lastFpsUpdate >= 1000) {
+        const fps = frameCount / ((now - lastFpsUpdate) / 1000);
+        document.getElementById('fps-display').textContent = 'FPS: ' + fps.toFixed(1);
+        frameCount = 0;
+        lastFpsUpdate = now;
+    }
+});
+
+// Initial updates
+updateTelemetry();
+updatePersons();
+updateHistory();
+
+// Periodic updates
+setInterval(updateTelemetry, 2000);
+setInterval(updatePersons, 2000);
+setInterval(updateHistory, 5000);
+
+// Stream auto-reconnect on error
+document.getElementById('stream').addEventListener('error', function() {
+    this.src = '/stream?' + Date.now();
+});
+
+// Handle page visibility
 document.addEventListener('visibilitychange', function() {
-    if (!document.hidden) refreshStream();
+    if (!document.hidden) {
+        document.getElementById('stream').src = '/stream?' + Date.now();
+    }
 });
 </script>
 

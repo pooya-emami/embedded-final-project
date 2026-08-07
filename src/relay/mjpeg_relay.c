@@ -95,7 +95,7 @@ void *receiver_thread(void *arg) {
 
             if (soi >= 0 && eoi > soi) {
                 frame_count++;
-                size_t frame_size = eoi + 2; // Include EOI marker
+                size_t frame_size = eoi + 2; 
                 printf("Frame #%d: %zu bytes\n", frame_count, frame_size);
                 shared_frame_write(g_frame, jpeg + soi, frame_size - soi);
 
