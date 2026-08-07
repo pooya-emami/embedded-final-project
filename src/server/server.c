@@ -11,16 +11,28 @@
 #include <openssl/err.h>
 #include <time.h>
 #include <stdint.h>
+#include <ctype.h>
 
 #include "server.h"
 #include "shared_frame.h"
 
-#define PORT_HTTP 8080
-#define PORT_HTTPS 8443
+extern "C" {
+    #include "detector.hpp"
+}
+
 #define BUFFER_SIZE 65536
 #define HTML_PATH "../html/template.html"
-#define MAX_HISTORY 5
-#define FRAME_INTERVAL_MS 100  // 10 fps (100ms between frames)
+#define CONFIG_PATH "/usr/local/bin/server.conf"
+
+int g_frame_interval_ms = DEFAULT_FRAME_INTERVAL_MS;
+int g_frame_width = DEFAULT_FRAME_WIDTH;
+int g_frame_height = DEFAULT_FRAME_HEIGHT;
+int g_port_http = DEFAULT_PORT_HTTP;
+int g_port_https = DEFAULT_PORT_HTTPS;
+int g_max_history = DEFAULT_MAX_HISTORY;
+int g_temp_throttle_c = DEFAULT_TEMP_THROTTLE_C;
+int g_min_interval_ms = DEFAULT_MIN_INTERVAL_MS;
+int g_watchdog_timeout_ms = DEFAULT_WATCHDOG_TIMEOUT_MS;
 
 static shared_frame_t *g_frame;
 static unsigned char current_frame[BUFFER_SIZE];
@@ -31,7 +43,7 @@ static volatile int running = 1;
 
 static SSL_CTX *ssl_ctx = NULL;
 
-static detection_record_t history[MAX_HISTORY];
+static detection_record_t *history = NULL;
 static int history_count = 0;
 static pthread_mutex_t history_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -40,28 +52,104 @@ static char *html_cache = NULL;
 static float cached_temp = -1;
 static long cached_mem = -1;
 static float cached_cpu = 0;
-static time_t last_telemetry_update = 0;
 static pthread_mutex_t telemetry_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static int current_interval_ms = 100;
+
+static void trim(char *str) {
+    char *start = str;
+    char *end;
+    while (isspace((unsigned char)*start)) start++;
+    if (*start == 0) { str[0] = '\0'; return; }
+    end = start + strlen(start) - 1;
+    while (end > start && isspace((unsigned char)*end)) end--;
+    end[1] = '\0';
+    if (start != str) memmove(str, start, strlen(start) + 1);
+}
+
+void load_config(const char *filename) {
+    FILE *fp = fopen(filename, "r");
+    if (!fp) {
+        printf("Config file not found: %s (using defaults)\n", filename);
+        return;
+    }
+    
+    char line[256];
+    int loaded = 0;
+    
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+        
+        char *nl = strchr(line, '\n'); if (nl) *nl = '\0';
+        nl = strchr(line, '\r'); if (nl) *nl = '\0';
+        
+        char *eq = strchr(line, '=');
+        if (!eq) continue;
+        
+        *eq = '\0';
+        char *key = line;
+        char *value = eq + 1;
+        trim(key);
+        trim(value);
+        
+        if (strcmp(key, "FRAME_INTERVAL_MS") == 0) {
+            g_frame_interval_ms = atoi(value);
+            loaded++;
+        } else if (strcmp(key, "FRAME_WIDTH") == 0) {
+            g_frame_width = atoi(value);
+            loaded++;
+        } else if (strcmp(key, "FRAME_HEIGHT") == 0) {
+            g_frame_height = atoi(value);
+            loaded++;
+        } else if (strcmp(key, "PORT_HTTP") == 0) {
+            g_port_http = atoi(value);
+            loaded++;
+        } else if (strcmp(key, "PORT_HTTPS") == 0) {
+            g_port_https = atoi(value);
+            loaded++;
+        } else if (strcmp(key, "MAX_HISTORY") == 0) {
+            g_max_history = atoi(value);
+            loaded++;
+        } else if (strcmp(key, "TEMP_THROTTLE_C") == 0) {
+            g_temp_throttle_c = atoi(value);
+            loaded++;
+        } else if (strcmp(key, "MIN_INTERVAL_MS") == 0) {
+            g_min_interval_ms = atoi(value);
+            loaded++;
+        } else if (strcmp(key, "WATCHDOG_TIMEOUT_MS") == 0) {
+            g_watchdog_timeout_ms = atoi(value);
+            loaded++;
+        }
+    }
+    
+    fclose(fp);
+    printf("Config loaded: %d settings\n", loaded);
+}
+
+void reload_config(const char *filename) {
+    printf("\n[RELOAD] Reloading config...\n");
+    load_config(filename);
+    current_interval_ms = g_frame_interval_ms;
+    printf("[RELOAD] New interval: %dms (%.1f fps)\n", 
+           current_interval_ms, 1000.0/current_interval_ms);
+}
+
 static void signal_handler(int sig) {
-    (void)sig;
+    if (sig == SIGHUP) {
+        reload_config(CONFIG_PATH);
+        return;
+    }
     running = 0;
 }
 
 static char *load_html(void) {
     FILE *fp = fopen(HTML_PATH, "r");
     if (!fp) return NULL;
-
     fseek(fp, 0, SEEK_END);
     long len = ftell(fp);
     fseek(fp, 0, SEEK_SET);
-
     char *buf = malloc(len + 1);
-    if (!buf) {
-        fclose(fp);
-        return NULL;
-    }
-
+    if (!buf) { fclose(fp); return NULL; }
     size_t r = fread(buf, 1, len, fp);
     (void)r;
     buf[len] = '\0';
@@ -72,12 +160,8 @@ static char *load_html(void) {
 static float read_temp(void) {
     FILE *f = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
     if (!f) return -1;
-
     int t = 0;
-    if (fscanf(f, "%d", &t) != 1) {
-        fclose(f);
-        return -1;
-    }
+    if (fscanf(f, "%d", &t) != 1) { fclose(f); return -1; }
     fclose(f);
     return t / 1000.0f;
 }
@@ -85,17 +169,11 @@ static float read_temp(void) {
 static long read_mem_available(void) {
     FILE *f = fopen("/proc/meminfo", "r");
     if (!f) return -1;
-
     char key[32];
     long val = -1;
-
     while (fscanf(f, "%31s %ld", key, &val) != EOF) {
-        if (strcmp(key, "MemAvailable:") == 0) {
-            fclose(f);
-            return val;
-        }
+        if (strcmp(key, "MemAvailable:") == 0) { fclose(f); return val; }
     }
-
     fclose(f);
     return -1;
 }
@@ -103,24 +181,16 @@ static long read_mem_available(void) {
 static float read_cpu_usage(void) {
     FILE *f = fopen("/proc/stat", "r");
     if (!f) return 0;
-
     long u, n, s, i;
-    if (fscanf(f, "cpu %ld %ld %ld %ld", &u, &n, &s, &i) != 4) {
-        fclose(f);
-        return 0;
-    }
+    if (fscanf(f, "cpu %ld %ld %ld %ld", &u, &n, &s, &i) != 4) { fclose(f); return 0; }
     fclose(f);
-
     static long prev_total = 0;
     static long prev_idle = 0;
-
     long total = u + n + s + i;
     long diff_total = total - prev_total;
     long diff_idle = i - prev_idle;
-
     prev_total = total;
     prev_idle = i;
-
     if (diff_total <= 0) return 0;
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
@@ -128,16 +198,21 @@ static float read_cpu_usage(void) {
 static void *telemetry_updater(void *arg) {
     (void)arg;
     while (running) {
-        float temp = read_temp();
-        long mem = read_mem_available();
-        float cpu = read_cpu_usage();
-        
         pthread_mutex_lock(&telemetry_mutex);
-        cached_temp = temp;
-        cached_mem = mem;
-        cached_cpu = cpu;
-        last_telemetry_update = time(NULL);
+        cached_temp = read_temp();
+        cached_mem = read_mem_available();
+        cached_cpu = read_cpu_usage();
         pthread_mutex_unlock(&telemetry_mutex);
+        
+        if (cached_temp > g_temp_throttle_c && g_frame_interval_ms < g_min_interval_ms) {
+            printf("[THERMAL] Temp %.1f°C > %d°C, throttling to %dms\n", 
+                   cached_temp, g_temp_throttle_c, g_min_interval_ms);
+            current_interval_ms = g_min_interval_ms;
+        } else if (cached_temp <= g_temp_throttle_c - 5 && current_interval_ms != g_frame_interval_ms) {
+            current_interval_ms = g_frame_interval_ms;
+            printf("[THERMAL] Temp %.1f°C, restoring to %dms\n", 
+                   cached_temp, current_interval_ms);
+        }
         
         sleep(2);
     }
@@ -146,24 +221,20 @@ static void *telemetry_updater(void *arg) {
 
 void add_history(int count, float temp) {
     pthread_mutex_lock(&history_mutex);
-    
-    if (history_count >= MAX_HISTORY) {
-        memmove(&history[0], &history[1], (MAX_HISTORY - 1) * sizeof(detection_record_t));
-        history_count = MAX_HISTORY - 1;
+    if (history_count >= g_max_history) {
+        memmove(&history[0], &history[1], (g_max_history - 1) * sizeof(detection_record_t));
+        history_count = g_max_history - 1;
     }
-    
     history[history_count].count = count;
     history[history_count].timestamp = time(NULL);
     history[history_count].temp = temp;
     history_count++;
-    
     pthread_mutex_unlock(&history_mutex);
 }
 
 void *frame_updater(void *arg) {
     (void)arg;
 
-    const long interval_ms = FRAME_INTERVAL_MS;   // e.g., 100 ms
     struct timespec next_time;
     clock_gettime(CLOCK_MONOTONIC, &next_time);
 
@@ -172,13 +243,18 @@ void *frame_updater(void *arg) {
         size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
 
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
+            DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
             pthread_mutex_lock(&frame_mutex);
-            memcpy(current_frame, buf, len);
-            current_len = len;
+            size_t copy_len = res.jpeg_output.size();
+            if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
+
+            memcpy(current_frame, res.jpeg_output.data(), copy_len);
+            current_len = copy_len;
             pthread_mutex_unlock(&frame_mutex);
         }
 
-        next_time.tv_nsec += interval_ms * 1000000L;
+        long interval = current_interval_ms;
+        next_time.tv_nsec += interval * 1000000L;
 
         while (next_time.tv_nsec >= 1000000000L) {
             next_time.tv_nsec -= 1000000000L;
@@ -190,7 +266,6 @@ void *frame_updater(void *arg) {
 
     return NULL;
 }
-
 
 static void set_socket_timeout(int fd, int seconds) {
     struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
@@ -446,11 +521,33 @@ static SSL_CTX *init_ssl(void) {
 
 int main(void) {
     printf("Starting Security Server...\n");
+    printf("Config path: %s\n", CONFIG_PATH);
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGHUP, signal_handler);
+
+    // Load config
+    load_config(CONFIG_PATH);
+    current_interval_ms = g_frame_interval_ms;
+
+    printf("\n=== Configuration ===\n");
+    printf("Frame interval: %dms (%.1f fps)\n", g_frame_interval_ms, 1000.0/g_frame_interval_ms);
+    printf("Frame size: %dx%d\n", g_frame_width, g_frame_height);
+    printf("HTTP port: %d, HTTPS port: %d\n", g_port_http, g_port_https);
+    printf("Max history: %d\n", g_max_history);
+    printf("Thermal throttle: %d°C, min interval: %dms\n", g_temp_throttle_c, g_min_interval_ms);
+    printf("Watchdog timeout: %dms\n", g_watchdog_timeout_ms);
+    printf("Send SIGHUP (kill -HUP %d) to reload config\n", getpid());
+    printf("========================\n\n");
 
     srand(time(NULL));
+
+    history = malloc(g_max_history * sizeof(detection_record_t));
+    if (!history) {
+        printf("Failed to allocate history\n");
+        return 1;
+    }
 
     html_cache = load_html();
     if (!html_cache) {
@@ -486,7 +583,7 @@ int main(void) {
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
-        .sin_port = htons(PORT_HTTP)
+        .sin_port = htons(g_port_http)
     };
 
     if (bind(http_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -494,7 +591,7 @@ int main(void) {
         return 1;
     }
     listen(http_fd, 10);
-    printf("HTTP on %d (redirects to HTTPS)\n", PORT_HTTP);
+    printf("HTTP on %d (redirects to HTTPS)\n", g_port_http);
 
     int https_fd = socket(AF_INET, SOCK_STREAM, 0);
     setsockopt(https_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
@@ -502,7 +599,7 @@ int main(void) {
     struct sockaddr_in addr_https = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
-        .sin_port = htons(PORT_HTTPS)
+        .sin_port = htons(g_port_https)
     };
 
     if (bind(https_fd, (struct sockaddr *)&addr_https, sizeof(addr_https)) < 0) {
@@ -511,10 +608,8 @@ int main(void) {
     }
     listen(https_fd, 10);
 
-    printf("HTTPS on %d\n", PORT_HTTPS);
-    printf("Open: https://192.168.137.100:8443/\n");
-    printf("API endpoints available at /api/v1/*\n");
-    printf("Frame capture: %d ms interval (%.1f fps)\n", FRAME_INTERVAL_MS, 1000.0/FRAME_INTERVAL_MS);
+    printf("HTTPS on %d\n", g_port_https);
+    printf("Open: https://192.168.137.100:%d/\n", g_port_https);
 
     while (running) {
         fd_set fds;
@@ -547,6 +642,7 @@ int main(void) {
     close(https_fd);
     SSL_CTX_free(ssl_ctx);
     free(html_cache);
+    free(history);
 
     return 0;
 }
