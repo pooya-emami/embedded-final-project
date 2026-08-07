@@ -243,12 +243,13 @@ void *frame_updater(void *arg) {
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
             pthread_mutex_lock(&frame_mutex);
-            size_t copy_len = res.jpeg_output.size();
+            size_t copy_len = res.jpeg_length;
             if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
 
-            memcpy(current_frame, res.jpeg_output.data(), copy_len);
+            memcpy(current_frame, res.jpeg_output, copy_len);
             current_len = copy_len;
             pthread_mutex_unlock(&frame_mutex);
+            free_detection_result(&res);
         }
 
         long interval = current_interval_ms;
