@@ -1,15 +1,20 @@
 #ifndef DETECTOR_HPP
 #define DETECTOR_HPP
 
-#include <vector>
-#include <cstdint>
+#include <stddef.h>
+#include <stdint.h>
 
-struct DetectionResult {
-    std::vector<uint8_t> jpeg_output; 
-    int width;
-    int height;
-    int person_count;  // Add this
-};
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef struct {
+    uint8_t* jpeg_output;   // malloc'ed buffer
+    size_t   jpeg_length;   // number of bytes
+    int      width;         // output width
+    int      height;        // output height
+    int      person_count;  // detection count
+} DetectionResult;
 
 DetectionResult process_frame(
     const uint8_t* jpeg_data,
@@ -17,5 +22,11 @@ DetectionResult process_frame(
     int output_width,
     int output_height
 );
+
+void free_detection_result(DetectionResult* res);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
