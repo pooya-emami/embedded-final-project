@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <pthread.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <signal.h>
@@ -12,6 +13,7 @@
 #include <time.h>
 #include <stdint.h>
 #include <ctype.h>
+#include <errno.h>
 
 #include "server.h"
 #include "shared_frame.h"
@@ -32,7 +34,7 @@ static unsigned char current_frame[BUFFER_SIZE];
 static size_t current_len = 0;
 
 static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
-static volatile int running = 1;
+static volatile sig_atomic_t running = 1;
 
 static SSL_CTX *ssl_ctx = NULL;
 
@@ -520,8 +522,8 @@ int main(void) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
 
-    // Load config
     load_config(CONFIG_PATH);
     current_interval_ms = g_frame_interval_ms;
 
@@ -612,7 +614,24 @@ int main(void) {
         FD_SET(https_fd, &fds);
 
         int max_fd = (https_fd > http_fd) ? https_fd : http_fd;
-        select(max_fd + 1, &fds, NULL, NULL, NULL);
+        
+        struct timeval tv;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+        
+        int ret = select(max_fd + 1, &fds, NULL, NULL, &tv);
+        
+        if (ret < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            perror("select");
+            break;
+        }
+        
+        if (ret == 0) {
+            continue;
+        }
 
         if (FD_ISSET(http_fd, &fds)) {
             int fd = accept(http_fd, NULL, NULL);
@@ -632,11 +651,18 @@ int main(void) {
         }
     }
 
+    printf("\nShutting down server...\n");
+    
+    // Wait for threads to finish
+    pthread_join(updater, NULL);
+    pthread_join(telemetry_thread, NULL);
+
     close(http_fd);
     close(https_fd);
     SSL_CTX_free(ssl_ctx);
     free(html_cache);
     free(history);
 
+    printf("Server shutdown complete.\n");
     return 0;
 }
