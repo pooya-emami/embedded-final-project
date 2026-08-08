@@ -64,29 +64,8 @@ while True:
             break
         continue
 
-    # ----------------------------------------------------
-    # YOLOv8 stride + grid correction (P4 + P5 only)
-    # ----------------------------------------------------
-    strides = [16, 32]
-    shapes = [(40, 40), (20, 20)]
-
-    grids = []
-    for (gh, gw), stride in zip(shapes, strides):
-        yv, xv = np.meshgrid(np.arange(gh), np.arange(gw))
-        grid = np.stack((xv, yv), axis=2).reshape(-1, 2)
-        grids.append((grid, stride))
-
-    offset = 0
-    for grid, stride in grids:
-        n = grid.shape[0]
-        boxes[offset:offset+n, 0:2] = (boxes[offset:offset+n, 0:2] * 2 - 0.5 + grid) * stride
-        boxes[offset:offset+n, 2:4] = (boxes[offset:offset+n, 2:4] * 2) ** 2 * stride
-        offset += n
-
-    # Convert to xyxy
     boxes_xyxy = xywh2xyxy(boxes)
 
-    # Scale to original frame
     scale_x = w / IMG_SIZE
     scale_y = h / IMG_SIZE
     boxes_xyxy[:, [0, 2]] *= scale_x

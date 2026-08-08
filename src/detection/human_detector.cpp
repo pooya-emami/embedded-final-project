@@ -41,82 +41,73 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
         return boxes;
 
     cv::Mat blob = cv::dnn::blobFromImage(
-        img320, 1/255.0, cv::Size(320, 320),
+        img320, 1.0/255.0, cv::Size(320, 320),
         cv::Scalar(), true, false
     );
 
     yolo.setInput(blob);
+    cv::Mat out = yolo.forward();   // (1, 84, 2100)
 
-    cv::Mat out = yolo.forward();  // shape: (1, 84, 2100)
+    out = out.reshape(1, 84);
 
-    cv::Mat out2;
-    cv::transpose(out.reshape(1, 84), out2);
+    cv::Mat outT;
+    cv::transpose(out, outT);
 
-    cv::Mat boxes_mat = out2.colRange(0, 4);      // (2100, 4)
-    cv::Mat scores_mat = out2.colRange(4, 84);    // (2100, 80)
+    int num_preds = outT.rows;
 
-    std::vector<cv::Vec4f> raw_boxes;
-    std::vector<float> confidences;
-    std::vector<int> class_ids;
+    std::vector<cv::Rect> final_boxes;
+    std::vector<float> final_scores;
 
-    for (int i = 0; i < boxes_mat.rows; i++) {
-        cv::Vec4f b = boxes_mat.row(i);
+    for (int i = 0; i < num_preds; i++) {
+        float x = outT.at<float>(i, 0);
+        float y = outT.at<float>(i, 1);
+        float w = outT.at<float>(i, 2);
+        float h = outT.at<float>(i, 3);
 
-        cv::Mat score_row = scores_mat.row(i);
+        // class scores start at column 4
+        float best_score = -1;
+        int best_class = -1;
 
-        cv::Point classIdPoint;
-        double maxScore;
-        cv::minMaxLoc(score_row, nullptr, &maxScore, nullptr, &classIdPoint);
-
-        if (maxScore > 0.25f) {
-            raw_boxes.push_back(b);
-            confidences.push_back((float)maxScore);
-            class_ids.push_back(classIdPoint.x);
+        for (int c = 0; c < 80; c++) {
+            float score = outT.at<float>(i, 4 + c);
+            if (score > best_score) {
+                best_score = score;
+                best_class = c;
+            }
         }
-    }
 
-    if (raw_boxes.empty())
-        return boxes;
+        if (best_score < 0.25f)
+            continue;
 
-    std::vector<cv::Rect> boxes_xyxy;
-    boxes_xyxy.reserve(raw_boxes.size());
+        if (best_class != 0) 
+            continue;
 
-    for (auto &b : raw_boxes) {
-        float x = b[0];
-        float y = b[1];
-        float w = b[2];
-        float h = b[3];
+        float x1 = x - w * 0.5f;
+        float y1 = y - h * 0.5f;
+        float x2 = x + w * 0.5f;
+        float y2 = y + h * 0.5f;
 
-        float x1 = x - w/2.0f;
-        float y1 = y - h/2.0f;
-        float x2 = x + w/2.0f;
-        float y2 = y + h/2.0f;
-
-        boxes_xyxy.emplace_back(
-            cv::Point((int)x1, (int)y1),
-            cv::Point((int)x2, (int)y2)
+        cv::Rect rect(
+            (int)x1, (int)y1,
+            (int)(x2 - x1),
+            (int)(y2 - y1)
         );
+
+        final_boxes.push_back(rect);
+        final_scores.push_back(best_score);
     }
 
-    float scale_x = img320.cols / 320.0f;
-    float scale_y = img320.rows / 320.0f;
-
-    for (auto &r : boxes_xyxy) {
-        r.x *= scale_x;
-        r.y *= scale_y;
-        r.width *= scale_x;
-        r.height *= scale_y;
-    }
-
+    // NMS
     std::vector<int> keep;
-    cv::dnn::NMSBoxes(boxes_xyxy, confidences, 0.25f, 0.45f, keep);
+    cv::dnn::NMSBoxes(final_boxes, final_scores,
+                      0.25f, 0.45f, keep);
 
+    std::vector<cv::Rect> nms_boxes;
     for (int idx : keep) {
-        if (class_ids[idx] == 0)
-            boxes.push_back(boxes_xyxy[idx]);
+        nms_boxes.push_back(final_boxes[idx]);
     }
 
-    return boxes;
+    return nms_boxes;
 }
 
 extern "C" DetectionResult process_frame(
