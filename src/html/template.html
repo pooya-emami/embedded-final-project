@@ -67,33 +67,18 @@ function updateTelemetry() {
         });
 }
 
-// Stream update - polls the image endpoint with cache-buster
 function updateStream() {
     const img = document.getElementById('stream');
-    const status = document.getElementById('streamStatus');
-    
-    // Add timestamp to force fresh request (bypass browser cache)
-    img.src = '/stream?t=' + Date.now();
-    status.textContent = 'Stream: Updating...';
-    
-    // Optional: track when image actually loads
-    img.onload = function() {
-        status.textContent = 'Stream: Live';
-    };
-    img.onerror = function() {
-        status.textContent = 'Stream: Error loading frame';
-    };
+    img.src = '/stream?t=' + Date.now(); 
+
 }
 
-// Start both polling loops
-// Telemetry: every 2 seconds (matches your server's telemetry update rate)
+
 setInterval(updateTelemetry, 2000);
 updateTelemetry();
 
-// Stream: every 200ms (adjust to match your FRAME_INTERVAL_MS)
-// Set to match your actual frame rate, not faster than server can respond
-setInterval(updateStream, 200);
-updateStream(); // Initial load
+setInterval(updateStream, 1);
+updateStream(); 
 </script>
 
 </body>
