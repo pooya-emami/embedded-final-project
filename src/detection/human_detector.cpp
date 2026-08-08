@@ -1,8 +1,9 @@
+#include <onnxruntime_cxx_api.h>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/dnn.hpp>
-#include <onnxruntime_cxx_api.h>
+
 #include <iostream>
 #include <vector>
 #include <string>
@@ -19,10 +20,6 @@ static Ort::Env ort_env(ORT_LOGGING_LEVEL_WARNING, "YOLO");
 static Ort::Session* yolo_session = nullptr;
 static bool yolo_loaded = false;
 
-static inline float sigmoid(float x) {
-    return 1.0f / (1.0f + std::exp(-x));
-}
-
 static void load_yolo()
 {
     if (yolo_loaded)
@@ -32,34 +29,43 @@ static void load_yolo()
              "%s%s", MODEL_BASE_PATH, YOLO_MODEL_FILE);
 
     Ort::SessionOptions session_options;
-    session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    session_options.SetGraphOptimizationLevel(
+        GraphOptimizationLevel::ORT_ENABLE_ALL
+    );
 
-    yolo_session = new Ort::Session(ort_env, model_path, session_options);
+    yolo_session = new Ort::Session(
+        ort_env,
+        model_path,
+        session_options
+    );
+
     yolo_loaded = true;
 }
 
-static std::vector<cv::Rect> detectHumans(const cv::Mat &img320, int orig_w, int orig_h)
+static inline float sigmoid(float x) {
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
+static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 {
     load_yolo();
 
-    std::vector<cv::Rect> final_boxes;
+    std::vector<cv::Rect> boxes;
     if (!yolo_loaded)
-        return final_boxes;
+        return boxes;
 
-    // --- Preprocess ---
     cv::Mat rgb;
     cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
     rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f);
 
-    std::vector<float> blob(1 * 3 * 320 * 320);
+    std::vector<float> input_tensor_values(1 * 3 * 320 * 320);
 
     for (int y = 0; y < 320; y++) {
         for (int x = 0; x < 320; x++) {
             cv::Vec3f p = rgb.at<cv::Vec3f>(y, x);
-
-            blob[y * 320 + x] = p[0];
-            blob[320 * 320 + y * 320 + x] = p[1];
-            blob[2 * 320 * 320 + y * 320 + x] = p[2];
+            input_tensor_values[y * 320 + x] = p[0];
+            input_tensor_values[320 * 320 + y * 320 + x] = p[1];
+            input_tensor_values[2 * 320 * 320 + y * 320 + x] = p[2];
         }
     }
 
@@ -70,8 +76,8 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320, int orig_w, int
 
     Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
         mem_info,
-        blob.data(),
-        blob.size(),
+        input_tensor_values.data(),
+        input_tensor_values.size(),
         input_shape.data(),
         input_shape.size()
     );
@@ -86,85 +92,82 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320, int orig_w, int
 
     auto output_tensors = yolo_session->Run(
         Ort::RunOptions{nullptr},
-        input_names,
-        &input_tensor,
-        1,
-        output_names,
-        1
-    );
+        input_names, &input_tensor, 1,
+        output_names, 1);
 
     float* out = output_tensors[0].GetTensorMutableData<float>();
+
     auto shape = output_tensors[0]
         .GetTensorTypeAndShapeInfo()
         .GetShape();
 
-    int C = shape[1];   // 84
-    int N = shape[2];   // 2100
+    int channels = shape[1];        // 84
+    int num_predictions = shape[2]; // 2100
 
-    std::vector<cv::Rect> raw_boxes;
-    std::vector<float> raw_scores;
+    struct Detection {
+        float x1, y1, x2, y2;
+        float confidence;
+        int class_id;
+    };
+    std::vector<Detection> detections;
 
-    float sx = (float)orig_w / 320.0f;
-    float sy = (float)orig_h / 320.0f;
+    // Model output: channels 0-3 are cx,cy,w,h in 0-320 pixel space (raw),
+    // channels 4-83 are already post-sigmoid class probabilities.
+    // No activation should be applied here — same as the working Python version.
+    for (int i = 0; i < num_predictions; i++) {
+        float x = out[0 * num_predictions + i];
+        float y = out[1 * num_predictions + i];
+        float w = out[2 * num_predictions + i];
+        float h = out[3 * num_predictions + i];
 
-    // --- Decode YOLOv5-u unified output ---
-    for (int i = 0; i < N; i++) {
-
-        float x = out[0 * N + i];
-        float y = out[1 * N + i];
-        float w = out[2 * N + i];
-        float h = out[3 * N + i];
-
-        float obj = sigmoid(out[4 * N + i]);
-        if (obj < 0.25f) continue;
-
-        float best_score = 0;
+        float best_score = 0.0f;
         int best_class = -1;
-
-        for (int c = 5; c < C; c++) {
-            float s = sigmoid(out[c * N + i]);
+        for (int c = 4; c < channels; c++) {
+            float s = out[c * num_predictions + i];
             if (s > best_score) {
                 best_score = s;
-                best_class = c - 5;
+                best_class = c - 4;
             }
         }
 
-        if (best_class != 0) continue; // only person class
+        if (best_score < 0.25f) continue;
+        if (best_class != 0) continue; // person class only
 
-        float conf = obj * best_score;
-        if (conf < 0.25f) continue;
+        float x1 = (x - w / 2.0f) * img320.cols / 320.0f;
+        float y1 = (y - h / 2.0f) * img320.rows / 320.0f;
+        float x2 = (x + w / 2.0f) * img320.cols / 320.0f;
+        float y2 = (y + h / 2.0f) * img320.rows / 320.0f;
 
-        // xywh → xyxy (absolute pixel coordinates)
-        float x1 = x - w / 2;
-        float y1 = y - h / 2;
-        float x2 = x + w / 2;
-        float y2 = y + h / 2;
-
-        // --- SCALE TO ORIGINAL FRAME BEFORE NMS ---
-        float x1s = x1 * sx;
-        float y1s = y1 * sy;
-        float x2s = x2 * sx;
-        float y2s = y2 * sy;
-
-        raw_boxes.emplace_back(
-            (int)x1s, (int)y1s,
-            (int)(x2s - x1s),
-            (int)(y2s - y1s)
-        );
-
-        raw_scores.push_back(conf);
+        detections.push_back({x1, y1, x2, y2, best_score, best_class});
     }
 
-    // --- Apply NMS ---
-    std::vector<int> keep;
-    cv::dnn::NMSBoxes(raw_boxes, raw_scores, 0.25f, 0.45f, keep);
+    if (!detections.empty()) {
+        std::vector<cv::Rect> rects;
+        std::vector<float> scores;
 
-    for (int idx : keep)
-        final_boxes.push_back(raw_boxes[idx]);
+        for (const auto& det : detections) {
+            rects.emplace_back(
+                (int)det.x1,
+                (int)det.y1,
+                (int)(det.x2 - det.x1),
+                (int)(det.y2 - det.y1)
+            );
+            scores.push_back(det.confidence);
+        }
 
-    return final_boxes;
+        std::vector<int> indices;
+        cv::dnn::NMSBoxes(rects, scores, 0.25f, 0.45f, indices);
+
+        for (int idx : indices) {
+            boxes.push_back(rects[idx]);
+        }
+    }
+
+    return boxes;
 }
 
+
+// This is the function that server.c is calling
 extern "C" DetectionResult process_frame(
     const uint8_t* jpeg_data,
     size_t jpeg_len,
@@ -172,6 +175,11 @@ extern "C" DetectionResult process_frame(
     int output_height)
 {
     DetectionResult result = {};
+    result.jpeg_output = NULL;
+    result.jpeg_length = 0;
+    result.width = 0;
+    result.height = 0;
+    result.person_count = 0;
 
     std::vector<uint8_t> buf(jpeg_data, jpeg_data + jpeg_len);
     cv::Mat frame_source = cv::imdecode(buf, cv::IMREAD_COLOR);
@@ -182,37 +190,38 @@ extern "C" DetectionResult process_frame(
     cv::Mat frame_detection;
     cv::resize(frame_source, frame_detection, cv::Size(320, 320));
 
-    auto boxes = detectHumans(frame_detection, frame_source.cols, frame_source.rows);
+    auto boxes = detectHumans(frame_detection);
 
+    // Draw boxes
     for (const auto &box : boxes)
-        cv::rectangle(frame_source, box, cv::Scalar(0, 255, 0), 2);
+        cv::rectangle(frame_detection, box, cv::Scalar(0, 255, 0), 2);
 
+    // Add text overlays
     auto now = std::chrono::system_clock::now();
     auto now_time_t = std::chrono::system_clock::to_time_t(now);
 
     std::stringstream ss;
     ss << std::put_time(std::localtime(&now_time_t), "%Y-%m-%d %H:%M:%S");
 
-    cv::putText(frame_source, "Student: 404300409",
+    cv::putText(frame_detection, "Student: 404300409",
                 cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
                 0.6, cv::Scalar(0, 255, 255), 2);
 
-    cv::putText(frame_source, ss.str(),
+    cv::putText(frame_detection, ss.str(),
                 cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX,
                 0.6, cv::Scalar(255, 255, 255), 2);
 
-    cv::putText(frame_source,
-                "Persons: " + std::to_string(boxes.size()),
+    cv::putText(frame_detection, "Persons: " + std::to_string(boxes.size()),
                 cv::Point(10, 90), cv::FONT_HERSHEY_SIMPLEX,
                 0.6, cv::Scalar(0, 255, 0), 2);
 
+    // FPS counter
     static double fps = 0;
     static int frame_count = 0;
     static auto start = std::chrono::steady_clock::now();
 
     auto current = std::chrono::steady_clock::now();
     double elapsed = std::chrono::duration<double>(current - start).count();
-
     frame_count++;
 
     if (elapsed >= 1.0) {
@@ -221,15 +230,15 @@ extern "C" DetectionResult process_frame(
         start = current;
     }
 
-    cv::putText(frame_source,
-                "FPS: " + std::to_string(fps).substr(0, 4),
-                cv::Point(frame_source.cols - 100, 30),
+    std::string fps_str = std::to_string(fps).substr(0, 4);
+    cv::putText(frame_detection, "FPS: " + fps_str,
+                cv::Point(frame_detection.cols - 100, 30),
                 cv::FONT_HERSHEY_SIMPLEX,
                 0.6, cv::Scalar(0, 255, 0), 2);
 
+    // Resize to output size and encode as JPEG
     cv::Mat frame_output;
-    cv::resize(frame_source, frame_output,
-               cv::Size(output_width, output_height));
+    cv::resize(frame_detection, frame_output, cv::Size(output_width, output_height));
 
     std::vector<uint8_t> jpegBuf;
     cv::imencode(".jpg", frame_output, jpegBuf);
