@@ -50,15 +50,32 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         return boxes;
 
 
-    cv::Mat blob = cv::dnn::blobFromImage(
-        img320,
-        1.0 / 255.0,
-        cv::Size(320,320),
-        cv::Scalar(),
-        true,
-        false
-    );
+cv::Mat rgb;
+cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
 
+rgb.convertTo(rgb, CV_32F, 1.0/255.0);
+
+std::vector<float> input_tensor_values(1 * 3 * 320 * 320);
+
+for(int y = 0; y < 320; y++)
+{
+    for(int x = 0; x < 320; x++)
+    {
+        cv::Vec3f pixel = rgb.at<cv::Vec3f>(y,x);
+
+        input_tensor_values[
+            0*320*320 + y*320 + x
+        ] = pixel[0];
+
+        input_tensor_values[
+            1*320*320 + y*320 + x
+        ] = pixel[1];
+
+        input_tensor_values[
+            2*320*320 + y*320 + x
+        ] = pixel[2];
+    }
+}
 
     std::array<int64_t,4> input_shape = {
         1,3,320,320
