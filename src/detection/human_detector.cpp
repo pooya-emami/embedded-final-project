@@ -54,15 +54,26 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
     // -------------------------------
     std::cout << "[YOLO] Running forward()...\n";
 
-    std::vector<cv::Mat> outputs;
-    std::vector<cv::String> names = yolo.getUnconnectedOutLayersNames();
+try {
+    std::cout << "[YOLO] Testing simple forward()...\n";
 
-    try {
-        yolo.forward(outputs, names);
-    } catch (cv::Exception &e) {
-        std::cerr << "[YOLO] forward() crashed: " << e.what() << "\n";
-        return boxes;
+    cv::Mat output = yolo.forward();
+
+    std::cout << "[YOLO] forward() SUCCESS!\n";
+    std::cout << "[YOLO] dims = " << output.dims << "\n";
+
+    std::cout << "[YOLO] shape = ";
+    for (int i = 0; i < output.dims; i++) {
+        std::cout << output.size[i] << " ";
     }
+    std::cout << "\n";
+
+} catch (const cv::Exception &e) {
+    std::cerr << "[YOLO] forward() FAILED:\n";
+    std::cerr << e.what() << "\n";
+}
+
+return boxes;  // TEMPORARY
 
     if (outputs.empty()) {
         std::cerr << "[YOLO] forward() returned NO outputs!\n";
