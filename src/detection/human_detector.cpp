@@ -48,189 +48,114 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     load_yolo();
 
     std::vector<cv::Rect> boxes;
-
     if (!yolo_loaded)
         return boxes;
 
+    // --- Preprocess ---
+    cv::Mat rgb;
+    cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
+    rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f);
 
-    cv::Mat blob = cv::dnn::blobFromImage(
-        img320,
-        1.0 / 255.0,
-        cv::Size(320,320),
-        cv::Scalar(),
-        true,
-        false
-    );
+    std::vector<float> blob(1 * 3 * 320 * 320);
 
+    for (int y = 0; y < 320; y++) {
+        for (int x = 0; x < 320; x++) {
+            cv::Vec3f p = rgb.at<cv::Vec3f>(y, x);
+            blob[0 * 320 * 320 + y * 320 + x] = p[0];
+            blob[1 * 320 * 320 + y * 320 + x] = p[1];
+            blob[2 * 320 * 320 + y * 320 + x] = p[2];
+        }
+    }
 
-    std::array<int64_t,4> input_shape = {1,3,320,320};
+    std::array<int64_t, 4> input_shape = {1, 3, 320, 320};
 
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
+        OrtArenaAllocator, OrtMemTypeDefault);
 
-    Ort::MemoryInfo memory_info =
-        Ort::MemoryInfo::CreateCpu(
-            OrtArenaAllocator,
-            OrtMemTypeDefault
-        );
-
-
-    Ort::Value input_tensor =
-        Ort::Value::CreateTensor<float>(
-            memory_info,
-            (float*)blob.data,
-            3 * 320 * 320,
-            input_shape.data(),
-            input_shape.size()
-        );
-
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+        mem_info, blob.data(), blob.size(),
+        input_shape.data(), input_shape.size());
 
     Ort::AllocatorWithDefaultOptions allocator;
 
+    auto input_name = yolo_session->GetInputNameAllocated(0, allocator);
+    auto output_name = yolo_session->GetOutputNameAllocated(0, allocator);
 
-    auto input_name =
-        yolo_session->GetInputNameAllocated(0, allocator);
+    const char* input_names[] = {input_name.get()};
+    const char* output_names[] = {output_name.get()};
 
-    auto output_name =
-        yolo_session->GetOutputNameAllocated(0, allocator);
+    auto output_tensors = yolo_session->Run(
+        Ort::RunOptions{nullptr},
+        input_names, &input_tensor, 1,
+        output_names, 1);
 
+    float* out = output_tensors[0].GetTensorMutableData<float>();
 
-    const char* input_names[] = {
-        input_name.get()
-    };
+    auto shape = output_tensors[0]
+        .GetTensorTypeAndShapeInfo()
+        .GetShape();
 
-    const char* output_names[] = {
-        output_name.get()
-    };
+    // Expected: (1, 84, 2100)
+    int C = shape[1];   // 84
+    int N = shape[2];   // 2100
 
+    // Convert to (2100, 84)
+    std::vector<std::array<float, 84>> preds(N);
+    for (int i = 0; i < N; i++) {
+        for (int c = 0; c < C; c++) {
+            preds[i][c] = out[c * N + i];
+        }
+    }
 
-    auto outputs =
-        yolo_session->Run(
-            Ort::RunOptions{nullptr},
-            input_names,
-            &input_tensor,
-            1,
-            output_names,
-            1
-        );
+    // Decode predictions
+    for (int i = 0; i < N; i++) {
+        float x = preds[i][0];
+        float y = preds[i][1];
+        float w = preds[i][2];
+        float h = preds[i][3];
 
+        float obj = preds[i][4];
+        if (obj < 0.25f) continue;
 
-    float* output =
-        outputs[0].GetTensorMutableData<float>();
-
-
-    /*
-       YOLO output:
-       1 x 84 x 2100
-
-       convert to:
-       2100 x 84
-    */
-
-    cv::Mat pred(
-        84,
-        2100,
-        CV_32F,
-        output
-    );
-
-
-    cv::Mat detections;
-
-    cv::transpose(pred, detections);
-
-
-    std::vector<cv::Rect> raw_boxes;
-    std::vector<float> scores;
-
-
-    for(int i=0;i<2100;i++)
-    {
-
-        float x = detections.at<float>(i,0);
-        float y = detections.at<float>(i,1);
-        float w = detections.at<float>(i,2);
-        float h = detections.at<float>(i,3);
-
-
-        float best_score = 0.0f;
+        // class scores
+        float best_score = 0;
         int best_class = -1;
 
-
-        for(int c=0;c<80;c++)
-        {
-            float s =
-                detections.at<float>(i,4+c);
-
-
-            if(s > best_score)
-            {
+        for (int c = 5; c < 84; c++) {
+            float s = preds[i][c];
+            if (s > best_score) {
                 best_score = s;
-                best_class = c;
+                best_class = c - 5;
             }
         }
 
+        if (best_class != 0) continue; // only person
 
-        // COCO person class
-        if(best_class == 0 && best_score > 0.25f)
-        {
+        float conf = best_score;
+        if (conf < 0.25f) continue;
 
-            /*
-              YOLO coordinates are normalized
-              relative to 320x320
-            */
+        // xywh → xyxy
+        float x1 = x - w / 2;
+        float y1 = y - h / 2;
+        float x2 = x + w / 2;
+        float y2 = y + h / 2;
 
-            int x1 =
-                (x - w/2.0f) * 320;
+        // scale to original 320×320
+        x1 *= (float)img320.cols / 320.0f;
+        x2 *= (float)img320.cols / 320.0f;
+        y1 *= (float)img320.rows / 320.0f;
+        y2 *= (float)img320.rows / 320.0f;
 
-            int y1 =
-                (y - h/2.0f) * 320;
-
-
-            int width =
-                w * 320;
-
-            int height =
-                h * 320;
-
-
-            raw_boxes.emplace_back(
-                x1,
-                y1,
-                width,
-                height
-            );
-
-
-            scores.push_back(best_score);
-        }
+        boxes.emplace_back(
+            (int)x1, (int)y1,
+            (int)(x2 - x1),
+            (int)(y2 - y1)
+        );
     }
-
-
-    std::vector<int> keep;
-
-
-    cv::dnn::NMSBoxes(
-        raw_boxes,
-        scores,
-        0.25f,
-        0.45f,
-        keep
-    );
-
-
-    for(int idx : keep)
-    {
-        boxes.push_back(raw_boxes[idx]);
-    }
-
-
-    std::cout 
-        << "DETECTIONS "
-        << boxes.size()
-        << std::endl;
-
 
     return boxes;
 }
+
 
 extern "C" DetectionResult process_frame(
     const uint8_t* jpeg_data,
