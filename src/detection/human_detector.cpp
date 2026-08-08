@@ -100,7 +100,31 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     int channels = shape[1];  // 84
     int num_predictions = shape[2];  // 2100
 
-    // Store all detections
+    // Debug: Print statistics for first 100 predictions
+    printf("\n=== Output Statistics ===\n");
+    float max_score = 0;
+    float min_score = 1;
+    int scores_above_025 = 0;
+    int class0_above_025 = 0;
+    
+    for (int i = 0; i < std::min(100, num_predictions); i++) {
+        for (int c = 4; c < channels; c++) {
+            float s = out[c * num_predictions + i];
+            if (s > max_score) max_score = s;
+            if (s < min_score) min_score = s;
+            if (s > 0.25) scores_above_025++;
+        }
+        // Check class 0 specifically
+        float class0_score = out[4 * num_predictions + i];
+        if (class0_score > 0.25) class0_above_025++;
+    }
+    printf("Max class score: %.6f\n", max_score);
+    printf("Min class score: %.6f\n", min_score);
+    printf("Scores > 0.25 in first 100 predictions: %d\n", scores_above_025);
+    printf("Class 0 scores > 0.25 in first 100: %d\n", class0_above_025);
+    printf("========================\n");
+
+    // Store all detections - MATCH PYTHON CODE EXACTLY
     struct Detection {
         float x1, y1, x2, y2;
         float confidence;
@@ -108,53 +132,49 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     };
     std::vector<Detection> detections;
 
-    // Helper function for sigmoid
-    auto sigmoid = [](float x) { return 1.0f / (1.0f + exp(-x)); };
-
-    // Process each prediction
+    // Process exactly like Python
     for (int i = 0; i < num_predictions; i++) {
-        // Box coordinates (no sigmoid needed for coordinates)
+        // Get box coordinates (indices 0-3)
         float x = out[0 * num_predictions + i];
         float y = out[1 * num_predictions + i];
         float w = out[2 * num_predictions + i];
         float h = out[3 * num_predictions + i];
         
-        // Find best class score with sigmoid activation
+        // Find best class score (indices 4-83)
         float best_score = 0;
         int best_class = -1;
         for (int c = 4; c < channels; c++) {
-            // Apply sigmoid to class scores (like Python's DNN does)
-            float s = sigmoid(out[c * num_predictions + i]);
+            float s = out[c * num_predictions + i];
             if (s > best_score) {
                 best_score = s;
                 best_class = c - 4;
             }
         }
         
-        // Lower threshold to match Python's behavior
+        // Apply threshold - MATCH PYTHON
         if (best_score < 0.25f) continue;
         
-        // Only person class (class 0)
+        // Only person class (class 0) - MATCH PYTHON
         if (best_class != 0) continue;
         
-        // Scale coordinates from 0-320 to image size
+        // Convert center format to corner format - MATCH PYTHON
         float x1 = (x - w/2) * img320.cols / 320.0f;
         float y1 = (y - h/2) * img320.rows / 320.0f;
         float x2 = (x + w/2) * img320.cols / 320.0f;
         float y2 = (y + h/2) * img320.rows / 320.0f;
         
-        // Clamp to image bounds
-        x1 = std::max(0.0f, std::min(x1, (float)img320.cols));
-        y1 = std::max(0.0f, std::min(y1, (float)img320.rows));
-        x2 = std::max(0.0f, std::min(x2, (float)img320.cols));
-        y2 = std::max(0.0f, std::min(y2, (float)img320.rows));
+        detections.push_back({x1, y1, x2, y2, best_score, best_class});
         
-        if (x2 > x1 && y2 > y1) {
-            detections.push_back({x1, y1, x2, y2, best_score, best_class});
+        // Debug: Print first few detections
+        if (detections.size() <= 5) {
+            printf("Detection %zu: class=%d, score=%.4f, box=(%.1f,%.1f)-(%.1f,%.1f)\n", 
+                   detections.size(), best_class, best_score, x1, y1, x2, y2);
         }
     }
 
-    // Apply NMS
+    printf("Detections before NMS: %zu\n", detections.size());
+
+    // Apply NMS - MATCH PYTHON
     if (!detections.empty()) {
         std::vector<cv::Rect> rects;
         std::vector<float> scores;
@@ -172,11 +192,14 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         std::vector<int> indices;
         cv::dnn::NMSBoxes(rects, scores, 0.25f, 0.45f, indices);
         
+        printf("Indices after NMS: %zu\n", indices.size());
+        
         for (int idx : indices) {
             boxes.push_back(rects[idx]);
         }
     }
 
+    printf("Final boxes: %zu\n", boxes.size());
     return boxes;
 }
 
