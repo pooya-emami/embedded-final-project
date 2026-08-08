@@ -49,41 +49,37 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     if (!yolo_loaded)
         return boxes;
 
+    cv::Mat rgb;
+    cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
+    rgb.convertTo(rgb, CV_32F, 1.0 / 255.0);
 
-cv::Mat rgb;
-cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
+    std::vector<float> input_tensor_values(1 * 3 * 320 * 320);
 
-rgb.convertTo(rgb, CV_32F, 1.0/255.0);
-
-std::vector<float> input_tensor_values(1 * 3 * 320 * 320);
-
-for(int y = 0; y < 320; y++)
-{
-    for(int x = 0; x < 320; x++)
+    for (int y = 0; y < 320; y++)
     {
-        cv::Vec3f pixel = rgb.at<cv::Vec3f>(y,x);
+        for (int x = 0; x < 320; x++)
+        {
+            cv::Vec3f pixel = rgb.at<cv::Vec3f>(y, x);
 
-        input_tensor_values[
-            0*320*320 + y*320 + x
-        ] = pixel[0];
+            input_tensor_values[
+                0 * 320 * 320 + y * 320 + x
+            ] = pixel[0];
 
-        input_tensor_values[
-            1*320*320 + y*320 + x
-        ] = pixel[1];
+            input_tensor_values[
+                1 * 320 * 320 + y * 320 + x
+            ] = pixel[1];
 
-        input_tensor_values[
-            2*320*320 + y*320 + x
-        ] = pixel[2];
+            input_tensor_values[
+                2 * 320 * 320 + y * 320 + x
+            ] = pixel[2];
+        }
     }
-}
 
-    std::array<int64_t,4> input_shape = {
-        1,3,320,320
+    std::array<int64_t, 4> input_shape = {
+        1, 3, 320, 320
     };
 
-
-    size_t input_tensor_size = 1*3*320*320;
-
+    size_t input_tensor_size = 1 * 3 * 320 * 320;
 
     Ort::MemoryInfo memory_info =
         Ort::MemoryInfo::CreateCpu(
@@ -91,19 +87,16 @@ for(int y = 0; y < 320; y++)
             OrtMemTypeDefault
         );
 
-
     Ort::Value input_tensor =
         Ort::Value::CreateTensor<float>(
             memory_info,
-            (float*)blob.data,
+            input_tensor_values.data(),
             input_tensor_size,
             input_shape.data(),
             input_shape.size()
         );
 
-
     Ort::AllocatorWithDefaultOptions allocator;
-
 
     auto input_name =
         yolo_session->GetInputNameAllocated(
@@ -117,7 +110,6 @@ for(int y = 0; y < 320; y++)
             allocator
         );
 
-
     const char* input_names[] = {
         input_name.get()
     };
@@ -125,7 +117,6 @@ for(int y = 0; y < 320; y++)
     const char* output_names[] = {
         output_name.get()
     };
-
 
     auto output_tensors =
         yolo_session->Run(
@@ -137,24 +128,17 @@ for(int y = 0; y < 320; y++)
             1
         );
 
-
-    float* output =
-        output_tensors[0].GetTensorMutableData<float>();
-
-
     auto output_shape =
         output_tensors[0]
-        .GetTensorTypeAndShapeInfo()
-        .GetShape();
-
+            .GetTensorTypeAndShapeInfo()
+            .GetShape();
 
     std::cout << "YOLO output: ";
 
-    for(auto x: output_shape)
+    for (auto x : output_shape)
         std::cout << x << " ";
 
     std::cout << std::endl;
-
 
     return boxes;
 }
