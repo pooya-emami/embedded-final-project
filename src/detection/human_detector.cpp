@@ -42,6 +42,10 @@ static void load_yolo()
     yolo_loaded = true;
 }
 
+static inline float sigmoid(float x) {
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
 static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 {
     load_yolo();
@@ -50,129 +54,83 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     if (!yolo_loaded)
         return boxes;
 
+    // Preprocess
     cv::Mat rgb;
     cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
-    rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f);
+    rgb.convertTo(rgb, CV_32F, 1.0f/255.0f);
 
-    std::vector<float> input_tensor_values(1 * 3 * 320 * 320);
-
-    for (int y = 0; y < 320; y++) {
-        for (int x = 0; x < 320; x++) {
-            cv::Vec3f p = rgb.at<cv::Vec3f>(y, x);
-            input_tensor_values[y * 320 + x] = p[0];
-            input_tensor_values[320 * 320 + y * 320 + x] = p[1];
-            input_tensor_values[2 * 320 * 320 + y * 320 + x] = p[2];
+    std::vector<float> blob(1 * 3 * 320 * 320);
+    for(int y=0; y<320; y++)
+        for(int x=0; x<320; x++) {
+            cv::Vec3f p = rgb.at<cv::Vec3f>(y,x);
+            blob[y*320 + x]                 = p[0];
+            blob[320*320 + y*320 + x]      = p[1];
+            blob[2*320*320 + y*320 + x]    = p[2];
         }
-    }
 
-    std::array<int64_t, 4> input_shape = {1, 3, 320, 320};
-
-    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
-        OrtArenaAllocator, OrtMemTypeDefault);
+    std::array<int64_t,4> shape = {1,3,320,320};
+    Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
 
     Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        mem_info,
-        input_tensor_values.data(),
-        input_tensor_values.size(),
-        input_shape.data(),
-        input_shape.size()
+        mem, blob.data(), blob.size(), shape.data(), shape.size()
     );
 
     Ort::AllocatorWithDefaultOptions allocator;
+    auto in_name = yolo_session->GetInputNameAllocated(0, allocator);
+    auto out_name = yolo_session->GetOutputNameAllocated(0, allocator);
 
-    auto input_name = yolo_session->GetInputNameAllocated(0, allocator);
-    auto output_name = yolo_session->GetOutputNameAllocated(0, allocator);
+    const char* input_names[] = {in_name.get()};
+    const char* output_names[] = {out_name.get()};
 
-    const char* input_names[] = {input_name.get()};
-    const char* output_names[] = {output_name.get()};
-
-    auto output_tensors = yolo_session->Run(
+    auto outs = yolo_session->Run(
         Ort::RunOptions{nullptr},
         input_names, &input_tensor, 1,
-        output_names, 1);
+        output_names, 1
+    );
 
-    float* out = output_tensors[0].GetTensorMutableData<float>();
+    float* out = outs[0].GetTensorMutableData<float>();
+    auto out_shape = outs[0].GetTensorTypeAndShapeInfo().GetShape();
 
-    auto shape = output_tensors[0]
-        .GetTensorTypeAndShapeInfo()
-        .GetShape();
+    int C = out_shape[1];   // 84
+    int N = out_shape[2];   // 2100
 
-    int channels = shape[1];  // 84
-    int num_predictions = shape[2];  // 2100
+    for(int i=0; i<N; i++) {
 
-    // Sigmoid function
-    auto sigmoid = [](float x) { return 1.0f / (1.0f + expf(-x)); };
+        float x = out[0*N + i];
+        float y = out[1*N + i];
+        float w = out[2*N + i];
+        float h = out[3*N + i];
 
-    struct Detection {
-        float x1, y1, x2, y2;
-        float confidence;
-        int class_id;
-    };
-    std::vector<Detection> detections;
+        float obj = sigmoid(out[4*N + i]);
+        if(obj < 0.25f) continue;
 
-    // Process each prediction - box coords are raw, class scores need sigmoid
-    for (int i = 0; i < num_predictions; i++) {
-        // Box coordinates - these are already in the correct range (0-320)
-        float x = out[0 * num_predictions + i];
-        float y = out[1 * num_predictions + i];
-        float w = out[2 * num_predictions + i];
-        float h = out[3 * num_predictions + i];
-        
-        // Find best class score - apply sigmoid to get probabilities
         float best_score = 0;
         int best_class = -1;
-        for (int c = 4; c < channels; c++) {
-            float s = sigmoid(out[c * num_predictions + i]);
-            if (s > best_score) {
+
+        for(int c=5; c<C; c++) {
+            float s = sigmoid(out[c*N + i]);
+            if(s > best_score) {
                 best_score = s;
-                best_class = c - 4;
+                best_class = c - 5;
             }
         }
-        
-        // Skip low confidence
-        if (best_score < 0.25f) continue;
-        
-        // Only person class (class 0)
-        if (best_class != 0) continue;
-        
-        // Convert center format to corner format and scale
-        float x1 = (x - w/2) * img320.cols / 320.0f;
-        float y1 = (y - h/2) * img320.rows / 320.0f;
-        float x2 = (x + w/2) * img320.cols / 320.0f;
-        float y2 = (y + h/2) * img320.rows / 320.0f;
-        
-        // Clamp to valid range
-        x1 = std::max(0.0f, std::min(x1, (float)img320.cols));
-        y1 = std::max(0.0f, std::min(y1, (float)img320.rows));
-        x2 = std::max(0.0f, std::min(x2, (float)img320.cols));
-        y2 = std::max(0.0f, std::min(y2, (float)img320.rows));
-        
-        if (x2 > x1 && y2 > y1) {
-            detections.push_back({x1, y1, x2, y2, best_score, best_class});
-        }
-    }
 
-    // Apply NMS
-    if (!detections.empty()) {
-        std::vector<cv::Rect> rects;
-        std::vector<float> scores;
-        
-        for (const auto& det : detections) {
-            rects.emplace_back(
-                (int)det.x1, 
-                (int)det.y1,
-                (int)(det.x2 - det.x1),
-                (int)(det.y2 - det.y1)
-            );
-            scores.push_back(det.confidence);
-        }
-        
-        std::vector<int> indices;
-        cv::dnn::NMSBoxes(rects, scores, 0.25f, 0.45f, indices);
-        
-        for (int idx : indices) {
-            boxes.push_back(rects[idx]);
-        }
+        if(best_class != 0) continue; // only person
+
+        float conf = obj * best_score;
+        if(conf < 0.25f) continue;
+
+        // xywh → xyxy (already absolute pixels)
+        float x1 = x - w/2;
+        float y1 = y - h/2;
+        float x2 = x + w/2;
+        float y2 = y + h/2;
+
+        boxes.emplace_back(
+            (int)x1, (int)y1,
+            (int)(x2 - x1),
+            (int)(y2 - y1)
+        );
     }
 
     return boxes;
