@@ -51,19 +51,18 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     if (!yolo_loaded)
         return boxes;
 
-    // --- Preprocess ---
     cv::Mat rgb;
     cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
     rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f);
 
-    std::vector<float> blob(1 * 3 * 320 * 320);
+    std::vector<float> input_tensor_values(1 * 3 * 320 * 320);
 
     for (int y = 0; y < 320; y++) {
         for (int x = 0; x < 320; x++) {
             cv::Vec3f p = rgb.at<cv::Vec3f>(y, x);
-            blob[0 * 320 * 320 + y * 320 + x] = p[0];
-            blob[1 * 320 * 320 + y * 320 + x] = p[1];
-            blob[2 * 320 * 320 + y * 320 + x] = p[2];
+            input_tensor_values[y * 320 + x] = p[0];
+            input_tensor_values[320 * 320 + y * 320 + x] = p[1];
+            input_tensor_values[2 * 320 * 320 + y * 320 + x] = p[2];
         }
     }
 
@@ -73,8 +72,12 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         OrtArenaAllocator, OrtMemTypeDefault);
 
     Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        mem_info, blob.data(), blob.size(),
-        input_shape.data(), input_shape.size());
+        mem_info,
+        input_tensor_values.data(),   // FIXED
+        input_tensor_values.size(),
+        input_shape.data(),
+        input_shape.size()
+    );
 
     Ort::AllocatorWithDefaultOptions allocator;
 
@@ -95,19 +98,15 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         .GetTensorTypeAndShapeInfo()
         .GetShape();
 
-    // Expected: (1, 84, 2100)
     int C = shape[1];   // 84
     int N = shape[2];   // 2100
 
-    // Convert to (2100, 84)
     std::vector<std::array<float, 84>> preds(N);
-    for (int i = 0; i < N; i++) {
-        for (int c = 0; c < C; c++) {
-            preds[i][c] = out[c * N + i];
-        }
-    }
 
-    // Decode predictions
+    for (int i = 0; i < N; i++)
+        for (int c = 0; c < C; c++)
+            preds[i][c] = out[c * N + i];
+
     for (int i = 0; i < N; i++) {
         float x = preds[i][0];
         float y = preds[i][1];
@@ -117,7 +116,6 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         float obj = preds[i][4];
         if (obj < 0.25f) continue;
 
-        // class scores
         float best_score = 0;
         int best_class = -1;
 
@@ -129,22 +127,18 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
             }
         }
 
-        if (best_class != 0) continue; // only person
+        if (best_class != 0) continue;
+        if (best_score < 0.25f) continue;
 
-        float conf = best_score;
-        if (conf < 0.25f) continue;
-
-        // xywh → xyxy
         float x1 = x - w / 2;
         float y1 = y - h / 2;
         float x2 = x + w / 2;
         float y2 = y + h / 2;
 
-        // scale to original 320×320
-        x1 *= (float)img320.cols / 320.0f;
-        x2 *= (float)img320.cols / 320.0f;
-        y1 *= (float)img320.rows / 320.0f;
-        y2 *= (float)img320.rows / 320.0f;
+        x1 *= img320.cols / 320.0f;
+        x2 *= img320.cols / 320.0f;
+        y1 *= img320.rows / 320.0f;
+        y2 *= img320.rows / 320.0f;
 
         boxes.emplace_back(
             (int)x1, (int)y1,
@@ -155,6 +149,7 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 
     return boxes;
 }
+
 
 
 extern "C" DetectionResult process_frame(
