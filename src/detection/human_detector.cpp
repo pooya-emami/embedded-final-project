@@ -42,7 +42,6 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
     if (!yolo_loaded)
         return boxes;
 
-    // Create blob
     cv::Mat blob = cv::dnn::blobFromImage(
         img320, 1.0/255.0, cv::Size(320, 320),
         cv::Scalar(), true, false
@@ -50,86 +49,133 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
 
     yolo.setInput(blob);
 
-    // Get output - this might return multiple outputs
+    // -------------------------------
+    // Forward pass with debug prints
+    // -------------------------------
+    std::cout << "[YOLO] Running forward()...\n";
+
     std::vector<cv::Mat> outputs;
-    std::vector<cv::String> outputNames = yolo.getUnconnectedOutLayersNames();
-    yolo.forward(outputs, outputNames);
-    
-    if (outputs.empty()) {
-        std::cerr << "[YOLO] No outputs from network\n";
+    std::vector<cv::String> names = yolo.getUnconnectedOutLayersNames();
+
+    try {
+        yolo.forward(outputs, names);
+    } catch (cv::Exception &e) {
+        std::cerr << "[YOLO] forward() crashed: " << e.what() << "\n";
         return boxes;
     }
-    
-    // Print all output shapes for debugging
-    std::cout << "[YOLO] Number of outputs: " << outputs.size() << "\n";
+
+    if (outputs.empty()) {
+        std::cerr << "[YOLO] forward() returned NO outputs!\n";
+        return boxes;
+    }
+
+    std::cout << "[YOLO] forward() returned " << outputs.size() << " outputs\n";
+
+    // Print all output shapes
     for (size_t i = 0; i < outputs.size(); i++) {
-        std::cout << "[YOLO] Output " << i << " dims: " << outputs[i].dims << " | sizes: ";
-        for (int j = 0; j < outputs[i].dims; j++)
-            std::cout << outputs[i].size[j] << " ";
+        cv::Mat &o = outputs[i];
+        std::cout << "[YOLO] Output[" << i << "] dims=" << o.dims << " sizes=";
+        for (int d = 0; d < o.dims; d++)
+            std::cout << o.size[d] << " ";
         std::cout << "\n";
     }
-    
-    // We expect output[0] to be (1, 84, 2100) or (84, 2100)
+
+    // Use first output
     cv::Mat out = outputs[0];
-    
-    // If it's 3D (1, 84, 2100), reshape to (84, 2100)
+
+    // -------------------------------
+    // Print raw output shape
+    // -------------------------------
+    std::cout << "[YOLO] RAW out dims=" << out.dims << " sizes=";
+    for (int d = 0; d < out.dims; d++)
+        std::cout << out.size[d] << " ";
+    std::cout << "\n";
+
+    // -------------------------------
+    // Handle 3D → reshape → transpose
+    // -------------------------------
     if (out.dims == 3) {
         int d0 = out.size[0];
         int d1 = out.size[1];
         int d2 = out.size[2];
-        
-        std::cout << "[YOLO] Output shape: " << d0 << "x" << d1 << "x" << d2 << "\n";
-        
-        // Expected: (1, 84, 2100)
+
+        std::cout << "[YOLO] 3D tensor: " << d0 << "x" << d1 << "x" << d2 << "\n";
+
         if (d0 == 1 && d1 == 84) {
-            // Reshape to (84, 2100) using a different approach
-            cv::Mat reshaped = out.reshape(1, d1);  // (84, 2100)
-            cv::transpose(reshaped, out);  // (2100, 84)
+            std::cout << "[YOLO] Reshaping to (84, " << d2 << ")...\n";
+
+            cv::Mat reshaped;
+            try {
+                reshaped = out.reshape(1, d1);  // (84, 2100)
+            } catch (cv::Exception &e) {
+                std::cerr << "[YOLO] reshape() failed: " << e.what() << "\n";
+                return boxes;
+            }
+
+            std::cout << "[YOLO] reshaped: " << reshaped.rows << "x" << reshaped.cols << "\n";
+
+            try {
+                cv::transpose(reshaped, out);  // (2100, 84)
+            } catch (cv::Exception &e) {
+                std::cerr << "[YOLO] transpose() failed: " << e.what() << "\n";
+                return boxes;
+            }
+
+            std::cout << "[YOLO] transposed: " << out.rows << "x" << out.cols << "\n";
         } else {
-            std::cerr << "[YOLO] Unexpected 3D shape\n";
+            std::cerr << "[YOLO] Unexpected 3D shape, cannot reshape\n";
             return boxes;
         }
-    } 
-    // If it's 2D, check if it's already (2100, 84)
+    }
+
+    // -------------------------------
+    // Handle 2D output
+    // -------------------------------
     else if (out.dims == 2) {
-        int rows = out.rows;
-        int cols = out.cols;
-        std::cout << "[YOLO] Output shape: " << rows << "x" << cols << "\n";
-        
-        // If it's (84, 2100), transpose to (2100, 84)
-        if (rows == 84 && cols == 2100) {
+        std::cout << "[YOLO] 2D tensor: " << out.rows << "x" << out.cols << "\n";
+
+        if (out.rows == 84 && out.cols == 2100) {
+            std::cout << "[YOLO] Transposing (84x2100) → (2100x84)\n";
             cv::transpose(out, out);
-        }
-        // If it's (2100, 84), keep as is
-        else if (rows != 2100 || cols != 84) {
-            std::cerr << "[YOLO] Unexpected 2D shape: " << rows << "x" << cols << "\n";
+        } else if (out.rows == 2100 && out.cols == 84) {
+            std::cout << "[YOLO] Already correct shape (2100x84)\n";
+        } else {
+            std::cerr << "[YOLO] Unexpected 2D shape\n";
             return boxes;
         }
-    } else {
+    }
+
+    else {
         std::cerr << "[YOLO] Unexpected dims: " << out.dims << "\n";
         return boxes;
     }
-    
-    // Now out should be (num_detections, 84)
-    // where num_detections is typically 2100 for 320x320 input
-    
-    int num_detections = out.rows;
-    std::cout << "[YOLO] Number of detections: " << num_detections << "\n";
-    
+
+    // -------------------------------
+    // Print first row values (debug)
+    // -------------------------------
+    std::cout << "[YOLO] First row values: ";
+    for (int i = 0; i < 10; i++)
+        std::cout << out.at<float>(0, i) << " ";
+    std::cout << "\n";
+
+    // -------------------------------
+    // Decode detections
+    // -------------------------------
+    int num = out.rows;
+    std::cout << "[YOLO] num detections = " << num << "\n";
+
     std::vector<cv::Rect> raw_boxes;
     std::vector<float> raw_scores;
 
-    for (int i = 0; i < num_detections; i++) {
-        // Get bbox coordinates (xywh format)
+    for (int i = 0; i < num; i++) {
         float x = out.at<float>(i, 0);
         float y = out.at<float>(i, 1);
         float w = out.at<float>(i, 2);
         float h = out.at<float>(i, 3);
-        
-        // Find best class score (skip first 4 bbox values)
-        float best_score = -1.0f;
+
+        float best_score = -1;
         int best_class = -1;
-        
+
         for (int c = 0; c < 80; c++) {
             float score = out.at<float>(i, 4 + c);
             if (score > best_score) {
@@ -137,39 +183,28 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
                 best_class = c;
             }
         }
-        
-        // Filter: person (class 0) and confidence > 0.25
+
         if (best_score > 0.25f && best_class == 0) {
-            // Convert xywh to xyxy
-            float x1 = (x - w/2.0f) * 320.0f;
-            float y1 = (y - h/2.0f) * 320.0f;
-            float x2 = (x + w/2.0f) * 320.0f;
-            float y2 = (y + h/2.0f) * 320.0f;
-            
-            cv::Rect rect(
-                (int)x1, (int)y1,
-                (int)(x2 - x1),
-                (int)(y2 - y1)
-            );
-            
-            raw_boxes.push_back(rect);
+            float x1 = (x - w/2) * 320;
+            float y1 = (y - h/2) * 320;
+            float x2 = (x + w/2) * 320;
+            float y2 = (y + h/2) * 320;
+
+            raw_boxes.emplace_back((int)x1, (int)y1, (int)(x2-x1), (int)(y2-y1));
             raw_scores.push_back(best_score);
         }
     }
-    
-    std::cout << "[YOLO] Detected " << raw_boxes.size() << " persons before NMS\n";
 
-    // Apply NMS
-    if (!raw_boxes.empty()) {
-        std::vector<int> keep;
-        cv::dnn::NMSBoxes(raw_boxes, raw_scores, 0.25f, 0.45f, keep);
-        
-        for (int idx : keep) {
-            boxes.push_back(raw_boxes[idx]);
-        }
-    }
-    
-    std::cout << "[YOLO] Final detections: " << boxes.size() << " persons\n";
+    std::cout << "[YOLO] raw person detections: " << raw_boxes.size() << "\n";
+
+    // NMS
+    std::vector<int> keep;
+    cv::dnn::NMSBoxes(raw_boxes, raw_scores, 0.25f, 0.45f, keep);
+
+    for (int idx : keep)
+        boxes.push_back(raw_boxes[idx]);
+
+    std::cout << "[YOLO] final persons: " << boxes.size() << "\n";
 
     return boxes;
 }
