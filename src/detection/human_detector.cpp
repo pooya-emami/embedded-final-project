@@ -9,16 +9,17 @@
 #include <iomanip>
 #include <cstdlib>
 #include <cstring>
+#include <vector>
 
 #include "human_detector.hpp"
 
 static char model_path[256] = {0};
-
 static cv::dnn::Net yolo;
 static bool yolo_loaded = false;
 
 static void load_yolo() {
     if (yolo_loaded) return;
+    
     snprintf(model_path, sizeof(model_path),
              "%s%s", MODEL_BASE_PATH, YOLO_MODEL_FILE);
 
@@ -28,8 +29,9 @@ static void load_yolo() {
         yolo.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
         yolo_loaded = true;
         std::cout << "[YOLO] Loaded model: " << model_path << "\n";
-    } catch (...) {
+    } catch (const std::exception& e) {
         std::cerr << "[YOLO] Failed to load model: " << model_path << "\n";
+        std::cerr << "[YOLO] Error: " << e.what() << "\n";
     }
 }
 
@@ -48,109 +50,126 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
 
     yolo.setInput(blob);
 
-    // Forward pass
-    cv::Mat out = yolo.forward();
-
-    // -------------------------------
-    // 1. Print actual output shape
-    // -------------------------------
-    std::cout << "[YOLO] Output dims: " << out.dims << " | sizes: ";
-    for (int i = 0; i < out.dims; i++)
-        std::cout << out.size[i] << " ";
-    std::cout << "\n";
-
-    // -------------------------------
-    // 2. Validate shape
-    // -------------------------------
-    if (out.empty()) {
-        std::cerr << "[YOLO] forward() returned empty output\n";
+    // Get output - this might return multiple outputs
+    std::vector<cv::Mat> outputs;
+    std::vector<cv::String> outputNames = yolo.getUnconnectedOutLayersNames();
+    yolo.forward(outputs, outputNames);
+    
+    if (outputs.empty()) {
+        std::cerr << "[YOLO] No outputs from network\n";
         return boxes;
     }
-
-    if (out.dims != 3) {
+    
+    // Print all output shapes for debugging
+    std::cout << "[YOLO] Number of outputs: " << outputs.size() << "\n";
+    for (size_t i = 0; i < outputs.size(); i++) {
+        std::cout << "[YOLO] Output " << i << " dims: " << outputs[i].dims << " | sizes: ";
+        for (int j = 0; j < outputs[i].dims; j++)
+            std::cout << outputs[i].size[j] << " ";
+        std::cout << "\n";
+    }
+    
+    // We expect output[0] to be (1, 84, 2100) or (84, 2100)
+    cv::Mat out = outputs[0];
+    
+    // If it's 3D (1, 84, 2100), reshape to (84, 2100)
+    if (out.dims == 3) {
+        int d0 = out.size[0];
+        int d1 = out.size[1];
+        int d2 = out.size[2];
+        
+        std::cout << "[YOLO] Output shape: " << d0 << "x" << d1 << "x" << d2 << "\n";
+        
+        // Expected: (1, 84, 2100)
+        if (d0 == 1 && d1 == 84) {
+            // Reshape to (84, 2100) using a different approach
+            cv::Mat reshaped = out.reshape(1, d1);  // (84, 2100)
+            cv::transpose(reshaped, out);  // (2100, 84)
+        } else {
+            std::cerr << "[YOLO] Unexpected 3D shape\n";
+            return boxes;
+        }
+    } 
+    // If it's 2D, check if it's already (2100, 84)
+    else if (out.dims == 2) {
+        int rows = out.rows;
+        int cols = out.cols;
+        std::cout << "[YOLO] Output shape: " << rows << "x" << cols << "\n";
+        
+        // If it's (84, 2100), transpose to (2100, 84)
+        if (rows == 84 && cols == 2100) {
+            cv::transpose(out, out);
+        }
+        // If it's (2100, 84), keep as is
+        else if (rows != 2100 || cols != 84) {
+            std::cerr << "[YOLO] Unexpected 2D shape: " << rows << "x" << cols << "\n";
+            return boxes;
+        }
+    } else {
         std::cerr << "[YOLO] Unexpected dims: " << out.dims << "\n";
         return boxes;
     }
-
-    int d0 = out.size[0];
-    int d1 = out.size[1];
-    int d2 = out.size[2];
-
-    // Expected: (1, 84, 2100)
-    if (d0 != 1 || d1 != 84) {
-        std::cerr << "[YOLO] Unexpected shape: "
-                  << d0 << "x" << d1 << "x" << d2 << "\n";
-        return boxes;
-    }
-
-    // -------------------------------
-    // 3. Reshape safely → (84, 2100)
-    // -------------------------------
-    cv::Mat out2;
-    try {
-        out2 = out.reshape(1, d1);
-    } catch (cv::Exception &e) {
-        std::cerr << "[YOLO] reshape failed: " << e.what() << "\n";
-        return boxes;
-    }
-
-    cv::Mat outT;
-    try {
-        cv::transpose(out2, outT);
-    } catch (cv::Exception &e) {
-        std::cerr << "[YOLO] transpose failed: " << e.what() << "\n";
-        return boxes;
-    }
-
-    int num_preds = outT.rows;
-
+    
+    // Now out should be (num_detections, 84)
+    // where num_detections is typically 2100 for 320x320 input
+    
+    int num_detections = out.rows;
+    std::cout << "[YOLO] Number of detections: " << num_detections << "\n";
+    
     std::vector<cv::Rect> raw_boxes;
     std::vector<float> raw_scores;
 
-    for (int i = 0; i < num_preds; i++) {
-        float x = outT.at<float>(i, 0);
-        float y = outT.at<float>(i, 1);
-        float w = outT.at<float>(i, 2);
-        float h = outT.at<float>(i, 3);
-
-        float best_score = -1;
+    for (int i = 0; i < num_detections; i++) {
+        // Get bbox coordinates (xywh format)
+        float x = out.at<float>(i, 0);
+        float y = out.at<float>(i, 1);
+        float w = out.at<float>(i, 2);
+        float h = out.at<float>(i, 3);
+        
+        // Find best class score (skip first 4 bbox values)
+        float best_score = -1.0f;
         int best_class = -1;
-
+        
         for (int c = 0; c < 80; c++) {
-            float score = outT.at<float>(i, 4 + c);
+            float score = out.at<float>(i, 4 + c);
             if (score > best_score) {
                 best_score = score;
                 best_class = c;
             }
         }
-
-        if (best_score < 0.25f)
-            continue;
-
-        if (best_class != 0) 
-            continue;
-
-        float x1 = x - w * 0.5f;
-        float y1 = y - h * 0.5f;
-        float x2 = x + w * 0.5f;
-        float y2 = y + h * 0.5f;
-
-        cv::Rect rect(
-            (int)x1, (int)y1,
-            (int)(x2 - x1),
-            (int)(y2 - y1)
-        );
-
-        raw_boxes.push_back(rect);
-        raw_scores.push_back(best_score);
+        
+        // Filter: person (class 0) and confidence > 0.25
+        if (best_score > 0.25f && best_class == 0) {
+            // Convert xywh to xyxy
+            float x1 = (x - w/2.0f) * 320.0f;
+            float y1 = (y - h/2.0f) * 320.0f;
+            float x2 = (x + w/2.0f) * 320.0f;
+            float y2 = (y + h/2.0f) * 320.0f;
+            
+            cv::Rect rect(
+                (int)x1, (int)y1,
+                (int)(x2 - x1),
+                (int)(y2 - y1)
+            );
+            
+            raw_boxes.push_back(rect);
+            raw_scores.push_back(best_score);
+        }
     }
+    
+    std::cout << "[YOLO] Detected " << raw_boxes.size() << " persons before NMS\n";
 
-    std::vector<int> keep;
-    cv::dnn::NMSBoxes(raw_boxes, raw_scores,
-                      0.25f, 0.45f, keep);
-
-    for (int idx : keep)
-        boxes.push_back(raw_boxes[idx]);
+    // Apply NMS
+    if (!raw_boxes.empty()) {
+        std::vector<int> keep;
+        cv::dnn::NMSBoxes(raw_boxes, raw_scores, 0.25f, 0.45f, keep);
+        
+        for (int idx : keep) {
+            boxes.push_back(raw_boxes[idx]);
+        }
+    }
+    
+    std::cout << "[YOLO] Final detections: " << boxes.size() << " persons\n";
 
     return boxes;
 }
@@ -179,7 +198,7 @@ extern "C" DetectionResult process_frame(
     // Run YOLO
     auto boxes = detectHumans(frame_detection);
 
-    // Draw boxes
+    // Draw boxes on the detection image (320x320)
     for (const auto &box : boxes) {
         cv::rectangle(frame_detection, box, cv::Scalar(0, 255, 0), 2);
     }
@@ -234,8 +253,10 @@ extern "C" DetectionResult process_frame(
     cv::imencode(".jpg", frame_output, jpegBuf);
 
     result.jpeg_output = (uint8_t*)malloc(jpegBuf.size());
-    result.jpeg_length = jpegBuf.size();
-    memcpy(result.jpeg_output, jpegBuf.data(), jpegBuf.size());
+    if (result.jpeg_output) {
+        result.jpeg_length = jpegBuf.size();
+        memcpy(result.jpeg_output, jpegBuf.data(), jpegBuf.size());
+    }
 
     result.width = output_width;
     result.height = output_height;
