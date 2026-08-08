@@ -6,6 +6,7 @@
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>  // Added for TCP_NODELAY
 #include <arpa/inet.h>
 #include <signal.h>
 #include <openssl/ssl.h>
@@ -282,9 +283,8 @@ void send_redirect(int fd) {
     send(fd, msg, strlen(msg), 0);
 }
 
-// New function for MJPEG streaming
+// MJPEG streaming with coalesced writes
 static void handle_mjpeg_stream(SSL *ssl, int fd) {
-    const char *boundary = "--frame\r\n";
     const char *header = 
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
@@ -312,31 +312,30 @@ static void handle_mjpeg_stream(SSL *ssl, int fd) {
         pthread_mutex_unlock(&frame_mutex);
         
         if (copy && len > 0) {
-            // Write multipart boundary
-            if (SSL_write(ssl, boundary, strlen(boundary)) <= 0) break;
-            
-            // Write Content-Type header for this part
-            char part_header[128];
-            snprintf(part_header, sizeof(part_header),
+            // Build one contiguous buffer: boundary + header + jpeg + CRLF
+            char part_header[160];
+            int hlen = snprintf(part_header, sizeof(part_header),
+                "--frame\r\n"
                 "Content-Type: image/jpeg\r\n"
                 "Content-Length: %zu\r\n"
                 "\r\n", len);
             
-            if (SSL_write(ssl, part_header, strlen(part_header)) <= 0) {
-                free(copy);
-                break;
+            size_t total = hlen + len + 2;  // +2 for trailing CRLF
+            unsigned char *sendbuf = malloc(total);
+            if (sendbuf) {
+                memcpy(sendbuf, part_header, hlen);
+                memcpy(sendbuf + hlen, copy, len);
+                sendbuf[hlen + len] = '\r';
+                sendbuf[hlen + len + 1] = '\n';
+                
+                if (SSL_write(ssl, sendbuf, total) <= 0) {
+                    free(sendbuf);
+                    free(copy);
+                    break;
+                }
+                free(sendbuf);
             }
-            
-            // Write JPEG data
-            if (SSL_write(ssl, copy, len) <= 0) {
-                free(copy);
-                break;
-            }
-            
             free(copy);
-            
-            // Write extra newline after frame
-            if (SSL_write(ssl, "\r\n", 2) <= 0) break;
         }
         
         // Pace to requested frame rate
@@ -354,6 +353,12 @@ static void handle_mjpeg_stream(SSL *ssl, int fd) {
 static void *handle_https_thread(void *arg) {
     int fd = *(int*)arg;
     free(arg);
+    
+    // Disable Nagle's algorithm - critical for low-latency streaming
+    int nodelay = 1;
+    if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay)) < 0) {
+        perror("setsockopt TCP_NODELAY");
+    }
     
     SSL *ssl = SSL_new(ssl_ctx);
     SSL_set_fd(ssl, fd);
