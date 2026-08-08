@@ -54,6 +54,15 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     if (!yolo_loaded)
         return boxes;
 
+    // STEP 2: Debug frame dump
+    static int dbg_frame_count = 0;
+    if (dbg_frame_count++ % 30 == 0) {
+        cv::imwrite("/tmp/debug_input.jpg", img320);
+        printf("Debug: Dumped frame %d to /tmp/debug_input.jpg\n", dbg_frame_count);
+        printf("Debug: img320 size: %dx%d, channels: %d\n", 
+               img320.cols, img320.rows, img320.channels());
+    }
+
     cv::Mat rgb;
     cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
     rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f);
@@ -68,6 +77,20 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
             input_tensor_values[2 * 320 * 320 + y * 320 + x] = p[2];
         }
     }
+
+    // Verify input tensor has valid data
+    float mean_r = 0.0f, mean_g = 0.0f, mean_b = 0.0f;
+    int pixel_count = 320 * 320;
+    for (int i = 0; i < pixel_count; i++) {
+        mean_r += input_tensor_values[i];
+        mean_g += input_tensor_values[pixel_count + i];
+        mean_b += input_tensor_values[2 * pixel_count + i];
+    }
+    mean_r /= pixel_count;
+    mean_g /= pixel_count;
+    mean_b /= pixel_count;
+    printf("Input tensor means - R: %.3f, G: %.3f, B: %.3f (should be ~0.5 for average image)\n", 
+           mean_r, mean_g, mean_b);
 
     std::array<int64_t, 4> input_shape = {1, 3, 320, 320};
 
@@ -104,12 +127,20 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     int channels = shape[1];        // 84
     int num_predictions = shape[2]; // 2100
 
+    printf("Model output shape: channels=%d, predictions=%d\n", channels, num_predictions);
+
     struct Detection {
         float x1, y1, x2, y2;
         float confidence;
         int class_id;
     };
     std::vector<Detection> detections;
+
+    // STEP 1: Track highest score
+    float frame_max_score = 0.0f;
+    int frame_max_class = -1;
+    float frame_max_score_all_classes = 0.0f;
+    int frame_max_class_all = -1;
 
     // Model output: channels 0-3 are cx,cy,w,h in 0-320 pixel space (raw),
     // channels 4-83 are already post-sigmoid class probabilities.
@@ -130,6 +161,18 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
             }
         }
 
+        // Track highest score for debugging (all classes)
+        if (best_score > frame_max_score_all_classes) {
+            frame_max_score_all_classes = best_score;
+            frame_max_class_all = best_class;
+        }
+
+        // Track highest score for class 0 (person) specifically
+        if (best_class == 0 && best_score > frame_max_score) {
+            frame_max_score = best_score;
+            frame_max_class = best_class;
+        }
+
         if (best_score < 0.25f) continue;
         if (best_class != 0) continue; // person class only
 
@@ -140,6 +183,23 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 
         detections.push_back({x1, y1, x2, y2, best_score, best_class});
     }
+
+    // STEP 1: Print frame max scores
+    printf("Frame max score (class 0 - person): %.4f\n", frame_max_score);
+    printf("Frame max score (any class): %.4f (class %d)\n", 
+           frame_max_score_all_classes, frame_max_class_all);
+
+    // Additional debug: check if we got any detections at all
+    printf("Total predictions processed: %d, detections before NMS: %zu\n", 
+           num_predictions, detections.size());
+
+    // Print first few prediction scores for debugging
+    printf("First 5 prediction scores (class 0): ");
+    for (int i = 0; i < std::min(5, num_predictions); i++) {
+        float score = out[4 * num_predictions + i]; // class 0 is at channel 4
+        printf("%.4f ", score);
+    }
+    printf("\n");
 
     if (!detections.empty()) {
         std::vector<cv::Rect> rects;
@@ -158,11 +218,14 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         std::vector<int> indices;
         cv::dnn::NMSBoxes(rects, scores, 0.25f, 0.45f, indices);
 
+        printf("NMS returned %zu boxes\n", indices.size());
+
         for (int idx : indices) {
             boxes.push_back(rects[idx]);
         }
     }
 
+    printf("Final boxes count: %zu\n", boxes.size());
     return boxes;
 }
 
@@ -181,16 +244,32 @@ extern "C" DetectionResult process_frame(
     result.height = 0;
     result.person_count = 0;
 
+    printf("\n=== process_frame called ===\n");
+    printf("Input JPEG size: %zu bytes\n", jpeg_len);
+
     std::vector<uint8_t> buf(jpeg_data, jpeg_data + jpeg_len);
     cv::Mat frame_source = cv::imdecode(buf, cv::IMREAD_COLOR);
 
-    if (frame_source.empty())
+    if (frame_source.empty()) {
+        printf("ERROR: Failed to decode JPEG\n");
         return result;
+    }
+    printf("Decoded frame: %dx%d, channels: %d\n", 
+           frame_source.cols, frame_source.rows, frame_source.channels());
+
+    // Dump the decoded frame once every 30 frames
+    static int debug_count = 0;
+    if (debug_count++ % 30 == 0) {
+        cv::imwrite("/tmp/decoded_frame.jpg", frame_source);
+        printf("Saved decoded frame to /tmp/decoded_frame.jpg\n");
+    }
 
     cv::Mat frame_detection;
     cv::resize(frame_source, frame_detection, cv::Size(320, 320));
+    printf("Resized frame to: %dx%d\n", frame_detection.cols, frame_detection.rows);
 
     auto boxes = detectHumans(frame_detection);
+    printf("Detection complete: %zu persons found\n", boxes.size());
 
     // Draw boxes
     for (const auto &box : boxes)
@@ -239,9 +318,11 @@ extern "C" DetectionResult process_frame(
     // Resize to output size and encode as JPEG
     cv::Mat frame_output;
     cv::resize(frame_detection, frame_output, cv::Size(output_width, output_height));
+    printf("Resized output to: %dx%d\n", output_width, output_height);
 
     std::vector<uint8_t> jpegBuf;
     cv::imencode(".jpg", frame_output, jpegBuf);
+    printf("Encoded JPEG size: %zu bytes\n", jpegBuf.size());
 
     result.jpeg_output = (uint8_t*)malloc(jpegBuf.size());
     if (result.jpeg_output) {
@@ -253,6 +334,7 @@ extern "C" DetectionResult process_frame(
     result.height = output_height;
     result.person_count = (int)boxes.size();
 
+    printf("=== process_frame complete ===\n\n");
     return result;
 }
 
