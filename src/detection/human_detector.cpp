@@ -35,124 +35,92 @@ static void load_yolo() {
     }
 }
 
-static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
+static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
+{
     load_yolo();
+
     std::vector<cv::Rect> boxes;
 
-    if (!yolo_loaded)
+    if (!yolo_loaded) {
+        std::cerr << "[YOLO] Model is not loaded\n";
         return boxes;
+    }
 
+    // --------------------------------------------------
+    // Create YOLO input blob
+    // --------------------------------------------------
     cv::Mat blob = cv::dnn::blobFromImage(
-        img320, 1.0/255.0, cv::Size(320, 320),
-        cv::Scalar(), true, false
+        img320,
+        1.0 / 255.0,
+        cv::Size(320, 320),
+        cv::Scalar(),
+        true,   // swapRB
+        false   // crop
     );
 
-    yolo.setInput(blob);
+    std::cout << "[YOLO] Blob dims = " << blob.dims << "\n";
+    std::cout << "[YOLO] Blob shape = ";
 
-    // -------------------------------
-    // Forward pass with debug prints
-    // -------------------------------
-    std::cout << "[YOLO] Running forward()...\n";
-
-try {
-    std::cout << "[YOLO] Testing simple forward()...\n";
-
-    cv::Mat output = yolo.forward();
-
-    std::cout << "[YOLO] forward() SUCCESS!\n";
-    std::cout << "[YOLO] dims = " << output.dims << "\n";
-
-    std::cout << "[YOLO] shape = ";
-    for (int i = 0; i < output.dims; i++) {
-        std::cout << output.size[i] << " ";
+    for (int i = 0; i < blob.dims; i++) {
+        std::cout << blob.size[i] << " ";
     }
+
     std::cout << "\n";
 
-} catch (const cv::Exception &e) {
-    std::cerr << "[YOLO] forward() FAILED:\n";
-    std::cerr << e.what() << "\n";
-}
+    // --------------------------------------------------
+    // Set input
+    // --------------------------------------------------
+    yolo.setInput(blob);
 
-return boxes;  // TEMPORARY
-    }
+    std::cout << "[YOLO] Input set successfully\n";
 
-    // -------------------------------
-    // Handle 2D output
-    // -------------------------------
-    else if (out.dims == 2) {
-        std::cout << "[YOLO] 2D tensor: " << out.rows << "x" << out.cols << "\n";
+    // --------------------------------------------------
+    // SIMPLE FORWARD TEST
+    // --------------------------------------------------
+    std::cout << "[YOLO] Testing simple forward()...\n";
 
-        if (out.rows == 84 && out.cols == 2100) {
-            std::cout << "[YOLO] Transposing (84x2100) → (2100x84)\n";
-            cv::transpose(out, out);
-        } else if (out.rows == 2100 && out.cols == 84) {
-            std::cout << "[YOLO] Already correct shape (2100x84)\n";
-        } else {
-            std::cerr << "[YOLO] Unexpected 2D shape\n";
-            return boxes;
+    try {
+        cv::Mat output = yolo.forward();
+
+        // If we reach here, OpenCV successfully executed
+        // the ONNX network.
+        std::cout << "[YOLO] forward() SUCCESS!\n";
+
+        std::cout << "[YOLO] Output dims = "
+                  << output.dims << "\n";
+
+        std::cout << "[YOLO] Output shape = ";
+
+        for (int i = 0; i < output.dims; i++) {
+            std::cout << output.size[i] << " ";
         }
-    }
 
-    else {
-        std::cerr << "[YOLO] Unexpected dims: " << out.dims << "\n";
+        std::cout << "\n";
+
+        std::cout << "[YOLO] Output type = "
+                  << output.type() << "\n";
+
+        std::cout << "[YOLO] Output total elements = "
+                  << output.total() << "\n";
+
+    }
+    catch (const cv::Exception &e) {
+
+        std::cerr << "[YOLO] forward() FAILED\n";
+        std::cerr << "[YOLO] OpenCV exception:\n";
+        std::cerr << e.what() << "\n";
+
         return boxes;
     }
 
-    // -------------------------------
-    // Print first row values (debug)
-    // -------------------------------
-    std::cout << "[YOLO] First row values: ";
-    for (int i = 0; i < 10; i++)
-        std::cout << out.at<float>(0, i) << " ";
-    std::cout << "\n";
-
-    // -------------------------------
-    // Decode detections
-    // -------------------------------
-    int num = out.rows;
-    std::cout << "[YOLO] num detections = " << num << "\n";
-
-    std::vector<cv::Rect> raw_boxes;
-    std::vector<float> raw_scores;
-
-    for (int i = 0; i < num; i++) {
-        float x = out.at<float>(i, 0);
-        float y = out.at<float>(i, 1);
-        float w = out.at<float>(i, 2);
-        float h = out.at<float>(i, 3);
-
-        float best_score = -1;
-        int best_class = -1;
-
-        for (int c = 0; c < 80; c++) {
-            float score = out.at<float>(i, 4 + c);
-            if (score > best_score) {
-                best_score = score;
-                best_class = c;
-            }
-        }
-
-        if (best_score > 0.25f && best_class == 0) {
-            float x1 = (x - w/2) * 320;
-            float y1 = (y - h/2) * 320;
-            float x2 = (x + w/2) * 320;
-            float y2 = (y + h/2) * 320;
-
-            raw_boxes.emplace_back((int)x1, (int)y1, (int)(x2-x1), (int)(y2-y1));
-            raw_scores.push_back(best_score);
-        }
-    }
-
-    std::cout << "[YOLO] raw person detections: " << raw_boxes.size() << "\n";
-
-    // NMS
-    std::vector<int> keep;
-    cv::dnn::NMSBoxes(raw_boxes, raw_scores, 0.25f, 0.45f, keep);
-
-    for (int idx : keep)
-        boxes.push_back(raw_boxes[idx]);
-
-    std::cout << "[YOLO] final persons: " << boxes.size() << "\n";
+    // --------------------------------------------------
+    // TEMPORARY
+    //
+    // We are ONLY testing whether OpenCV 4.6 can execute
+    // the ONNX model.
+    //
+    // Do NOT add YOLO decoding yet.
+    // --------------------------------------------------
 
     return boxes;
 }
