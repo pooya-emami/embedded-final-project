@@ -5,8 +5,8 @@ Requires=relay.service
 
 [Service]
 Type=simple
-User=orangepi
-WorkingDirectory=/home/orangepi/embedded-proj/src/server
+User=pooya
+WorkingDirectory=/home/pooya/embproj/proj/src/server
 ExecStart=/usr/local/bin/server
 Restart=always
 RestartSec=5

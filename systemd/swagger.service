@@ -5,9 +5,9 @@ Requires=server.service
 
 [Service]
 Type=simple
-User=orangepi
-WorkingDirectory=/home/orangepi/embedded-proj/src/api
-ExecStart=/usr/bin/python3 /home/orangepi/embedded-proj/src/api/swagger.py
+User=pooya
+WorkingDirectory=/home/pooya/embproj/proj/src/api
+ExecStart=/usr/bin/python3 /home/pooya/embproj/proj/src/api/swagger.py
 Restart=always
 RestartSec=5
 

@@ -8,8 +8,8 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <signal.h>
-// #include <openssl/ssl.h>
-// #include <openssl/err.h>
+#include <openssl/ssl.h>
+#include <openssl/err.h>
 #include <time.h>
 #include <stdint.h>
 #include <ctype.h>
@@ -36,7 +36,7 @@ static size_t current_len = 0;
 static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile int running = 1;
 
-// static SSL_CTX *ssl_ctx = NULL;
+static SSL_CTX *ssl_ctx = NULL;
 
 static detection_record_t *history = NULL;
 static int history_count = 0;
@@ -135,6 +135,8 @@ static void signal_handler(int sig) {
         return;
     }
     running = 0;
+    // Interrupt select() by writing to a pipe or just letting it time out
+    // We'll use a simple approach - just set running to 0 and let the loop check
 }
 
 static char *load_html(void) {
@@ -154,11 +156,36 @@ static char *load_html(void) {
 
 static float read_temp(void) {
     FILE *f = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
-    if (!f) return -1;
-    int t = 0;
-    if (fscanf(f, "%d", &t) != 1) { fclose(f); return -1; }
-    fclose(f);
-    return t / 1000.0f;
+    if (f) {
+        int t = 0;
+        if (fscanf(f, "%d", &t) == 1) {
+            fclose(f);
+            return t / 1000.0f;
+        }
+        fclose(f);
+    }
+
+    f = fopen("/mnt/d/Users/ASUS/Documents/Virtual Machines/shared/cpu.txt", "r");
+    if (f) {
+        float t = -1;
+        if (fscanf(f, "%f", &t) == 1) {
+            fclose(f);
+            return t;
+        }
+        fclose(f);
+    }
+
+    f = fopen("/mnt/hgfs/shared/cpu.txt", "r");
+    if (f) {
+        float t = -1;
+        if (fscanf(f, "%f", &t) == 1) {
+            fclose(f);
+            return t;
+        }
+        fclose(f);
+    }
+
+    return -1;
 }
 
 static long read_mem_available(void) {
@@ -226,7 +253,7 @@ void add_history(int count, float temp) {
     history_count++;
     pthread_mutex_unlock(&history_mutex);
 }
-/*
+
 void *frame_updater(void *arg) {
     (void)arg;
 
@@ -267,76 +294,6 @@ void *frame_updater(void *arg) {
 
     return NULL;
 }
-*/
-void *frame_updater(void *arg) {
-    (void)arg;
-
-    struct timespec next_time;
-    clock_gettime(CLOCK_MONOTONIC, &next_time);
-
-    static int frame_count = 0;
-    static struct timespec last_report;
-    static int timing_initialized = 0;
-
-    while (running) {
-        unsigned char buf[BUFFER_SIZE];
-        size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
-
-if (len > 0 && len >= 2 &&
-    buf[0] == 0xFF && buf[1] == 0xD8) {
-
-    frame_count++;
-
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-
-    if (!timing_initialized) {
-        last_report = now;
-        timing_initialized = 1;
-    }
-
-    double elapsed =
-        (now.tv_sec - last_report.tv_sec) +
-        (now.tv_nsec - last_report.tv_nsec) / 1e9;
-
-    if (elapsed >= 2.0) {
-        printf("[FRAME] %d frames in %.2f sec = %.2f FPS, JPEG=%zu bytes\n",
-               frame_count,
-               elapsed,
-               frame_count / elapsed,
-               len);
-
-        frame_count = 0;
-        last_report = now;
-        fflush(stdout);
-    }
-
-    pthread_mutex_lock(&frame_mutex);
-
-    size_t copy_len = len;
-    if (copy_len > BUFFER_SIZE)
-        copy_len = BUFFER_SIZE;
-
-    memcpy(current_frame, buf, copy_len);
-    current_len = copy_len;
-
-    pthread_mutex_unlock(&frame_mutex);
-}
-
-        long interval = current_interval_ms;
-
-        next_time.tv_nsec += interval * 1000000L;
-
-        while (next_time.tv_nsec >= 1000000000L) {
-            next_time.tv_nsec -= 1000000000L;
-            next_time.tv_sec += 1;
-        }
-
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_time, NULL);
-    }
-
-    return NULL;
-}
 
 static void set_socket_timeout(int fd, int seconds) {
     struct timeval tv = { .tv_sec = seconds, .tv_usec = 0 };
@@ -347,7 +304,7 @@ static void set_socket_timeout(int fd, int seconds) {
 void send_redirect(int fd) {
     const char *msg =
         "HTTP/1.1 301 Moved Permanently\r\n"
-        "Location: http://192.168.137.100:8080/\r\n"  // Changed to HTTP for testing
+        "Location: https://192.168.137.100:8443/\r\n"
         "Content-Type: text/html\r\n"
         "Content-Length: 24\r\n"
         "Connection: close\r\n"
@@ -357,8 +314,7 @@ void send_redirect(int fd) {
     send(fd, msg, strlen(msg), 0);
 }
 
-// Modified to use plain sockets instead of SSL
-static void handle_mjpeg_stream(int fd) {
+static void handle_mjpeg_stream(SSL *ssl) {
     const char *header =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
@@ -366,7 +322,7 @@ static void handle_mjpeg_stream(int fd) {
         "Connection: keep-alive\r\n"
         "\r\n";
 
-    if (send(fd, header, strlen(header), 0) <= 0) return;
+    if (SSL_write(ssl, header, strlen(header)) <= 0) return;
 
     struct timespec next_frame;
     clock_gettime(CLOCK_MONOTONIC, &next_frame);
@@ -397,7 +353,7 @@ static void handle_mjpeg_stream(int fd) {
                 sendbuf[hlen + len] = '\r';
                 sendbuf[hlen + len + 1] = '\n';
 
-                if (send(fd, sendbuf, total, 0) <= 0) {
+                if (SSL_write(ssl, sendbuf, total) <= 0) {
                     free(sendbuf);
                     free(copy);
                     break;
@@ -417,17 +373,26 @@ static void handle_mjpeg_stream(int fd) {
     }
 }
 
-// Modified to use plain sockets instead of SSL
-static void *handle_http_thread(void *arg) {
+static void *handle_https_thread(void *arg) {
     int fd = *(int*)arg;
     free(arg);
 
     int nodelay = 1;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
 
+    SSL *ssl = SSL_new(ssl_ctx);
+    SSL_set_fd(ssl, fd);
+
+    if (SSL_accept(ssl) <= 0) {
+        SSL_free(ssl);
+        close(fd);
+        return NULL;
+    }
+
     char req[4096];
-    int n = recv(fd, req, sizeof(req) - 1, 0);
+    int n = SSL_read(ssl, req, sizeof(req) - 1);
     if (n <= 0) {
+        SSL_free(ssl);
         close(fd);
         return NULL;
     }
@@ -452,15 +417,17 @@ static void *handle_http_thread(void *arg) {
                 "\r\n",
                 strlen(html_cache));
 
-            send(fd, header, strlen(header), 0);
-            send(fd, html_cache, strlen(html_cache), 0);
+            SSL_write(ssl, header, strlen(header));
+            SSL_write(ssl, html_cache, strlen(html_cache));
         }
+        SSL_free(ssl);
         close(fd);
         return NULL;
     }
 
     if (strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) {
-        handle_mjpeg_stream(fd);
+        handle_mjpeg_stream(ssl);
+        SSL_free(ssl);
         close(fd);
         return NULL;
     }
@@ -486,10 +453,11 @@ static void *handle_http_thread(void *arg) {
                 "Connection: close\r\n"
                 "\r\n",
                 len);
-            send(fd, header, strlen(header), 0);
-            send(fd, copy, len, 0);
+            SSL_write(ssl, header, strlen(header));
+            SSL_write(ssl, copy, len);
             free(copy);
         }
+        SSL_free(ssl);
         close(fd);
         return NULL;
     }
@@ -516,7 +484,8 @@ static void *handle_http_thread(void *arg) {
             "\r\n%s",
             strlen(json), json);
 
-        send(fd, header, strlen(header), 0);
+        SSL_write(ssl, header, strlen(header));
+        SSL_free(ssl);
         close(fd);
         return NULL;
     }
@@ -546,7 +515,8 @@ static void *handle_http_thread(void *arg) {
             "\r\n%s",
             strlen(json), json);
 
-        send(fd, header, strlen(header), 0);
+        SSL_write(ssl, header, strlen(header));
+        SSL_free(ssl);
         close(fd);
         return NULL;
     }
@@ -579,7 +549,8 @@ static void *handle_http_thread(void *arg) {
             "\r\n%s",
             strlen(json), json);
 
-        send(fd, header, strlen(header), 0);
+        SSL_write(ssl, header, strlen(header));
+        SSL_free(ssl);
         close(fd);
         return NULL;
     }
@@ -597,7 +568,7 @@ static void *handle_http_thread(void *arg) {
                         "Connection: close\r\n"
                         "\r\n"
                         "{\"status\":\"success\",\"cmd\":\"reboot\"}";
-                    send(fd, resp, strlen(resp), 0);
+                    SSL_write(ssl, resp, strlen(resp));
                 } else {
                     const char *resp = 
                         "HTTP/1.1 400 Bad Request\r\n"
@@ -606,7 +577,7 @@ static void *handle_http_thread(void *arg) {
                         "Connection: close\r\n"
                         "\r\n"
                         "{\"error\":\"Unknown command\"}";
-                    send(fd, resp, strlen(resp), 0);
+                    SSL_write(ssl, resp, strlen(resp));
                 }
             }
         } else {
@@ -617,18 +588,19 @@ static void *handle_http_thread(void *arg) {
                 "Connection: close\r\n"
                 "\r\n"
                 "{\"error\":\"Method not allowed\"}";
-            send(fd, resp, strlen(resp), 0);
+            SSL_write(ssl, resp, strlen(resp));
         }
+        SSL_free(ssl);
         close(fd);
         return NULL;
     }
 
-    send(fd, "HTTP/1.1 404 Not Found\r\n\r\n", 26, 0);
+    SSL_write(ssl, "HTTP/1.1 404 Not Found\r\n\r\n", 26);
+    SSL_free(ssl);
     close(fd);
     return NULL;
 }
 
-/* SSL initialization function commented out
 static SSL_CTX *init_ssl(void) {
     SSL_library_init();
     SSL_load_error_strings();
@@ -647,10 +619,9 @@ static SSL_CTX *init_ssl(void) {
 
     return ctx;
 }
-*/
 
 int main(void) {
-    printf("Starting Security Server (TEST MODE - No SSL)...\n");
+    printf("Starting Security Server...\n");
     printf("Config path: %s\n", CONFIG_PATH);
 
     signal(SIGINT, signal_handler);
@@ -699,7 +670,6 @@ int main(void) {
     pthread_t telemetry_thread;
     pthread_create(&telemetry_thread, NULL, telemetry_updater, NULL);
 
-    /* SSL initialization commented out
     ssl_ctx = init_ssl();
     if (!ssl_ctx) {
         printf("SSL init failed. Generate cert.pem and key.pem\n");
@@ -707,7 +677,6 @@ int main(void) {
     }
 
     printf("SSL initialized\n");
-    */
 
     int http_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
@@ -724,9 +693,8 @@ int main(void) {
         return 1;
     }
     listen(http_fd, 10);
-    printf("HTTP server running on port %d (TEST MODE - No SSL redirect)\n", g_port_http);
+    printf("HTTP on %d (redirects to HTTPS)\n", g_port_http);
 
-    /* HTTPS socket creation commented out - using only HTTP for testing
     int https_fd = socket(AF_INET, SOCK_STREAM, 0);
     setsockopt(https_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
@@ -744,19 +712,14 @@ int main(void) {
 
     printf("HTTPS on %d\n", g_port_https);
     printf("Open: https://192.168.137.100:%d/\n", g_port_https);
-    */
-
-    // Use only HTTP port for testing
-    printf("Open: http://192.168.137.100:%d/\n", g_port_http);
 
     while (running) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(http_fd, &fds);
-        // FD_SET(https_fd, &fds);  // Commented out for testing
+        FD_SET(https_fd, &fds);
 
-        // int max_fd = (https_fd > http_fd) ? https_fd : http_fd;
-        int max_fd = http_fd;  // Only HTTP for testing
+        int max_fd = (https_fd > http_fd) ? https_fd : http_fd;
         
         // Use a timeout so we can check running status periodically
         struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
@@ -779,21 +742,12 @@ int main(void) {
         if (FD_ISSET(http_fd, &fds)) {
             int fd = accept(http_fd, NULL, NULL);
             if (fd >= 0) {
-                set_socket_timeout(fd, 30);  // long-lived stream needs a longer timeout
-                pthread_t thread;
-                int *fd_ptr = malloc(sizeof(int));
-                if (fd_ptr) {
-                    *fd_ptr = fd;
-                    // Use HTTP handler instead of HTTPS
-                    pthread_create(&thread, NULL, handle_http_thread, fd_ptr);
-                    pthread_detach(thread);
-                } else {
-                    close(fd);
-                }
+                set_socket_timeout(fd, 5);
+                send_redirect(fd);
+                close(fd);
             }
         }
 
-        /* HTTPS handling commented out
         if (FD_ISSET(https_fd, &fds)) {
             int fd = accept(https_fd, NULL, NULL);
             if (fd >= 0) {
@@ -809,7 +763,6 @@ int main(void) {
                 }
             }
         }
-        */
     }
 
     printf("\nShutting down...\n");
@@ -819,8 +772,8 @@ int main(void) {
     pthread_join(telemetry_thread, NULL);
 
     close(http_fd);
-    // close(https_fd);  // Commented out
-    // SSL_CTX_free(ssl_ctx);  // Commented out
+    close(https_fd);
+    SSL_CTX_free(ssl_ctx);
     free(html_cache);
     free(history);
 
