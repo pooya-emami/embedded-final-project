@@ -56,7 +56,6 @@ void *receiver_thread(void *arg) {
     unsigned char buf[RELAY_BUF_SIZE];
     unsigned char jpeg[RELAY_BUF_SIZE];
     size_t jpeg_len = 0;
-    int frame_count = 0;
 
     while (1) {
         client_fd = accept(server_fd, (struct sockaddr*)&addr, &addr_len);
@@ -69,7 +68,6 @@ void *receiver_thread(void *arg) {
                inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 
         jpeg_len = 0;
-        frame_count = 0;
 
         while (1) {
             ssize_t n = read(client_fd, buf, RELAY_BUF_SIZE);
@@ -86,88 +84,29 @@ void *receiver_thread(void *arg) {
                 memcpy(jpeg + jpeg_len, buf, n);
                 jpeg_len += n;
             } else {
-                printf("Buffer full (%zu bytes), attempting to recover...\n", jpeg_len);
-                
-                int soi = find_marker(jpeg, jpeg_len, 0xFF, 0xD8);
-                int eoi = find_marker(jpeg, jpeg_len, 0xFF, 0xD9);
-                
-                if (soi >= 0 && eoi > soi) {
-                    size_t frame_size = eoi + 2;
-                    shared_frame_write(g_frame, jpeg + soi, frame_size - soi);
-                    frame_count++;
-                    
-                    if (frame_size < jpeg_len) {
-                        memmove(jpeg, jpeg + frame_size, jpeg_len - frame_size);
-                        jpeg_len -= frame_size;
-                    } else {
-                        jpeg_len = 0;
-                    }
-                    continue;
-                }
-                
-                int last_soi = -1;
-                for (int i = 0; i < (int)jpeg_len - 1; i++) {
-                    if (jpeg[i] == 0xFF && jpeg[i+1] == 0xD8) {
-                        last_soi = i;
-                    }
-                }
-                
-                if (last_soi > 0) {
-                    printf("Found last SOI at %d, discarding %d bytes\n", last_soi, last_soi);
-                    memmove(jpeg, jpeg + last_soi, jpeg_len - last_soi);
-                    jpeg_len -= last_soi;
-                } else {
-                    printf("No valid SOI found, resetting buffer\n");
-                    jpeg_len = 0;
-                }
+                printf("Buffer full, resetting\n");
+                jpeg_len = 0;
+                continue;
             }
 
-            while (1) {
-                int soi = find_marker(jpeg, jpeg_len, 0xFF, 0xD8);
-                if (soi < 0) {
-                    break;
-                }
+            int soi = find_marker(jpeg, jpeg_len, 0xFF, 0xD8);
+            int eoi = find_marker(jpeg, jpeg_len, 0xFF, 0xD9);
 
-                int eoi = find_marker(jpeg + soi + 2, jpeg_len - soi - 2, 0xFF, 0xD9);
-                if (eoi < 0) {
-                    break;
-                }
+            if (soi >= 0 && eoi > soi) {
+                size_t frame_size = eoi + 2; 
+                shared_frame_write(g_frame, jpeg + soi, frame_size - soi);
 
-                eoi = eoi + soi + 2;
-                size_t frame_size = eoi - soi + 2;
-                
-                frame_count++;
-                
-                if (frame_size <= RELAY_BUF_SIZE) {
-                    shared_frame_write(g_frame, jpeg + soi, frame_size);
+                if (frame_size < jpeg_len) {
+                    memmove(jpeg, jpeg + frame_size, jpeg_len - frame_size);
+                    jpeg_len -= frame_size;
                 } else {
-                    printf("Frame too large: %zu bytes (max %d)\n", frame_size, RELAY_BUF_SIZE);
-                }
-
-                if (eoi + 2 < jpeg_len) {
-                    memmove(jpeg, jpeg + eoi + 2, jpeg_len - eoi - 2);
-                    jpeg_len -= eoi + 2;
-                } else {
-                    jpeg_len = 0;
-                    break;
-                }
-            }
-
-            if (jpeg_len > RELAY_BUF_SIZE / 2) {
-                int soi = find_marker(jpeg, jpeg_len, 0xFF, 0xD8);
-                if (soi > 0) {
-                    printf("Cleaning %d bytes of garbage before SOI\n", soi);
-                    memmove(jpeg, jpeg + soi, jpeg_len - soi);
-                    jpeg_len -= soi;
-                } else if (soi < 0) {
-                    printf("No SOI found in %zu bytes, clearing buffer\n", jpeg_len);
                     jpeg_len = 0;
                 }
             }
         }
 
         close(client_fd);
-        printf("Client disconnected - Total frames: %d\n", frame_count);
+        printf("Client disconnected\n");
     }
 
     return NULL;
