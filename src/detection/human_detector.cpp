@@ -46,7 +46,7 @@ static inline float sigmoid(float x) {
     return 1.0f / (1.0f + std::exp(-x));
 }
 
-static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
+static std::vector<cv::Rect> detectHumans(const cv::Mat &img320, int orig_w, int orig_h)
 {
     load_yolo();
 
@@ -112,6 +112,9 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     std::vector<cv::Rect> raw_boxes;
     std::vector<float> raw_scores;
 
+    float sx = (float)orig_w / 320.0f;
+    float sy = (float)orig_h / 320.0f;
+
     // --- Decode YOLOv5-u unified output ---
     for (int i = 0; i < N; i++) {
 
@@ -145,10 +148,16 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         float x2 = x + w / 2;
         float y2 = y + h / 2;
 
+        // --- SCALE TO ORIGINAL FRAME BEFORE NMS ---
+        float x1s = x1 * sx;
+        float y1s = y1 * sy;
+        float x2s = x2 * sx;
+        float y2s = y2 * sy;
+
         raw_boxes.emplace_back(
-            (int)x1, (int)y1,
-            (int)(x2 - x1),
-            (int)(y2 - y1)
+            (int)x1s, (int)y1s,
+            (int)(x2s - x1s),
+            (int)(y2s - y1s)
         );
 
         raw_scores.push_back(conf);
@@ -163,6 +172,7 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 
     return final_boxes;
 }
+
 
 
 // This is the function that server.c is calling
