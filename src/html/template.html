@@ -3,82 +3,52 @@
 <head>
     <meta charset="UTF-8">
     <title>Embedded Security System</title>
-
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            background: #f4f4f4;
-            margin: 0;
-            padding: 20px;
-        }
-        h1 {
-            background: #222;
-            color: #fff;
-            padding: 10px;
-        }
-        #tele {
-            background: #fff;
-            padding: 10px;
-            margin-top: 15px;
-            border-radius: 5px;
-            width: 300px;
-            box-shadow: 0 0 5px rgba(0,0,0,0.2);
-        }
-        img {
-            border: 3px solid #333;
-            border-radius: 5px;
-            display: block;
-            margin-bottom: 10px;
-            /* Add a subtle loading indicator */
-            background: #ddd;
-        }
-        .status {
-            font-size: 0.9em;
-            color: #666;
-            margin: 5px 0;
-        }
+        body { font-family: Arial, sans-serif; background: #f4f4f4; padding: 20px; }
+        h1 { background: #222; color: #fff; padding: 10px; }
+        #tele { background: #fff; padding: 10px; margin-top: 15px; border-radius: 5px; width: 300px; }
+        img { border: 3px solid #333; border-radius: 5px; display: block; background: #ddd; width: 320px; }
     </style>
 </head>
-
 <body>
 
 <h1>Embedded Security System – Pooya Emami</h1>
 
-<!-- Live stream image -->
 <img id="stream" src="/stream" width="320" alt="Live Stream">
 
 <h3>Telemetry</h3>
 <div id="tele">Loading...</div>
 
 <script>
-// Telemetry update
+// Adaptive telemetry - no fixed interval
+let interval = 1000;
+
 function updateTelemetry() {
     fetch('/telemetry')
-        .then(response => response.json())
+        .then(r => r.json())
         .then(data => {
             document.getElementById('tele').innerHTML =
                 "CPU Temp: " + data.temp + " °C<br>" +
                 "Free Memory: " + data.mem + " kB<br>" +
                 "CPU Load: " + data.cpu + " %";
+            interval = Math.max(500, Math.min(10000, interval * (data.cpu > 50 ? 0.7 : 1.3)));
+            setTimeout(updateTelemetry, interval);
         })
-        .catch(err => {
-            document.getElementById('tele').innerHTML = "Error loading telemetry";
+        .catch(() => {
+            interval = Math.min(30000, interval * 2);
+            setTimeout(updateTelemetry, interval);
         });
 }
 
+// Stream update - simple
 function updateStream() {
-    const img = document.getElementById('stream');
-    img.src = '/stream?t=' + Date.now(); 
-
+    document.getElementById('stream').src = '/stream?t=' + Date.now();
 }
 
-
-setInterval(updateTelemetry, 2000);
+// Start
 updateTelemetry();
-
-setInterval(updateStream, 1);
-updateStream(); 
+setInterval(updateStream, 150);
+updateStream();
 </script>
-
 </body>
 </html>
