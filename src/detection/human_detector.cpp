@@ -77,7 +77,7 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         Ort::Value::CreateTensor<float>(
             memory_info,
             (float*)blob.data,
-            1 * 3 * 320 * 320,
+            3 * 320 * 320,
             input_shape.data(),
             input_shape.size()
         );
@@ -93,18 +93,16 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         yolo_session->GetOutputNameAllocated(0, allocator);
 
 
-    const char* input_names[] =
-    {
+    const char* input_names[] = {
         input_name.get()
     };
 
-    const char* output_names[] =
-    {
+    const char* output_names[] = {
         output_name.get()
     };
 
 
-    auto output_tensors =
+    auto outputs =
         yolo_session->Run(
             Ort::RunOptions{nullptr},
             input_names,
@@ -116,18 +114,18 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 
 
     float* output =
-        output_tensors[0].GetTensorMutableData<float>();
+        outputs[0].GetTensorMutableData<float>();
 
 
     /*
-       YOLOv8/YOLOv5u output:
+       YOLO output:
        1 x 84 x 2100
 
-       transpose:
+       convert to:
        2100 x 84
     */
 
-    cv::Mat raw(
+    cv::Mat pred(
         84,
         2100,
         CV_32F,
@@ -135,8 +133,9 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     );
 
 
-    cv::Mat pred;
-    cv::transpose(raw, pred);
+    cv::Mat detections;
+
+    cv::transpose(pred, detections);
 
 
     std::vector<cv::Rect> raw_boxes;
@@ -146,10 +145,10 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     for(int i=0;i<2100;i++)
     {
 
-        float x = pred.at<float>(i,0);
-        float y = pred.at<float>(i,1);
-        float w = pred.at<float>(i,2);
-        float h = pred.at<float>(i,3);
+        float x = detections.at<float>(i,0);
+        float y = detections.at<float>(i,1);
+        float w = detections.at<float>(i,2);
+        float h = detections.at<float>(i,3);
 
 
         float best_score = 0.0f;
@@ -158,13 +157,13 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 
         for(int c=0;c<80;c++)
         {
-            float score =
-                pred.at<float>(i,4+c);
+            float s =
+                detections.at<float>(i,4+c);
 
 
-            if(score > best_score)
+            if(s > best_score)
             {
-                best_score = score;
+                best_score = s;
                 best_class = c;
             }
         }
@@ -175,23 +174,27 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         {
 
             /*
-              output is normalized to 320x320
+              YOLO coordinates are normalized
+              relative to 320x320
             */
 
-            int left =
-                (x - w/2.0f);
+            int x1 =
+                (x - w/2.0f) * 320;
 
-            int top =
-                (y - h/2.0f);
+            int y1 =
+                (y - h/2.0f) * 320;
 
 
-            int width = w;
-            int height = h;
+            int width =
+                w * 320;
+
+            int height =
+                h * 320;
 
 
             raw_boxes.emplace_back(
-                left,
-                top,
+                x1,
+                y1,
                 width,
                 height
             );
@@ -220,7 +223,7 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     }
 
 
-    std::cout
+    std::cout 
         << "DETECTIONS "
         << boxes.size()
         << std::endl;
