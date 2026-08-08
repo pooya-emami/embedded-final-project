@@ -278,8 +278,6 @@ static int frame_count = 0;
 static struct timespec last_report;
 static int timing_initialized = 0;
 
-...
-
 if (len > 0 && len >= 2 &&
     buf[0] == 0xFF && buf[1] == 0xD8) {
 
