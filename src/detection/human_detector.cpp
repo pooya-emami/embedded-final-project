@@ -11,10 +11,59 @@
 
 #include "human_detector.hpp"
 
-// Dummy detection - replace with YOLO later
+static cv::dnn::Net yolo;
+static bool yolo_loaded = false;
+
+static void load_yolo() {
+    if (yolo_loaded) return;
+
+    try {
+        yolo = cv::dnn::readNetFromONNX("models/yolov8n.onnx");
+        yolo.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
+        yolo.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+        yolo_loaded = true;
+        std::cout << "[YOLO] Model loaded\n";
+    } catch (...) {
+        std::cerr << "[YOLO] Failed to load ONNX model\n";
+    }
+}
+
 static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
-    (void)img320;
-    return { cv::Rect(80, 80, 160, 160) };  // fake box
+    load_yolo();
+    std::vector<cv::Rect> boxes;
+
+    if (!yolo_loaded) return boxes;
+
+    cv::Mat blob = cv::dnn::blobFromImage(
+        img320, 1.0/255.0, cv::Size(320, 320),
+        cv::Scalar(), true, false
+    );
+
+    yolo.setInput(blob);
+    cv::Mat out = yolo.forward();
+
+    // YOLOv8 ONNX output: Nx6 → [x, y, w, h, conf, class]
+    for (int i = 0; i < out.rows; i++) {
+        float conf = out.at<float>(i, 4);
+        if (conf < 0.40f) continue;  // confidence threshold
+
+        int cls = (int)out.at<float>(i, 5);
+        if (cls != 0) continue;      // class 0 = person
+
+        float x = out.at<float>(i, 0);
+        float y = out.at<float>(i, 1);
+        float w = out.at<float>(i, 2);
+        float h = out.at<float>(i, 3);
+
+        int left   = (int)(x - w/2);
+        int top    = (int)(y - h/2);
+        int width  = (int)w;
+        int height = (int)h;
+
+        boxes.emplace_back(left, top, width, height);
+    }
+
+    return boxes;
 }
 
 extern "C" DetectionResult process_frame(
