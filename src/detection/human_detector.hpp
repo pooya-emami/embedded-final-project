@@ -8,6 +8,9 @@
 extern "C" {
 #endif
 
+#define MODEL_BASE_PATH "../../models/"
+#define YOLO_MODEL_FILE "yolov8n.onnx"
+
 typedef struct {
     uint8_t* jpeg_output;   // malloc'ed buffer
     size_t   jpeg_length;   // number of bytes

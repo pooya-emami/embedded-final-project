@@ -8,23 +8,28 @@
 #include <sstream>
 #include <iomanip>
 #include <cstdlib>
+#include <cstring>
 
 #include "human_detector.hpp"
+
+static char model_path[256] = {0};
 
 static cv::dnn::Net yolo;
 static bool yolo_loaded = false;
 
 static void load_yolo() {
     if (yolo_loaded) return;
+    snprintf(model_path, sizeof(model_path),
+             "%s%s", MODEL_BASE_PATH, YOLO_MODEL_FILE);
 
     try {
-        yolo = cv::dnn::readNetFromONNX("models/yolov8n.onnx");
+        yolo = cv::dnn::readNetFromONNX(model_path);
         yolo.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
         yolo.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
         yolo_loaded = true;
-        std::cout << "[YOLO] Model loaded\n";
+        std::cout << "[YOLO] Loaded model: " << model_path << "\n";
     } catch (...) {
-        std::cerr << "[YOLO] Failed to load ONNX model\n";
+        std::cerr << "[YOLO] Failed to load model: " << model_path << "\n";
     }
 }
 
@@ -32,7 +37,8 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
     load_yolo();
     std::vector<cv::Rect> boxes;
 
-    if (!yolo_loaded) return boxes;
+    if (!yolo_loaded)
+        return boxes;
 
     cv::Mat blob = cv::dnn::blobFromImage(
         img320, 1.0/255.0, cv::Size(320, 320),
@@ -45,10 +51,10 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
     // YOLOv8 ONNX output: Nx6 → [x, y, w, h, conf, class]
     for (int i = 0; i < out.rows; i++) {
         float conf = out.at<float>(i, 4);
-        if (conf < 0.40f) continue;  // confidence threshold
+        if (conf < 0.40f) continue;
 
         int cls = (int)out.at<float>(i, 5);
-        if (cls != 0) continue;      // class 0 = person
+        if (cls != 0) continue;  // class 0 = person
 
         float x = out.at<float>(i, 0);
         float y = out.at<float>(i, 1);
@@ -74,7 +80,7 @@ extern "C" DetectionResult process_frame(
 ) {
     DetectionResult result = {};
 
-    // Step 1: Decode JPEG → Mat
+    // Decode JPEG
     std::vector<uint8_t> buf(jpeg_data, jpeg_data + jpeg_len);
     cv::Mat frame_source = cv::imdecode(buf, cv::IMREAD_COLOR);
 
@@ -83,19 +89,19 @@ extern "C" DetectionResult process_frame(
         return result;
     }
 
-    // Step 2: Resize to 320x320 for detection
+    // Resize for detection
     cv::Mat frame_detection;
     cv::resize(frame_source, frame_detection, cv::Size(320, 320));
 
-    // Step 3: Dummy detection
+    // Run YOLO
     auto boxes = detectHumans(frame_detection);
 
-    // Step 4: Draw boxes
+    // Draw boxes
     for (const auto &box : boxes) {
         cv::rectangle(frame_detection, box, cv::Scalar(0, 255, 0), 2);
     }
 
-    // Step 5: Overlays (student ID, timestamp, FPS)
+    // Timestamp
     auto now = std::chrono::system_clock::now();
     auto now_time_t = std::chrono::system_clock::to_time_t(now);
     std::stringstream ss;
@@ -114,6 +120,7 @@ extern "C" DetectionResult process_frame(
                 cv::Point(10, 90), cv::FONT_HERSHEY_SIMPLEX, 0.6,
                 cv::Scalar(0, 255, 0), 2);
 
+    // FPS counter
     static double fps = 0;
     static int frame_count = 0;
     static auto start = std::chrono::steady_clock::now();
@@ -134,12 +141,12 @@ extern "C" DetectionResult process_frame(
                 cv::FONT_HERSHEY_SIMPLEX, 0.6,
                 cv::Scalar(0, 255, 0), 2);
 
-    // Step 6: Resize to output resolution
+    // Resize to output resolution
     cv::Mat frame_output;
     cv::resize(frame_detection, frame_output,
                cv::Size(output_width, output_height));
 
-    // Step 7: Encode to JPEG
+    // Encode JPEG
     std::vector<uint8_t> jpegBuf;
     cv::imencode(".jpg", frame_output, jpegBuf);
 
