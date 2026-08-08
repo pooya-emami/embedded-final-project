@@ -105,8 +105,9 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     }
     printf("]\n");
 
-    int N = shape[1];  // Should be 2100
-    int C = shape[2];  // Should be 84
+    // For shape [1, 84, 2100]
+    int channels = shape[1];  // 84
+    int num_predictions = shape[2];  // 2100
 
     // Store all detections
     struct Detection {
@@ -115,81 +116,42 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     };
     std::vector<Detection> detections;
 
-    // Handle both possible output formats
-    if (C == 84 && N == 2100) {
-        // Format is [1, 84, 2100] - need to transpose
-        for (int i = 0; i < N; i++) {
-            // Get the 84 values for this prediction
-            float x = out[0 * N + i];
-            float y = out[1 * N + i];
-            float w = out[2 * N + i];
-            float h = out[3 * N + i];
-            float obj = out[4 * N + i];
-            
-            if (obj < 0.25f) continue;
-            
-            // Find best class
-            float best_score = 0;
-            int best_class = -1;
-            for (int c = 5; c < C; c++) {
-                float s = out[c * N + i];
-                if (s > best_score) {
-                    best_score = s;
-                    best_class = c - 5;
-                }
+    // Process each prediction (like Python's transpose)
+    for (int i = 0; i < num_predictions; i++) {
+        // Get the 84 values for this prediction (transposed)
+        float x = out[0 * num_predictions + i];
+        float y = out[1 * num_predictions + i];
+        float w = out[2 * num_predictions + i];
+        float h = out[3 * num_predictions + i];
+        float obj = out[4 * num_predictions + i];
+        
+        if (obj < 0.25f) continue;
+        
+        // Find best class
+        float best_score = 0;
+        int best_class = -1;
+        for (int c = 5; c < channels; c++) {
+            float s = out[c * num_predictions + i];
+            if (s > best_score) {
+                best_score = s;
+                best_class = c - 5;
             }
-            
-            // Only person class (class 0)
-            if (best_class != 0) continue;
-            if (best_score < 0.25f) continue;
-            
-            // Convert center format to corner format
-            float x1 = (x - w/2) * img320.cols / 320.0f;
-            float y1 = (y - h/2) * img320.rows / 320.0f;
-            float x2 = (x + w/2) * img320.cols / 320.0f;
-            float y2 = (y + h/2) * img320.rows / 320.0f;
-            
-            detections.push_back({x1, y1, x2, y2, best_score});
         }
-    } else if (N == 2100 && C == 84) {
-        // Format is [1, 2100, 84] - direct access
-        for (int i = 0; i < N; i++) {
-            int offset = i * C;
-            float x = out[offset + 0];
-            float y = out[offset + 1];
-            float w = out[offset + 2];
-            float h = out[offset + 3];
-            float obj = out[offset + 4];
-            
-            if (obj < 0.25f) continue;
-            
-            // Find best class
-            float best_score = 0;
-            int best_class = -1;
-            for (int c = 5; c < C; c++) {
-                float s = out[offset + c];
-                if (s > best_score) {
-                    best_score = s;
-                    best_class = c - 5;
-                }
-            }
-            
-            // Only person class (class 0)
-            if (best_class != 0) continue;
-            if (best_score < 0.25f) continue;
-            
-            // Convert center format to corner format
-            float x1 = (x - w/2) * img320.cols / 320.0f;
-            float y1 = (y - h/2) * img320.rows / 320.0f;
-            float x2 = (x + w/2) * img320.cols / 320.0f;
-            float y2 = (y + h/2) * img320.rows / 320.0f;
-            
-            detections.push_back({x1, y1, x2, y2, best_score});
-        }
-    } else {
-        printf("Unexpected output shape: N=%d, C=%d\n", N, C);
-        return boxes;
+        
+        // Only person class (class 0)
+        if (best_class != 0) continue;
+        if (best_score < 0.25f) continue;
+        
+        // Convert center format to corner format and scale to image size
+        float x1 = (x - w/2) * img320.cols / 320.0f;
+        float y1 = (y - h/2) * img320.rows / 320.0f;
+        float x2 = (x + w/2) * img320.cols / 320.0f;
+        float y2 = (y + h/2) * img320.rows / 320.0f;
+        
+        detections.push_back({x1, y1, x2, y2, best_score});
     }
+
+    printf("Raw detections: %zu\n", detections.size());
 
     // Apply NMS
     if (!detections.empty()) {
@@ -214,131 +176,8 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         }
     }
 
-    printf("Detected %zu persons\n", boxes.size());
+    printf("After NMS: %zu persons\n", boxes.size());
     return boxes;
-}
-
-
-extern "C" DetectionResult process_frame(
-    const uint8_t* jpeg_data,
-    size_t jpeg_len,
-    int output_width,
-    int output_height)
-{
-    DetectionResult result = {};
-
-    std::vector<uint8_t> buf(jpeg_data, jpeg_data + jpeg_len);
-    cv::Mat frame_source = cv::imdecode(buf, cv::IMREAD_COLOR);
-
-    if (frame_source.empty())
-        return result;
-
-    cv::Mat frame_detection;
-    cv::resize(frame_source, frame_detection, cv::Size(320, 320));
-
-    auto boxes = detectHumans(frame_detection);
-
-    for (const auto &box : boxes)
-        cv::rectangle(frame_detection, box, cv::Scalar(0, 255, 0), 2);
-
-    auto now = std::chrono::system_clock::now();
-    auto now_time_t = std::chrono::system_clock::to_time_t(now);
-
-    std::stringstream ss;
-    ss << std::put_time(
-        std::localtime(&now_time_t),
-        "%Y-%m-%d %H:%M:%S"
-    );
-
-    cv::putText(
-        frame_detection,
-        "Student: 404300409",
-        cv::Point(10, 30),
-        cv::FONT_HERSHEY_SIMPLEX,
-        0.6,
-        cv::Scalar(0, 255, 255),
-        2
-    );
-
-    cv::putText(
-        frame_detection,
-        ss.str(),
-        cv::Point(10, 60),
-        cv::FONT_HERSHEY_SIMPLEX,
-        0.6,
-        cv::Scalar(255, 255, 255),
-        2
-    );
-
-    cv::putText(
-        frame_detection,
-        "Persons: " + std::to_string(boxes.size()),
-        cv::Point(10, 90),
-        cv::FONT_HERSHEY_SIMPLEX,
-        0.6,
-        cv::Scalar(0, 255, 0),
-        2
-    );
-
-    static double fps = 0;
-    static int frame_count = 0;
-    static auto start = std::chrono::steady_clock::now();
-
-    auto current = std::chrono::steady_clock::now();
-    double elapsed = std::chrono::duration<double>(
-        current - start
-    ).count();
-
-    frame_count++;
-
-    if (elapsed >= 1.0) {
-        fps = frame_count / elapsed;
-        frame_count = 0;
-        start = current;
-    }
-
-    cv::putText(
-        frame_detection,
-        "FPS: " + std::to_string(fps).substr(0, 4),
-        cv::Point(frame_detection.cols - 100, 30),
-        cv::FONT_HERSHEY_SIMPLEX,
-        0.6,
-        cv::Scalar(0, 255, 0),
-        2
-    );
-
-    cv::Mat frame_output;
-
-    cv::resize(
-        frame_detection,
-        frame_output,
-        cv::Size(output_width, output_height)
-    );
-
-    std::vector<uint8_t> jpegBuf;
-
-    cv::imencode(
-        ".jpg",
-        frame_output,
-        jpegBuf
-    );
-
-    result.jpeg_output = (uint8_t*)malloc(jpegBuf.size());
-
-    if (result.jpeg_output) {
-        result.jpeg_length = jpegBuf.size();
-        memcpy(
-            result.jpeg_output,
-            jpegBuf.data(),
-            jpegBuf.size()
-        );
-    }
-
-    result.width = output_width;
-    result.height = output_height;
-    result.person_count = (int)boxes.size();
-
-    return result;
 }
 
 extern "C" void free_detection_result(DetectionResult* res)
