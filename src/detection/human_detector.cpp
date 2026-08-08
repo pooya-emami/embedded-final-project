@@ -74,69 +74,6 @@ try {
 }
 
 return boxes;  // TEMPORARY
-
-    if (outputs.empty()) {
-        std::cerr << "[YOLO] forward() returned NO outputs!\n";
-        return boxes;
-    }
-
-    std::cout << "[YOLO] forward() returned " << outputs.size() << " outputs\n";
-
-    // Print all output shapes
-    for (size_t i = 0; i < outputs.size(); i++) {
-        cv::Mat &o = outputs[i];
-        std::cout << "[YOLO] Output[" << i << "] dims=" << o.dims << " sizes=";
-        for (int d = 0; d < o.dims; d++)
-            std::cout << o.size[d] << " ";
-        std::cout << "\n";
-    }
-
-    // Use first output
-    cv::Mat out = outputs[0];
-
-    // -------------------------------
-    // Print raw output shape
-    // -------------------------------
-    std::cout << "[YOLO] RAW out dims=" << out.dims << " sizes=";
-    for (int d = 0; d < out.dims; d++)
-        std::cout << out.size[d] << " ";
-    std::cout << "\n";
-
-    // -------------------------------
-    // Handle 3D → reshape → transpose
-    // -------------------------------
-    if (out.dims == 3) {
-        int d0 = out.size[0];
-        int d1 = out.size[1];
-        int d2 = out.size[2];
-
-        std::cout << "[YOLO] 3D tensor: " << d0 << "x" << d1 << "x" << d2 << "\n";
-
-        if (d0 == 1 && d1 == 84) {
-            std::cout << "[YOLO] Reshaping to (84, " << d2 << ")...\n";
-
-            cv::Mat reshaped;
-            try {
-                reshaped = out.reshape(1, d1);  // (84, 2100)
-            } catch (cv::Exception &e) {
-                std::cerr << "[YOLO] reshape() failed: " << e.what() << "\n";
-                return boxes;
-            }
-
-            std::cout << "[YOLO] reshaped: " << reshaped.rows << "x" << reshaped.cols << "\n";
-
-            try {
-                cv::transpose(reshaped, out);  // (2100, 84)
-            } catch (cv::Exception &e) {
-                std::cerr << "[YOLO] transpose() failed: " << e.what() << "\n";
-                return boxes;
-            }
-
-            std::cout << "[YOLO] transposed: " << out.rows << "x" << out.cols << "\n";
-        } else {
-            std::cerr << "[YOLO] Unexpected 3D shape, cannot reshape\n";
-            return boxes;
-        }
     }
 
     // -------------------------------
