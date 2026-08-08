@@ -40,23 +40,72 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
     if (!yolo_loaded)
         return boxes;
 
+    // Create blob
     cv::Mat blob = cv::dnn::blobFromImage(
         img320, 1.0/255.0, cv::Size(320, 320),
         cv::Scalar(), true, false
     );
 
     yolo.setInput(blob);
-    cv::Mat out = yolo.forward();   // (1, 84, 2100)
 
-    out = out.reshape(1, 84);
+    // Forward pass
+    cv::Mat out = yolo.forward();
+
+    // -------------------------------
+    // 1. Print actual output shape
+    // -------------------------------
+    std::cout << "[YOLO] Output dims: " << out.dims << " | sizes: ";
+    for (int i = 0; i < out.dims; i++)
+        std::cout << out.size[i] << " ";
+    std::cout << "\n";
+
+    // -------------------------------
+    // 2. Validate shape
+    // -------------------------------
+    if (out.empty()) {
+        std::cerr << "[YOLO] forward() returned empty output\n";
+        return boxes;
+    }
+
+    if (out.dims != 3) {
+        std::cerr << "[YOLO] Unexpected dims: " << out.dims << "\n";
+        return boxes;
+    }
+
+    int d0 = out.size[0];
+    int d1 = out.size[1];
+    int d2 = out.size[2];
+
+    // Expected: (1, 84, 2100)
+    if (d0 != 1 || d1 != 84) {
+        std::cerr << "[YOLO] Unexpected shape: "
+                  << d0 << "x" << d1 << "x" << d2 << "\n";
+        return boxes;
+    }
+
+    // -------------------------------
+    // 3. Reshape safely → (84, 2100)
+    // -------------------------------
+    cv::Mat out2;
+    try {
+        out2 = out.reshape(1, d1);
+    } catch (cv::Exception &e) {
+        std::cerr << "[YOLO] reshape failed: " << e.what() << "\n";
+        return boxes;
+    }
 
     cv::Mat outT;
-    cv::transpose(out, outT);
+    try {
+        cv::transpose(out2, outT);
+    } catch (cv::Exception &e) {
+        std::cerr << "[YOLO] transpose failed: " << e.what() << "\n";
+        return boxes;
+    }
 
     int num_preds = outT.rows;
 
-    std::vector<cv::Rect> final_boxes;
-    std::vector<float> final_scores;
+    std::vector<cv::Rect> raw_boxes;
+    std::vector<float> raw_scores;
 
     for (int i = 0; i < num_preds; i++) {
         float x = outT.at<float>(i, 0);
@@ -64,7 +113,6 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
         float w = outT.at<float>(i, 2);
         float h = outT.at<float>(i, 3);
 
-        // class scores start at column 4
         float best_score = -1;
         int best_class = -1;
 
@@ -93,21 +141,18 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320) {
             (int)(y2 - y1)
         );
 
-        final_boxes.push_back(rect);
-        final_scores.push_back(best_score);
+        raw_boxes.push_back(rect);
+        raw_scores.push_back(best_score);
     }
 
-    // NMS
     std::vector<int> keep;
-    cv::dnn::NMSBoxes(final_boxes, final_scores,
+    cv::dnn::NMSBoxes(raw_boxes, raw_scores,
                       0.25f, 0.45f, keep);
 
-    std::vector<cv::Rect> nms_boxes;
-    for (int idx : keep) {
-        nms_boxes.push_back(final_boxes[idx]);
-    }
+    for (int idx : keep)
+        boxes.push_back(raw_boxes[idx]);
 
-    return nms_boxes;
+    return boxes;
 }
 
 extern "C" DetectionResult process_frame(
