@@ -1,90 +1,150 @@
-import cv2
+import subprocess
 import numpy as np
-import time
+import cv2
 
-MODEL_PATH = "../models/yolov5nu.onnx"
-IMG_SIZE = 320
+# ---------------------------------------------------------------------------
+# CONFIG — adjust these for your setup
+# ---------------------------------------------------------------------------
 
-net = cv2.dnn.readNetFromONNX(MODEL_PATH)
-net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
-net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
+MODEL_PATH = "../models/yolov8n.onnx"
 
-def xywh2xyxy(x):
-    y = np.copy(x)
-    y[:, 0] = x[:, 0] - x[:, 2] / 2
-    y[:, 1] = x[:, 1] - x[:, 3] / 2
-    y[:, 2] = x[:, 0] + x[:, 2] / 2
-    y[:, 3] = x[:, 1] + x[:, 3] / 2
-    return y
+# List available DirectShow devices first if you don't know the exact name:
+#   ffmpeg -list_devices true -f dshow -i dummy
+# Then paste the exact camera name here.
+DEVICE_NAME = "USB2.0 HD UVC WebCam"
 
-def nms(boxes, scores, iou_threshold=0.45):
-    idxs = cv2.dnn.NMSBoxes(
-        bboxes=boxes.tolist(),
-        scores=scores.tolist(),
-        score_threshold=0.25,
-        nms_threshold=iou_threshold
+CAPTURE_WIDTH = 320
+CAPTURE_HEIGHT = 240
+CAPTURE_FPS = 30
+
+# Your real relay command doesn't set -q:v explicitly, so FFmpeg uses its
+# default MJPEG quality. Leave this as None to match production exactly.
+# Set it to a string like "20" if you want to experiment with compression
+# levels later.
+FFMPEG_QSCALE = None
+
+FRAME_SIZE_HINT = CAPTURE_WIDTH * CAPTURE_HEIGHT * 3  # generous read chunk
+
+# ---------------------------------------------------------------------------
+
+
+def letterbox_to_square(img, size=320, pad_color=(114, 114, 114)):
+    """Resize keeping aspect ratio, then pad to a size x size square.
+    Avoids the proportion distortion of a plain stretch resize."""
+    h, w = img.shape[:2]
+    scale = size / max(h, w)
+    new_w, new_h = int(round(w * scale)), int(round(h * scale))
+    resized = cv2.resize(img, (new_w, new_h))
+
+    canvas = np.full((size, size, 3), pad_color, dtype=np.uint8)
+    top = (size - new_h) // 2
+    left = (size - new_w) // 2
+    canvas[top:top + new_h, left:left + new_w] = resized
+    return canvas
+
+
+def run_inference(net, img320):
+    blob = cv2.dnn.blobFromImage(img320, 1 / 255.0, (320, 320), swapRB=True)
+    net.setInput(blob)
+    out = net.forward()[0].transpose(1, 0)  # (2100, 84)
+
+    scores = out[:, 4:]
+    person_scores = scores[:, 0]
+    return person_scores.max(), scores.max()
+
+
+def start_ffmpeg():
+    cmd = [
+        "ffmpeg",
+        "-f", "dshow",
+        "-video_size", f"{CAPTURE_WIDTH}x{CAPTURE_HEIGHT}",
+        "-i", f"video={DEVICE_NAME}",
+        "-vcodec", "mjpeg",
+    ]
+    if FFMPEG_QSCALE is not None:
+        cmd += ["-q:v", FFMPEG_QSCALE]
+    cmd += [
+        "-f", "mjpeg",
+        "-",  # write MJPEG stream to stdout instead of tcp://...
+    ]
+    return subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=10 ** 8,
     )
 
-    if idxs is None or len(idxs) == 0:
-        return []
 
-    if isinstance(idxs[0], (int, np.integer)):
-        return idxs
+def read_jpeg_frame(pipe, buf):
+    """Accumulate bytes from the pipe until we have one full JPEG frame
+    (from SOI 0xFFD8 to EOI 0xFFD9). Returns (frame_bytes, remaining_buf)
+    or (None, buf) if more data is needed."""
+    while True:
+        soi = buf.find(b"\xff\xd8")
+        if soi == -1:
+            chunk = pipe.read(FRAME_SIZE_HINT)
+            if not chunk:
+                return None, buf
+            buf += chunk
+            continue
 
-    return [i[0] for i in idxs]
+        eoi = buf.find(b"\xff\xd9", soi + 2)
+        if eoi == -1:
+            chunk = pipe.read(FRAME_SIZE_HINT)
+            if not chunk:
+                return None, buf
+            buf += chunk
+            continue
 
-cap = cv2.VideoCapture(0)
+        frame = buf[soi:eoi + 2]
+        rest = buf[eoi + 2:]
+        return frame, rest
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
 
-    h, w = frame.shape[:2]
+def main():
+    net = cv2.dnn.readNetFromONNX(MODEL_PATH)
+    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_OPENCV)
+    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CPU)
 
-    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (IMG_SIZE, IMG_SIZE), swapRB=True)
-    net.setInput(blob)
+    proc = start_ffmpeg()
+    buf = b""
 
-    out = net.forward()[0]  # (84, 2100)
-    out = out.transpose(1, 0)  # (2100, 84)
+    print("Reading MJPEG from FFmpeg. Press ESC to quit.")
 
-    boxes = out[:, :4]
-    scores = out[:, 4:]
-    class_ids = np.argmax(scores, axis=1)
-    confidences = np.max(scores, axis=1)
+    try:
+        while True:
+            frame_bytes, buf = read_jpeg_frame(proc.stdout, buf)
+            if frame_bytes is None:
+                print("FFmpeg pipe closed / no more data.")
+                break
 
-    mask = confidences > 0.25
-    boxes = boxes[mask]
-    confidences = confidences[mask]
-    class_ids = class_ids[mask]
+            arr = np.frombuffer(frame_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if frame is None:
+                continue  # corrupt frame, skip
 
-    if len(boxes) == 0:
-        cv2.imshow("YOLOv8 ONNX Test", frame)
-        if cv2.waitKey(1) == 27:
-            break
-        continue
+            img320 = letterbox_to_square(frame, 320)
+            person_score, any_score = run_inference(net, img320)
 
-    boxes_xyxy = xywh2xyxy(boxes)
+            display = cv2.resize(img320, (480, 480), interpolation=cv2.INTER_NEAREST)
+            lines = [
+                f"jpeg bytes: {len(frame_bytes)}",
+                f"person score: {person_score:.4f}",
+                f"max any score: {any_score:.4f}",
+            ]
+            for i, line in enumerate(lines):
+                cv2.putText(
+                    display, line, (10, 25 + i * 25),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                )
 
-    scale_x = w / IMG_SIZE
-    scale_y = h / IMG_SIZE
-    boxes_xyxy[:, [0, 2]] *= scale_x
-    boxes_xyxy[:, [1, 3]] *= scale_y
+            cv2.imshow("FFmpeg -> letterbox 320x320 -> YOLO", display)
+            if cv2.waitKey(1) & 0xFF == 27:
+                break
+    finally:
+        proc.terminate()
+        cv2.destroyAllWindows()
 
-    keep = nms(boxes_xyxy, confidences)
 
-    for i in keep:
-        x1, y1, x2, y2 = boxes_xyxy[i].astype(int)
-        conf = confidences[i]
-        cls = class_ids[i]
-
-        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        cv2.putText(frame, f"{cls}:{conf:.2f}", (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
-
-    cv2.imshow("YOLOv8 ONNX Test", frame)
-    if cv2.waitKey(1) == 27:
-        break
-
-cap.release()
-cv2.destroyAllWindows()
+if __name__ == "__main__":
+    main()
