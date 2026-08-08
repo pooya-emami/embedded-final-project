@@ -274,9 +274,13 @@ void *frame_updater(void *arg) {
     struct timespec next_time;
     clock_gettime(CLOCK_MONOTONIC, &next_time);
 
-static int frame_count = 0;
-static struct timespec last_report;
-static int timing_initialized = 0;
+    static int frame_count = 0;
+    static struct timespec last_report;
+    static int timing_initialized = 0;
+
+    while (running) {
+        unsigned char buf[BUFFER_SIZE];
+        size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
 
 if (len > 0 && len >= 2 &&
     buf[0] == 0xFF && buf[1] == 0xD8) {
