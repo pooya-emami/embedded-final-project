@@ -97,7 +97,6 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         .GetTensorTypeAndShapeInfo()
         .GetShape();
 
-    // For shape [1, 84, 2100]
     int channels = shape[1];  // 84
     int num_predictions = shape[2];  // 2100
 
@@ -109,38 +108,50 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     };
     std::vector<Detection> detections;
 
-    // Process each prediction (transpose from [84, 2100] to [2100, 84])
+    // Helper function for sigmoid
+    auto sigmoid = [](float x) { return 1.0f / (1.0f + exp(-x)); };
+
+    // Process each prediction
     for (int i = 0; i < num_predictions; i++) {
-        // Box coordinates (indices 0-3)
+        // Box coordinates (no sigmoid needed for coordinates)
         float x = out[0 * num_predictions + i];
         float y = out[1 * num_predictions + i];
         float w = out[2 * num_predictions + i];
         float h = out[3 * num_predictions + i];
         
-        // Find best class score (indices 4-83 are class scores)
+        // Find best class score with sigmoid activation
         float best_score = 0;
         int best_class = -1;
         for (int c = 4; c < channels; c++) {
-            float s = out[c * num_predictions + i];
+            // Apply sigmoid to class scores (like Python's DNN does)
+            float s = sigmoid(out[c * num_predictions + i]);
             if (s > best_score) {
                 best_score = s;
-                best_class = c - 4;  // Class index starts at 0
+                best_class = c - 4;
             }
         }
         
-        // Skip low confidence
+        // Lower threshold to match Python's behavior
         if (best_score < 0.25f) continue;
         
         // Only person class (class 0)
         if (best_class != 0) continue;
         
-        // Convert center format to corner format and scale to image size
+        // Scale coordinates from 0-320 to image size
         float x1 = (x - w/2) * img320.cols / 320.0f;
         float y1 = (y - h/2) * img320.rows / 320.0f;
         float x2 = (x + w/2) * img320.cols / 320.0f;
         float y2 = (y + h/2) * img320.rows / 320.0f;
         
-        detections.push_back({x1, y1, x2, y2, best_score, best_class});
+        // Clamp to image bounds
+        x1 = std::max(0.0f, std::min(x1, (float)img320.cols));
+        y1 = std::max(0.0f, std::min(y1, (float)img320.rows));
+        x2 = std::max(0.0f, std::min(x2, (float)img320.cols));
+        y2 = std::max(0.0f, std::min(y2, (float)img320.rows));
+        
+        if (x2 > x1 && y2 > y1) {
+            detections.push_back({x1, y1, x2, y2, best_score, best_class});
+        }
     }
 
     // Apply NMS
