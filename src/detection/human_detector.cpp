@@ -97,26 +97,9 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         .GetTensorTypeAndShapeInfo()
         .GetShape();
 
-    printf("Output shape: [");
-    for (size_t i = 0; i < shape.size(); i++) {
-        printf("%ld ", shape[i]);
-    }
-    printf("]\n");
-
+    // For shape [1, 84, 2100]
     int channels = shape[1];  // 84
     int num_predictions = shape[2];  // 2100
-
-    // DEBUG: Print first few raw values
-    printf("\n=== RAW OUTPUT DEBUG ===\n");
-    printf("First 5 predictions (first 10 values each):\n");
-    for (int i = 0; i < std::min(5, num_predictions); i++) {
-        printf("Pred %d: ", i);
-        for (int c = 0; c < std::min(10, channels); c++) {
-            printf("%.4f ", out[c * num_predictions + i]);
-        }
-        printf("\n");
-    }
-    printf("========================\n\n");
 
     // Store all detections
     struct Detection {
@@ -126,49 +109,32 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     };
     std::vector<Detection> detections;
 
-    int total_detections = 0;
-    int obj_threshold_passed = 0;
-    int class0_passed = 0;
-    int final_passed = 0;
-
-    // Process each prediction
+    // Process each prediction (transpose from [84, 2100] to [2100, 84])
     for (int i = 0; i < num_predictions; i++) {
+        // Box coordinates (indices 0-3)
         float x = out[0 * num_predictions + i];
         float y = out[1 * num_predictions + i];
         float w = out[2 * num_predictions + i];
         float h = out[3 * num_predictions + i];
-        float obj = out[4 * num_predictions + i];
         
-        total_detections++;
-        
-        if (obj < 0.25f) continue;
-        obj_threshold_passed++;
-        
-        // Find best class
+        // Find best class score (indices 4-83 are class scores)
         float best_score = 0;
         int best_class = -1;
-        for (int c = 5; c < channels; c++) {
+        for (int c = 4; c < channels; c++) {
             float s = out[c * num_predictions + i];
             if (s > best_score) {
                 best_score = s;
-                best_class = c - 5;
+                best_class = c - 4;  // Class index starts at 0
             }
         }
         
-        // DEBUG: Print some interesting detections
-        if (i < 10 || obj > 0.5f || best_score > 0.5f) {
-            printf("Pred %d: obj=%.4f, best_class=%d, best_score=%.4f, x=%.3f, y=%.3f, w=%.3f, h=%.3f\n", 
-                   i, obj, best_class, best_score, x, y, w, h);
-        }
+        // Skip low confidence
+        if (best_score < 0.25f) continue;
         
         // Only person class (class 0)
         if (best_class != 0) continue;
-        class0_passed++;
         
-        if (best_score < 0.25f) continue;
-        final_passed++;
-        
-        // Convert center format to corner format and scale
+        // Convert center format to corner format and scale to image size
         float x1 = (x - w/2) * img320.cols / 320.0f;
         float y1 = (y - h/2) * img320.rows / 320.0f;
         float x2 = (x + w/2) * img320.cols / 320.0f;
@@ -176,13 +142,6 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         
         detections.push_back({x1, y1, x2, y2, best_score, best_class});
     }
-
-    printf("\n=== DETECTION STATS ===\n");
-    printf("Total predictions: %d\n", total_detections);
-    printf("Passed obj threshold (0.25): %d\n", obj_threshold_passed);
-    printf("Passed class 0 filter: %d\n", class0_passed);
-    printf("Final detections after score threshold: %d\n", final_passed);
-    printf("========================\n\n");
 
     // Apply NMS
     if (!detections.empty()) {
@@ -207,7 +166,6 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         }
     }
 
-    printf("Final boxes after NMS: %zu\n", boxes.size());
     return boxes;
 }
 
