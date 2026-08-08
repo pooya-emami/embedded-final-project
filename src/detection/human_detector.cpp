@@ -1,7 +1,7 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
-#include <opencv2/dnn.hpp>
+#include <onnxruntime_cxx_api.h>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -14,18 +14,29 @@
 #include "human_detector.hpp"
 
 static char model_path[256] = {0};
-static cv::dnn::Net yolo;
+static Ort::Env ort_env(ORT_LOGGING_LEVEL_WARNING, "YOLO");
+static Ort::Session* yolo_session = nullptr;
 static bool yolo_loaded = false;
 
 static void load_yolo()
 {
-    if (yolo_loaded) return;
+    if (yolo_loaded)
+        return;
 
-    snprintf(model_path, sizeof(model_path), "%s%s", MODEL_BASE_PATH, YOLO_MODEL_FILE);
+    snprintf(model_path, sizeof(model_path),
+             "%s%s", MODEL_BASE_PATH, YOLO_MODEL_FILE);
 
-    yolo = cv::dnn::readNetFromONNX(model_path);
-    yolo.setPreferableBackend(cv::dnn::DNN_BACKEND_OPENCV);
-    yolo.setPreferableTarget(cv::dnn::DNN_TARGET_CPU);
+    Ort::SessionOptions session_options;
+    session_options.SetGraphOptimizationLevel(
+        GraphOptimizationLevel::ORT_ENABLE_ALL
+    );
+
+    yolo_session = new Ort::Session(
+        ort_env,
+        model_path,
+        session_options
+    );
+
     yolo_loaded = true;
 }
 
@@ -38,18 +49,95 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     if (!yolo_loaded)
         return boxes;
 
+
     cv::Mat blob = cv::dnn::blobFromImage(
         img320,
         1.0 / 255.0,
-        cv::Size(320, 320),
+        cv::Size(320,320),
         cv::Scalar(),
         true,
         false
     );
 
-    yolo.setInput(blob);
 
-    cv::Mat output = yolo.forward();
+    std::array<int64_t,4> input_shape = {
+        1,3,320,320
+    };
+
+
+    size_t input_tensor_size = 1*3*320*320;
+
+
+    Ort::MemoryInfo memory_info =
+        Ort::MemoryInfo::CreateCpu(
+            OrtArenaAllocator,
+            OrtMemTypeDefault
+        );
+
+
+    Ort::Value input_tensor =
+        Ort::Value::CreateTensor<float>(
+            memory_info,
+            (float*)blob.data,
+            input_tensor_size,
+            input_shape.data(),
+            input_shape.size()
+        );
+
+
+    Ort::AllocatorWithDefaultOptions allocator;
+
+
+    auto input_name =
+        yolo_session->GetInputNameAllocated(
+            0,
+            allocator
+        );
+
+    auto output_name =
+        yolo_session->GetOutputNameAllocated(
+            0,
+            allocator
+        );
+
+
+    const char* input_names[] = {
+        input_name.get()
+    };
+
+    const char* output_names[] = {
+        output_name.get()
+    };
+
+
+    auto output_tensors =
+        yolo_session->Run(
+            Ort::RunOptions{nullptr},
+            input_names,
+            &input_tensor,
+            1,
+            output_names,
+            1
+        );
+
+
+    float* output =
+        output_tensors[0].GetTensorMutableData<float>();
+
+
+    auto output_shape =
+        output_tensors[0]
+        .GetTensorTypeAndShapeInfo()
+        .GetShape();
+
+
+    std::cout << "YOLO output: ";
+
+    for(auto x: output_shape)
+        std::cout << x << " ";
+
+    std::cout << std::endl;
+
 
     return boxes;
 }

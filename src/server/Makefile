@@ -2,7 +2,7 @@ CC = gcc
 CXX = g++
 CFLAGS = -Wall -Wextra -O2 -std=gnu11 -I. -I../common -I../detection
 CXXFLAGS = -Wall -Wextra -O2 -std=c++11 -I. -I../common -I../detection -I/usr/include/opencv4
-LDFLAGS = -lpthread -lrt -lssl -lcrypto -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_dnn
+LDFLAGS = -lpthread -lrt -lssl -lcrypto -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_dnn -lonnxruntime
 
 SRC = server.c ../common/shared_frame.c ../detection/human_detector.cpp
 OBJ = server.o shared_frame.o human_detector.o
