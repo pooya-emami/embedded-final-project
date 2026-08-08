@@ -274,38 +274,52 @@ void *frame_updater(void *arg) {
     struct timespec next_time;
     clock_gettime(CLOCK_MONOTONIC, &next_time);
 
-    static int frame_count = 0;
+static int frame_count = 0;
+static struct timespec last_report;
+static int timing_initialized = 0;
 
-    while (running) {
-        unsigned char buf[BUFFER_SIZE];
-        size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
+...
 
-        if (len > 0 && len >= 2 &&
-            buf[0] == 0xFF && buf[1] == 0xD8) {
+if (len > 0 && len >= 2 &&
+    buf[0] == 0xFF && buf[1] == 0xD8) {
 
-            frame_count++;
+    frame_count++;
 
-            // Print JPEG size every 10 frames
-            if (frame_count % 10 == 0) {
-                printf("[FRAME] #%d  JPEG size = %zu bytes (%.2f KB)\n",
-                       frame_count,
-                       len,
-                       len / 1024.0);
-                fflush(stdout);
-            }
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
 
-            // Pass through raw JPEG frame directly
-            pthread_mutex_lock(&frame_mutex);
+    if (!timing_initialized) {
+        last_report = now;
+        timing_initialized = 1;
+    }
 
-            size_t copy_len = len;
-            if (copy_len > BUFFER_SIZE)
-                copy_len = BUFFER_SIZE;
+    double elapsed =
+        (now.tv_sec - last_report.tv_sec) +
+        (now.tv_nsec - last_report.tv_nsec) / 1e9;
 
-            memcpy(current_frame, buf, copy_len);
-            current_len = copy_len;
+    if (elapsed >= 2.0) {
+        printf("[FRAME] %d frames in %.2f sec = %.2f FPS, JPEG=%zu bytes\n",
+               frame_count,
+               elapsed,
+               frame_count / elapsed,
+               len);
 
-            pthread_mutex_unlock(&frame_mutex);
-        }
+        frame_count = 0;
+        last_report = now;
+        fflush(stdout);
+    }
+
+    pthread_mutex_lock(&frame_mutex);
+
+    size_t copy_len = len;
+    if (copy_len > BUFFER_SIZE)
+        copy_len = BUFFER_SIZE;
+
+    memcpy(current_frame, buf, copy_len);
+    current_len = copy_len;
+
+    pthread_mutex_unlock(&frame_mutex);
+}
 
         long interval = current_interval_ms;
 
