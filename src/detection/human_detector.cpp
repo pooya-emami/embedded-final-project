@@ -80,33 +80,6 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 
     Ort::AllocatorWithDefaultOptions allocator;
 
-    // Print model input/output info
-    printf("\n=== Model Input/Output Info ===\n");
-    size_t num_inputs = yolo_session->GetInputCount();
-    size_t num_outputs = yolo_session->GetOutputCount();
-    printf("Inputs: %zu, Outputs: %zu\n", num_inputs, num_outputs);
-    
-    for (size_t i = 0; i < num_inputs; i++) {
-        auto name = yolo_session->GetInputNameAllocated(i, allocator);
-        auto info = yolo_session->GetInputTypeInfo(i);
-        auto shape_info = info.GetTensorTypeAndShapeInfo();
-        auto shape = shape_info.GetShape();
-        printf("Input %zu: %s, shape: [", i, name.get());
-        for (auto dim : shape) printf("%ld ", dim);
-        printf("]\n");
-    }
-    
-    for (size_t i = 0; i < num_outputs; i++) {
-        auto name = yolo_session->GetOutputNameAllocated(i, allocator);
-        auto info = yolo_session->GetOutputTypeInfo(i);
-        auto shape_info = info.GetTensorTypeAndShapeInfo();
-        auto shape = shape_info.GetShape();
-        printf("Output %zu: %s, shape: [", i, name.get());
-        for (auto dim : shape) printf("%ld ", dim);
-        printf("]\n");
-    }
-    printf("===============================\n");
-
     auto input_name = yolo_session->GetInputNameAllocated(0, allocator);
     auto output_name = yolo_session->GetOutputNameAllocated(0, allocator);
 
@@ -124,71 +97,12 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         .GetTensorTypeAndShapeInfo()
         .GetShape();
 
-    printf("Output shape: [");
-    for (size_t i = 0; i < shape.size(); i++) {
-        printf("%ld ", shape[i]);
-    }
-    printf("]\n");
-
     int channels = shape[1];  // 84
     int num_predictions = shape[2];  // 2100
 
-    // DEBUG: Print ALL values for first prediction
-    printf("\n=== First prediction ALL 84 values ===\n");
-    for (int c = 0; c < channels; c++) {
-        float val = out[c * num_predictions + 0];
-        printf("idx %d: %.10f ", c, val);
-        if ((c+1) % 8 == 0) printf("\n");
-    }
-    printf("\n");
+    // Sigmoid function
+    auto sigmoid = [](float x) { return 1.0f / (1.0f + expf(-x)); };
 
-    // DEBUG: Print first 10 predictions, first 10 values
-    printf("\n=== First 10 predictions (first 10 values) ===\n");
-    for (int i = 0; i < 10 && i < num_predictions; i++) {
-        printf("Pred %d: ", i);
-        for (int c = 0; c < 10 && c < channels; c++) {
-            printf("%.10f ", out[c * num_predictions + i]);
-        }
-        printf("\n");
-    }
-
-    // DEBUG: Check if any value is > 0.01
-    int values_above_001 = 0;
-    printf("\n=== Values > 0.01 ===\n");
-    for (int i = 0; i < std::min(100, num_predictions); i++) {
-        for (int c = 0; c < channels; c++) {
-            float val = out[c * num_predictions + i];
-            if (val > 0.01f) {
-                values_above_001++;
-                if (values_above_001 <= 20) {
-                    printf("out[%d*%d+%d] = %.10f\n", c, num_predictions, i, val);
-                }
-            }
-        }
-    }
-    printf("Total values > 0.01 in first 100 predictions: %d\n", values_above_001);
-
-    // DEBUG: Check values around the middle of the array
-    printf("\n=== Values at position 1000 ===\n");
-    for (int c = 0; c < 10; c++) {
-        printf("out[%d*%d+%d] = %.10f\n", c, num_predictions, 1000, out[c * num_predictions + 1000]);
-    }
-
-    // Try to detect if output needs sigmoid or softmax
-    // Check if values are raw logits (could be negative)
-    float max_val = -1000, min_val = 1000;
-    for (int i = 0; i < std::min(100, num_predictions); i++) {
-        for (int c = 0; c < channels; c++) {
-            float val = out[c * num_predictions + i];
-            if (val > max_val) max_val = val;
-            if (val < min_val) min_val = val;
-        }
-    }
-    printf("\n=== Value Range ===\n");
-    printf("Min value: %.10f, Max value: %.10f\n", min_val, max_val);
-    printf("If values are negative or large (>10), they need sigmoid/softmax\n");
-
-    // Store all detections
     struct Detection {
         float x1, y1, x2, y2;
         float confidence;
@@ -196,41 +110,26 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     };
     std::vector<Detection> detections;
 
-    // Try both with and without sigmoid
-    bool use_sigmoid = false;
-    
-    // If max value is > 10 or min value is negative, we probably need sigmoid
-    if (max_val > 10.0f || min_val < -10.0f) {
-        use_sigmoid = true;
-        printf("\n=== Using sigmoid activation (values look like logits) ===\n");
-    } else if (max_val < 0.1f && min_val >= 0) {
-        printf("\n=== Values are already probabilities (0-1 range) ===\n");
-    }
-
-    auto sigmoid = [](float x) { return 1.0f / (1.0f + exp(-x)); };
-
-    // Process each prediction
+    // Process each prediction - box coords are raw, class scores need sigmoid
     for (int i = 0; i < num_predictions; i++) {
+        // Box coordinates - these are already in the correct range (0-320)
         float x = out[0 * num_predictions + i];
         float y = out[1 * num_predictions + i];
         float w = out[2 * num_predictions + i];
         float h = out[3 * num_predictions + i];
         
-        // Find best class score
+        // Find best class score - apply sigmoid to get probabilities
         float best_score = 0;
         int best_class = -1;
         for (int c = 4; c < channels; c++) {
-            float s = out[c * num_predictions + i];
-            if (use_sigmoid) {
-                s = sigmoid(s);
-            }
+            float s = sigmoid(out[c * num_predictions + i]);
             if (s > best_score) {
                 best_score = s;
                 best_class = c - 4;
             }
         }
         
-        // Apply threshold
+        // Skip low confidence
         if (best_score < 0.25f) continue;
         
         // Only person class (class 0)
@@ -242,17 +141,16 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         float x2 = (x + w/2) * img320.cols / 320.0f;
         float y2 = (y + h/2) * img320.rows / 320.0f;
         
-        detections.push_back({x1, y1, x2, y2, best_score, best_class});
+        // Clamp to valid range
+        x1 = std::max(0.0f, std::min(x1, (float)img320.cols));
+        y1 = std::max(0.0f, std::min(y1, (float)img320.rows));
+        x2 = std::max(0.0f, std::min(x2, (float)img320.cols));
+        y2 = std::max(0.0f, std::min(y2, (float)img320.rows));
         
-        // Debug: Print first few detections
-        if (detections.size() <= 10) {
-            printf("Detection %zu: class=%d, score=%.4f, box=(%.1f,%.1f)-(%.1f,%.1f)\n", 
-                   detections.size(), best_class, best_score, x1, y1, x2, y2);
+        if (x2 > x1 && y2 > y1) {
+            detections.push_back({x1, y1, x2, y2, best_score, best_class});
         }
     }
-
-    printf("\n=== Detection Summary ===\n");
-    printf("Detections before NMS: %zu\n", detections.size());
 
     // Apply NMS
     if (!detections.empty()) {
@@ -272,16 +170,11 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         std::vector<int> indices;
         cv::dnn::NMSBoxes(rects, scores, 0.25f, 0.45f, indices);
         
-        printf("Indices after NMS: %zu\n", indices.size());
-        
         for (int idx : indices) {
             boxes.push_back(rects[idx]);
         }
     }
 
-    printf("Final boxes: %zu\n", boxes.size());
-    printf("========================\n\n");
-    
     return boxes;
 }
 
