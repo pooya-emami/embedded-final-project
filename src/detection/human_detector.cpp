@@ -1,7 +1,10 @@
+#include <onnxruntime_cxx_api.h>
+
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
-#include <onnxruntime_cxx_api.h>
+#include <opencv2/dnn.hpp>
+
 #include <iostream>
 #include <vector>
 #include <string>
@@ -49,37 +52,16 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     if (!yolo_loaded)
         return boxes;
 
-    cv::Mat rgb;
-    cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
-    rgb.convertTo(rgb, CV_32F, 1.0 / 255.0);
+    cv::Mat blob = cv::dnn::blobFromImage(
+        img320,
+        1.0 / 255.0,
+        cv::Size(320,320),
+        cv::Scalar(),
+        true,
+        false
+    );
 
-    std::vector<float> input_tensor_values(1 * 3 * 320 * 320);
-
-    for (int y = 0; y < 320; y++)
-    {
-        for (int x = 0; x < 320; x++)
-        {
-            cv::Vec3f pixel = rgb.at<cv::Vec3f>(y, x);
-
-            input_tensor_values[
-                0 * 320 * 320 + y * 320 + x
-            ] = pixel[0];
-
-            input_tensor_values[
-                1 * 320 * 320 + y * 320 + x
-            ] = pixel[1];
-
-            input_tensor_values[
-                2 * 320 * 320 + y * 320 + x
-            ] = pixel[2];
-        }
-    }
-
-    std::array<int64_t, 4> input_shape = {
-        1, 3, 320, 320
-    };
-
-    size_t input_tensor_size = 1 * 3 * 320 * 320;
+    std::array<int64_t,4> input_shape = {1,3,320,320};
 
     Ort::MemoryInfo memory_info =
         Ort::MemoryInfo::CreateCpu(
@@ -90,8 +72,8 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     Ort::Value input_tensor =
         Ort::Value::CreateTensor<float>(
             memory_info,
-            input_tensor_values.data(),
-            input_tensor_size,
+            (float*)blob.data,
+            1 * 3 * 320 * 320,
             input_shape.data(),
             input_shape.size()
         );
@@ -99,16 +81,10 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     Ort::AllocatorWithDefaultOptions allocator;
 
     auto input_name =
-        yolo_session->GetInputNameAllocated(
-            0,
-            allocator
-        );
+        yolo_session->GetInputNameAllocated(0, allocator);
 
     auto output_name =
-        yolo_session->GetOutputNameAllocated(
-            0,
-            allocator
-        );
+        yolo_session->GetOutputNameAllocated(0, allocator);
 
     const char* input_names[] = {
         input_name.get()
@@ -128,17 +104,81 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
             1
         );
 
-    auto output_shape =
+    float* output =
+        output_tensors[0].GetTensorMutableData<float>();
+
+    auto shape =
         output_tensors[0]
-            .GetTensorTypeAndShapeInfo()
-            .GetShape();
+        .GetTensorTypeAndShapeInfo()
+        .GetShape();
 
-    std::cout << "YOLO output: ";
+    int num_predictions = 2100;
 
-    for (auto x : output_shape)
-        std::cout << x << " ";
+    cv::Mat detections(
+        84,
+        num_predictions,
+        CV_32F,
+        output
+    );
 
-    std::cout << std::endl;
+    cv::Mat transposed;
+    cv::transpose(detections, transposed);
+
+    std::vector<cv::Rect> raw_boxes;
+    std::vector<float> scores;
+
+    for(int i=0;i<num_predictions;i++)
+    {
+        float x = transposed.at<float>(i,0);
+        float y = transposed.at<float>(i,1);
+        float w = transposed.at<float>(i,2);
+        float h = transposed.at<float>(i,3);
+
+        float best_score = 0;
+        int best_class = -1;
+
+        for(int c=0;c<80;c++)
+        {
+            float score =
+                transposed.at<float>(i,4+c);
+
+            if(score > best_score)
+            {
+                best_score = score;
+                best_class = c;
+            }
+        }
+
+        if(best_class == 0 && best_score > 0.25f)
+        {
+            int x1 = (x - w/2) * 320;
+            int y1 = (y - h/2) * 320;
+            int width = w * 320;
+            int height = h * 320;
+
+            raw_boxes.emplace_back(
+                x1,
+                y1,
+                width,
+                height
+            );
+
+            scores.push_back(best_score);
+        }
+    }
+
+    std::vector<int> keep;
+
+    cv::dnn::NMSBoxes(
+        raw_boxes,
+        scores,
+        0.25f,
+        0.45f,
+        keep
+    );
+
+    for(auto i: keep)
+        boxes.push_back(raw_boxes[i]);
 
     return boxes;
 }
