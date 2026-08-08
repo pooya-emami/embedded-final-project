@@ -27,6 +27,15 @@
         img {
             border: 3px solid #333;
             border-radius: 5px;
+            display: block;
+            margin-bottom: 10px;
+            /* Add a subtle loading indicator */
+            background: #ddd;
+        }
+        .status {
+            font-size: 0.9em;
+            color: #666;
+            margin: 5px 0;
         }
     </style>
 </head>
@@ -35,13 +44,15 @@
 
 <h1>Embedded Security System – Pooya Emami</h1>
 
-<!-- Live MJPEG stream -->
-<img src="/stream" width="480" alt="Live Stream">
+<!-- Live stream image -->
+<img id="stream" src="/stream" width="480" alt="Live Stream">
+<div class="status" id="streamStatus">Stream: Loading...</div>
 
 <h3>Telemetry</h3>
 <div id="tele">Loading...</div>
 
 <script>
+// Telemetry update
 function updateTelemetry() {
     fetch('/telemetry')
         .then(response => response.json())
@@ -56,10 +67,34 @@ function updateTelemetry() {
         });
 }
 
+// Stream update - polls the image endpoint with cache-buster
+function updateStream() {
+    const img = document.getElementById('stream');
+    const status = document.getElementById('streamStatus');
+    
+    // Add timestamp to force fresh request (bypass browser cache)
+    img.src = '/stream?t=' + Date.now();
+    status.textContent = 'Stream: Updating...';
+    
+    // Optional: track when image actually loads
+    img.onload = function() {
+        status.textContent = 'Stream: Live';
+    };
+    img.onerror = function() {
+        status.textContent = 'Stream: Error loading frame';
+    };
+}
+
+// Start both polling loops
+// Telemetry: every 2 seconds (matches your server's telemetry update rate)
 setInterval(updateTelemetry, 2000);
 updateTelemetry();
+
+// Stream: every 200ms (adjust to match your FRAME_INTERVAL_MS)
+// Set to match your actual frame rate, not faster than server can respond
+setInterval(updateStream, 200);
+updateStream(); // Initial load
 </script>
 
 </body>
 </html>
- 
