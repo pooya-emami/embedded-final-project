@@ -50,91 +50,120 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 {
     load_yolo();
 
-    std::vector<cv::Rect> boxes;
+    std::vector<cv::Rect> final_boxes;
     if (!yolo_loaded)
-        return boxes;
+        return final_boxes;
 
-    // Preprocess
+    // --- Preprocess ---
     cv::Mat rgb;
     cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
-    rgb.convertTo(rgb, CV_32F, 1.0f/255.0f);
+    rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f);
 
     std::vector<float> blob(1 * 3 * 320 * 320);
-    for(int y=0; y<320; y++)
-        for(int x=0; x<320; x++) {
-            cv::Vec3f p = rgb.at<cv::Vec3f>(y,x);
-            blob[y*320 + x]                 = p[0];
-            blob[320*320 + y*320 + x]      = p[1];
-            blob[2*320*320 + y*320 + x]    = p[2];
-        }
 
-    std::array<int64_t,4> shape = {1,3,320,320};
-    Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
+    for (int y = 0; y < 320; y++) {
+        for (int x = 0; x < 320; x++) {
+            cv::Vec3f p = rgb.at<cv::Vec3f>(y, x);
+
+            blob[y * 320 + x] = p[0];
+            blob[320 * 320 + y * 320 + x] = p[1];
+            blob[2 * 320 * 320 + y * 320 + x] = p[2];
+        }
+    }
+
+    std::array<int64_t, 4> input_shape = {1, 3, 320, 320};
+
+    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
+        OrtArenaAllocator, OrtMemTypeDefault);
 
     Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        mem, blob.data(), blob.size(), shape.data(), shape.size()
+        mem_info,
+        blob.data(),
+        blob.size(),
+        input_shape.data(),
+        input_shape.size()
     );
 
     Ort::AllocatorWithDefaultOptions allocator;
-    auto in_name = yolo_session->GetInputNameAllocated(0, allocator);
-    auto out_name = yolo_session->GetOutputNameAllocated(0, allocator);
 
-    const char* input_names[] = {in_name.get()};
-    const char* output_names[] = {out_name.get()};
+    auto input_name = yolo_session->GetInputNameAllocated(0, allocator);
+    auto output_name = yolo_session->GetOutputNameAllocated(0, allocator);
 
-    auto outs = yolo_session->Run(
+    const char* input_names[] = {input_name.get()};
+    const char* output_names[] = {output_name.get()};
+
+    auto output_tensors = yolo_session->Run(
         Ort::RunOptions{nullptr},
-        input_names, &input_tensor, 1,
-        output_names, 1
+        input_names,
+        &input_tensor,
+        1,
+        output_names,
+        1
     );
 
-    float* out = outs[0].GetTensorMutableData<float>();
-    auto out_shape = outs[0].GetTensorTypeAndShapeInfo().GetShape();
+    float* out = output_tensors[0].GetTensorMutableData<float>();
+    auto shape = output_tensors[0]
+        .GetTensorTypeAndShapeInfo()
+        .GetShape();
 
-    int C = out_shape[1];   // 84
-    int N = out_shape[2];   // 2100
+    int C = shape[1];   // 84
+    int N = shape[2];   // 2100
 
-    for(int i=0; i<N; i++) {
+    std::vector<cv::Rect> raw_boxes;
+    std::vector<float> raw_scores;
 
-        float x = out[0*N + i];
-        float y = out[1*N + i];
-        float w = out[2*N + i];
-        float h = out[3*N + i];
+    // --- Decode YOLOv5-u unified output ---
+    for (int i = 0; i < N; i++) {
 
-        float obj = sigmoid(out[4*N + i]);
-        if(obj < 0.25f) continue;
+        float x = out[0 * N + i];
+        float y = out[1 * N + i];
+        float w = out[2 * N + i];
+        float h = out[3 * N + i];
+
+        float obj = sigmoid(out[4 * N + i]);
+        if (obj < 0.25f) continue;
 
         float best_score = 0;
         int best_class = -1;
 
-        for(int c=5; c<C; c++) {
-            float s = sigmoid(out[c*N + i]);
-            if(s > best_score) {
+        for (int c = 5; c < C; c++) {
+            float s = sigmoid(out[c * N + i]);
+            if (s > best_score) {
                 best_score = s;
                 best_class = c - 5;
             }
         }
 
-        if(best_class != 0) continue; // only person
+        if (best_class != 0) continue; // only person class
 
         float conf = obj * best_score;
-        if(conf < 0.25f) continue;
+        if (conf < 0.25f) continue;
 
-        // xywh → xyxy (already absolute pixels)
-        float x1 = x - w/2;
-        float y1 = y - h/2;
-        float x2 = x + w/2;
-        float y2 = y + h/2;
+        // xywh → xyxy (absolute pixel coordinates)
+        float x1 = x - w / 2;
+        float y1 = y - h / 2;
+        float x2 = x + w / 2;
+        float y2 = y + h / 2;
 
-        boxes.emplace_back(
+        raw_boxes.emplace_back(
             (int)x1, (int)y1,
             (int)(x2 - x1),
             (int)(y2 - y1)
         );
+
+        raw_scores.push_back(conf);
     }
 
-    return boxes;
+    // --- Apply NMS (critical!) ---
+    std::vector<int> keep;
+    cv::dnn::NMSBoxes(raw_boxes, raw_scores, 0.25f, 0.45f, keep);
+
+    for (int idx : keep)
+        final_boxes.push_back(raw_boxes[idx]);
+
+    return final_boxes;
 }
+
 
 // This is the function that server.c is calling
 extern "C" DetectionResult process_frame(
