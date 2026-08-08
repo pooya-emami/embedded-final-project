@@ -52,6 +52,25 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     if (!yolo_loaded)
         return boxes;
 
+    std::cout
+        << "IMAGE SIZE "
+        << img320.cols << "x"
+        << img320.rows
+        << " CHANNELS "
+        << img320.channels()
+        << std::endl;
+
+    cv::Scalar mean = cv::mean(img320);
+
+    std::cout
+        << "MEAN "
+        << mean[0] << " "
+        << mean[1] << " "
+        << mean[2]
+        << std::endl;
+
+    cv::imwrite("/tmp/test.jpg", img320);
+
     cv::Mat blob = cv::dnn::blobFromImage(
         img320,
         1.0 / 255.0,
@@ -61,7 +80,32 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         false
     );
 
-    std::array<int64_t,4> input_shape = {1,3,320,320};
+    float *blob_ptr = (float*)blob.data;
+
+    float min_val = blob_ptr[0];
+    float max_val = blob_ptr[0];
+
+    for(int i=0;i<3*320*320;i++)
+    {
+        if(blob_ptr[i] < min_val)
+            min_val = blob_ptr[i];
+
+        if(blob_ptr[i] > max_val)
+            max_val = blob_ptr[i];
+    }
+
+    std::cout
+        << "BLOB MIN "
+        << min_val
+        << " MAX "
+        << max_val
+        << std::endl;
+
+
+    std::array<int64_t,4> input_shape = {
+        1,3,320,320
+    };
+
 
     Ort::MemoryInfo memory_info =
         Ort::MemoryInfo::CreateCpu(
@@ -69,31 +113,33 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
             OrtMemTypeDefault
         );
 
-float *blob_ptr = (float*)blob.data;
-
-std::cout
-<< "INPUT MIN: "
-<< blob_ptr[0]
-<< " MAX: "
-<< blob_ptr[3 * 320 * 320 - 1]
-<< std::endl;
 
     Ort::Value input_tensor =
         Ort::Value::CreateTensor<float>(
             memory_info,
-            (float*)blob.data,
-            1 * 3 * 320 * 320,
+            blob_ptr,
+            1*3*320*320,
             input_shape.data(),
             input_shape.size()
         );
 
+
     Ort::AllocatorWithDefaultOptions allocator;
 
+
     auto input_name =
-        yolo_session->GetInputNameAllocated(0, allocator);
+        yolo_session->GetInputNameAllocated(
+            0,
+            allocator
+        );
+
 
     auto output_name =
-        yolo_session->GetOutputNameAllocated(0, allocator);
+        yolo_session->GetOutputNameAllocated(
+            0,
+            allocator
+        );
+
 
     const char* input_names[] = {
         input_name.get()
@@ -102,6 +148,7 @@ std::cout
     const char* output_names[] = {
         output_name.get()
     };
+
 
     auto output_tensors =
         yolo_session->Run(
@@ -113,15 +160,29 @@ std::cout
             1
         );
 
+
     float* output =
-        output_tensors[0].GetTensorMutableData<float>();
+        output_tensors[0]
+        .GetTensorMutableData<float>();
+
 
     auto shape =
         output_tensors[0]
         .GetTensorTypeAndShapeInfo()
         .GetShape();
 
+
+    std::cout
+        << "OUTPUT SHAPE ";
+
+    for(auto s: shape)
+        std::cout << s << " ";
+
+    std::cout << std::endl;
+
+
     int num_predictions = 2100;
+
 
     cv::Mat detections(
         84,
@@ -130,48 +191,69 @@ std::cout
         output
     );
 
+
     cv::Mat transposed;
-    cv::transpose(detections, transposed);
 
-float max_score = 0;
-int max_class = -1;
-int max_index = -1;
+    cv::transpose(
+        detections,
+        transposed
+    );
 
-for(int i=0;i<2100;i++)
-{
-    for(int c=0;c<80;c++)
+
+    float max_score = 0;
+    int max_class = -1;
+    int max_index = -1;
+
+
+    for(int i=0;i<num_predictions;i++)
     {
-        float score = transposed.at<float>(i,4+c);
-
-        if(score > max_score)
+        for(int c=0;c<80;c++)
         {
-            max_score = score;
-            max_class = c;
-            max_index = i;
+            float score =
+                transposed.at<float>(i,4+c);
+
+            if(score > max_score)
+            {
+                max_score = score;
+                max_class = c;
+                max_index = i;
+            }
         }
     }
-}
 
-std::cout << "MAX SCORE: "
-          << max_score
-          << " CLASS: "
-          << max_class
-          << " INDEX: "
-          << max_index
-          << std::endl;
+
+    std::cout
+        << "MAX SCORE "
+        << max_score
+        << " CLASS "
+        << max_class
+        << " INDEX "
+        << max_index
+        << std::endl;
+
 
     std::vector<cv::Rect> raw_boxes;
     std::vector<float> scores;
 
+
     for(int i=0;i<num_predictions;i++)
     {
-        float x = transposed.at<float>(i,0);
-        float y = transposed.at<float>(i,1);
-        float w = transposed.at<float>(i,2);
-        float h = transposed.at<float>(i,3);
+        float x =
+            transposed.at<float>(i,0);
+
+        float y =
+            transposed.at<float>(i,1);
+
+        float w =
+            transposed.at<float>(i,2);
+
+        float h =
+            transposed.at<float>(i,3);
+
 
         float best_score = 0;
         int best_class = -1;
+
 
         for(int c=0;c<80;c++)
         {
@@ -185,12 +267,21 @@ std::cout << "MAX SCORE: "
             }
         }
 
+
         if(best_class == 0 && best_score > 0.25f)
         {
-            int x1 = (x - w/2) * 320;
-            int y1 = (y - h/2) * 320;
-            int width = w * 320;
-            int height = h * 320;
+            int x1 =
+                (x - w/2) * 320;
+
+            int y1 =
+                (y - h/2) * 320;
+
+            int width =
+                w * 320;
+
+            int height =
+                h * 320;
+
 
             raw_boxes.emplace_back(
                 x1,
@@ -199,11 +290,15 @@ std::cout << "MAX SCORE: "
                 height
             );
 
-            scores.push_back(best_score);
+            scores.push_back(
+                best_score
+            );
         }
     }
 
+
     std::vector<int> keep;
+
 
     cv::dnn::NMSBoxes(
         raw_boxes,
@@ -213,8 +308,18 @@ std::cout << "MAX SCORE: "
         keep
     );
 
+
     for(auto i: keep)
-        boxes.push_back(raw_boxes[i]);
+        boxes.push_back(
+            raw_boxes[i]
+        );
+
+
+    std::cout
+        << "DETECTIONS "
+        << boxes.size()
+        << std::endl;
+
 
     return boxes;
 }
