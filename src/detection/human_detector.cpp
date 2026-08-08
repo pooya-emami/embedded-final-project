@@ -124,6 +124,33 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     cv::Mat transposed;
     cv::transpose(detections, transposed);
 
+float max_score = 0;
+int max_class = -1;
+int max_index = -1;
+
+for(int i=0;i<2100;i++)
+{
+    for(int c=0;c<80;c++)
+    {
+        float score = transposed.at<float>(i,4+c);
+
+        if(score > max_score)
+        {
+            max_score = score;
+            max_class = c;
+            max_index = i;
+        }
+    }
+}
+
+std::cout << "MAX SCORE: "
+          << max_score
+          << " CLASS: "
+          << max_class
+          << " INDEX: "
+          << max_index
+          << std::endl;
+
     std::vector<cv::Rect> raw_boxes;
     std::vector<float> scores;
 
