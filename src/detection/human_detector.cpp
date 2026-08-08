@@ -98,117 +98,125 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         .GetTensorTypeAndShapeInfo()
         .GetShape();
 
-    // Print shape for debugging
+    // Debug print
     printf("Output shape: [");
-    for (auto dim : shape) {
-        printf("%lld ", dim);
+    for (size_t i = 0; i < shape.size(); i++) {
+        printf("%ld ", shape[i]);
     }
     printf("]\n");
 
-    int N = shape[1];  // Number of predictions (should be 2100)
-    int C = shape[2];  // Number of values per prediction (should be 84)
+    int N = shape[1];  // Should be 2100
+    int C = shape[2];  // Should be 84
 
-    // If shape is [1, 2100, 84], then N=2100, C=84
-    // If shape is [1, 84, 2100], then N=84, C=2100 (swap them)
-    
-    // Let's detect the format
+    // Store all detections
+    struct Detection {
+        float x1, y1, x2, y2;
+        float confidence;
+    };
+    std::vector<Detection> detections;
+
+    // Handle both possible output formats
     if (C == 84 && N == 2100) {
-        // Format is [1, 84, 2100] - transpose needed
-        std::vector<std::array<float, 84>> preds(N);
+        // Format is [1, 84, 2100] - need to transpose
         for (int i = 0; i < N; i++) {
-            for (int c = 0; c < C; c++) {
-                preds[i][c] = out[c * N + i];
+            // Get the 84 values for this prediction
+            float x = out[0 * N + i];
+            float y = out[1 * N + i];
+            float w = out[2 * N + i];
+            float h = out[3 * N + i];
+            float obj = out[4 * N + i];
+            
+            if (obj < 0.25f) continue;
+            
+            // Find best class
+            float best_score = 0;
+            int best_class = -1;
+            for (int c = 5; c < C; c++) {
+                float s = out[c * N + i];
+                if (s > best_score) {
+                    best_score = s;
+                    best_class = c - 5;
+                }
             }
-        }
-        
-        // Process predictions
-        for (int i = 0; i < N; i++) {
-            process_prediction(preds[i], img320, boxes);
+            
+            // Only person class (class 0)
+            if (best_class != 0) continue;
+            if (best_score < 0.25f) continue;
+            
+            // Convert center format to corner format
+            float x1 = (x - w/2) * img320.cols / 320.0f;
+            float y1 = (y - h/2) * img320.rows / 320.0f;
+            float x2 = (x + w/2) * img320.cols / 320.0f;
+            float y2 = (y + h/2) * img320.rows / 320.0f;
+            
+            detections.push_back({x1, y1, x2, y2, best_score});
         }
     } else if (N == 2100 && C == 84) {
         // Format is [1, 2100, 84] - direct access
         for (int i = 0; i < N; i++) {
-            std::array<float, 84> pred;
-            for (int c = 0; c < C; c++) {
-                pred[c] = out[i * C + c];
+            int offset = i * C;
+            float x = out[offset + 0];
+            float y = out[offset + 1];
+            float w = out[offset + 2];
+            float h = out[offset + 3];
+            float obj = out[offset + 4];
+            
+            if (obj < 0.25f) continue;
+            
+            // Find best class
+            float best_score = 0;
+            int best_class = -1;
+            for (int c = 5; c < C; c++) {
+                float s = out[offset + c];
+                if (s > best_score) {
+                    best_score = s;
+                    best_class = c - 5;
+                }
             }
-            process_prediction(pred, img320, boxes);
+            
+            // Only person class (class 0)
+            if (best_class != 0) continue;
+            if (best_score < 0.25f) continue;
+            
+            // Convert center format to corner format
+            float x1 = (x - w/2) * img320.cols / 320.0f;
+            float y1 = (y - h/2) * img320.rows / 320.0f;
+            float x2 = (x + w/2) * img320.cols / 320.0f;
+            float y2 = (y + h/2) * img320.rows / 320.0f;
+            
+            detections.push_back({x1, y1, x2, y2, best_score});
+        }
+    } else {
+        printf("Unexpected output shape: N=%d, C=%d\n", N, C);
+        return boxes;
+    }
+
+    // Apply NMS
+    if (!detections.empty()) {
+        std::vector<cv::Rect> rects;
+        std::vector<float> scores;
+        
+        for (const auto& det : detections) {
+            rects.emplace_back(
+                (int)det.x1, 
+                (int)det.y1,
+                (int)(det.x2 - det.x1),
+                (int)(det.y2 - det.y1)
+            );
+            scores.push_back(det.confidence);
+        }
+        
+        std::vector<int> indices;
+        cv::dnn::NMSBoxes(rects, scores, 0.25f, 0.45f, indices);
+        
+        for (int idx : indices) {
+            boxes.push_back(rects[idx]);
         }
     }
 
-    // Apply NMS to remove overlapping boxes
-    boxes = apply_nms(boxes);
-
+    printf("Detected %zu persons\n", boxes.size());
     return boxes;
 }
-
-// Helper function to process a single prediction
-static void process_prediction(const std::array<float, 84>& pred, 
-                               const cv::Mat& img320, 
-                               std::vector<cv::Rect>& boxes)
-{
-    float x = pred[0];
-    float y = pred[1];
-    float w = pred[2];
-    float h = pred[3];
-
-    float obj = pred[4];
-    if (obj < 0.25f) return;
-
-    float best_score = 0;
-    int best_class = -1;
-
-    for (int c = 5; c < 84; c++) {
-        float s = pred[c];
-        if (s > best_score) {
-            best_score = s;
-            best_class = c - 5;
-        }
-    }
-
-    // Check for class 0 (person)
-    if (best_class != 0) return;
-    if (best_score < 0.25f) return;
-
-    // Convert from center format [x, y, w, h] to [x1, y1, x2, y2]
-    float x1 = x - w / 2;
-    float y1 = y - h / 2;
-    float x2 = x + w / 2;
-    float y2 = y + h / 2;
-
-    // Scale from 320x320 to original image size
-    x1 *= img320.cols / 320.0f;
-    x2 *= img320.cols / 320.0f;
-    y1 *= img320.rows / 320.0f;
-    y2 *= img320.rows / 320.0f;
-
-    boxes.emplace_back(
-        (int)x1, (int)y1,
-        (int)(x2 - x1),
-        (int)(y2 - y1)
-    );
-}
-
-// Helper function for NMS
-static std::vector<cv::Rect> apply_nms(std::vector<cv::Rect>& boxes)
-{
-    if (boxes.empty()) return boxes;
-
-    // Convert to vector of cv::Rect for OpenCV NMS
-    std::vector<float> scores(boxes.size(), 1.0f); // All scores are 1 since we already filtered
-    
-    // Apply NMS
-    std::vector<int> indices;
-    cv::dnn::NMSBoxes(boxes, scores, 0.25f, 0.45f, indices);
-
-    std::vector<cv::Rect> filtered_boxes;
-    for (int idx : indices) {
-        filtered_boxes.push_back(boxes[idx]);
-    }
-
-    return filtered_boxes;
-}
-
 
 
 extern "C" DetectionResult process_frame(
