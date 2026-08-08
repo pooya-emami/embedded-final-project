@@ -282,33 +282,127 @@ void send_redirect(int fd) {
     send(fd, msg, strlen(msg), 0);
 }
 
-static void handle_https(int fd) {
+// New function for MJPEG streaming
+static void handle_mjpeg_stream(SSL *ssl, int fd) {
+    const char *boundary = "--frame\r\n";
+    const char *header = 
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n";
+    
+    if (SSL_write(ssl, header, strlen(header)) <= 0) {
+        return;
+    }
+    
+    struct timespec next_frame;
+    clock_gettime(CLOCK_MONOTONIC, &next_frame);
+    
+    while (running) {
+        // Grab current frame
+        pthread_mutex_lock(&frame_mutex);
+        size_t len = current_len;
+        unsigned char *copy = NULL;
+        
+        if (len > 0) {
+            copy = malloc(len);
+            if (copy) memcpy(copy, current_frame, len);
+        }
+        pthread_mutex_unlock(&frame_mutex);
+        
+        if (copy && len > 0) {
+            // Write multipart boundary
+            if (SSL_write(ssl, boundary, strlen(boundary)) <= 0) break;
+            
+            // Write Content-Type header for this part
+            char part_header[128];
+            snprintf(part_header, sizeof(part_header),
+                "Content-Type: image/jpeg\r\n"
+                "Content-Length: %zu\r\n"
+                "\r\n", len);
+            
+            if (SSL_write(ssl, part_header, strlen(part_header)) <= 0) {
+                free(copy);
+                break;
+            }
+            
+            // Write JPEG data
+            if (SSL_write(ssl, copy, len) <= 0) {
+                free(copy);
+                break;
+            }
+            
+            free(copy);
+            
+            // Write extra newline after frame
+            if (SSL_write(ssl, "\r\n", 2) <= 0) break;
+        }
+        
+        // Pace to requested frame rate
+        long interval = current_interval_ms;
+        next_frame.tv_nsec += interval * 1000000L;
+        while (next_frame.tv_nsec >= 1000000000L) {
+            next_frame.tv_nsec -= 1000000000L;
+            next_frame.tv_sec += 1;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_frame, NULL);
+    }
+}
+
+// Thread function for handling a single HTTPS connection
+static void *handle_https_thread(void *arg) {
+    int fd = *(int*)arg;
+    free(arg);
+    
     SSL *ssl = SSL_new(ssl_ctx);
     SSL_set_fd(ssl, fd);
+    
+    // Set timeout for SSL handshake
+    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     if (SSL_accept(ssl) <= 0) {
         SSL_free(ssl);
         close(fd);
-        return;
+        return NULL;
     }
+    
+    // Longer timeout for established connection
+    tv.tv_sec = 30;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 
     char req[4096];
     int n = SSL_read(ssl, req, sizeof(req) - 1);
     if (n <= 0) {
         SSL_free(ssl);
         close(fd);
-        return;
+        return NULL;
     }
 
     req[n] = '\0';
-
+    
+    // Parse request line
     char method[16], path[256];
-    sscanf(req, "%15s %255s", method, path);
-
+    if (sscanf(req, "%15s %255s", method, path) != 2) {
+        SSL_free(ssl);
+        close(fd);
+        return NULL;
+    }
+    
     char *q = strchr(path, '?');
     if (q) *q = '\0';
-
-    if (strcmp(path, "/") == 0) {
+    
+    // Remove trailing slash if present
+    size_t path_len = strlen(path);
+    if (path_len > 1 && path[path_len - 1] == '/') {
+        path[path_len - 1] = '\0';
+    }
+    
+    // Serve HTML page
+    if (strcmp(path, "/") == 0 || strcmp(path, "/index.html") == 0) {
         if (html_cache) {
             char header[512];
             snprintf(header, sizeof(header),
@@ -316,29 +410,38 @@ static void handle_https(int fd) {
                 "Content-Type: text/html\r\n"
                 "Content-Length: %zu\r\n"
                 "Cache-Control: no-cache\r\n"
-                "Connection: close\r\n"
+                "Connection: keep-alive\r\n"
                 "\r\n",
                 strlen(html_cache));
-
+            
             SSL_write(ssl, header, strlen(header));
             SSL_write(ssl, html_cache, strlen(html_cache));
         }
         SSL_free(ssl);
         close(fd);
-        return;
+        return NULL;
     }
-
+    
+    // MJPEG stream endpoint
     if (strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) {
+        handle_mjpeg_stream(ssl, fd);
+        SSL_free(ssl);
+        close(fd);
+        return NULL;
+    }
+    
+    // Single JPEG snapshot
+    if (strcmp(path, "/snapshot") == 0 || strcmp(path, "/api/v1/snapshot") == 0) {
         pthread_mutex_lock(&frame_mutex);
         size_t len = current_len;
         unsigned char *copy = NULL;
-
+        
         if (len > 0) {
             copy = malloc(len);
             if (copy) memcpy(copy, current_frame, len);
         }
         pthread_mutex_unlock(&frame_mutex);
-
+        
         if (copy && len > 0) {
             char header[256];
             snprintf(header, sizeof(header),
@@ -355,21 +458,22 @@ static void handle_https(int fd) {
         }
         SSL_free(ssl);
         close(fd);
-        return;
+        return NULL;
     }
-
+    
+    // Telemetry endpoint
     if (strcmp(path, "/telemetry") == 0 || strcmp(path, "/api/v1/telemetry") == 0) {
         pthread_mutex_lock(&telemetry_mutex);
         float temp = cached_temp;
         long mem = cached_mem;
         float cpu = cached_cpu;
         pthread_mutex_unlock(&telemetry_mutex);
-
+        
         char json[256];
         snprintf(json, sizeof(json),
                  "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}",
                  temp, mem, cpu);
-
+        
         char header[512];
         snprintf(header, sizeof(header),
             "HTTP/1.1 200 OK\r\n"
@@ -379,13 +483,14 @@ static void handle_https(int fd) {
             "Connection: close\r\n"
             "\r\n%s",
             strlen(json), json);
-
+        
         SSL_write(ssl, header, strlen(header));
         SSL_free(ssl);
         close(fd);
-        return;
+        return NULL;
     }
-
+    
+    // Person detection endpoint
     if (strcmp(path, "/api/v1/persons") == 0) {
         int count = (rand() % 4);
         pthread_mutex_lock(&telemetry_mutex);
@@ -395,12 +500,12 @@ static void handle_https(int fd) {
         if (count > 0) {
             add_history(count, temp);
         }
-
+        
         char json[128];
         snprintf(json, sizeof(json),
                  "{\"count\":%d,\"timestamp\":%ld}",
                  count, time(NULL));
-
+        
         char header[512];
         snprintf(header, sizeof(header),
             "HTTP/1.1 200 OK\r\n"
@@ -410,13 +515,14 @@ static void handle_https(int fd) {
             "Connection: close\r\n"
             "\r\n%s",
             strlen(json), json);
-
+        
         SSL_write(ssl, header, strlen(header));
         SSL_free(ssl);
         close(fd);
-        return;
+        return NULL;
     }
-
+    
+    // History endpoint
     if (strcmp(path, "/api/v1/history") == 0) {
         pthread_mutex_lock(&history_mutex);
         
@@ -434,7 +540,7 @@ static void handle_https(int fd) {
         
         p += sprintf(p, "]}");
         pthread_mutex_unlock(&history_mutex);
-
+        
         char header[2048];
         snprintf(header, sizeof(header),
             "HTTP/1.1 200 OK\r\n"
@@ -444,13 +550,14 @@ static void handle_https(int fd) {
             "Connection: close\r\n"
             "\r\n%s",
             strlen(json), json);
-
+        
         SSL_write(ssl, header, strlen(header));
         SSL_free(ssl);
         close(fd);
-        return;
+        return NULL;
     }
-
+    
+    // Command endpoint
     if (strcmp(path, "/api/v1/command") == 0) {
         if (strcmp(method, "POST") == 0) {
             char *body = strstr(req, "\r\n\r\n");
@@ -488,45 +595,47 @@ static void handle_https(int fd) {
         }
         SSL_free(ssl);
         close(fd);
-        return;
+        return NULL;
     }
-
-    SSL_write(ssl, "HTTP/1.1 404 Not Found\r\n\r\n", 26);
+    
+    // 404
+    SSL_write(ssl, "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n", 41);
     SSL_free(ssl);
     close(fd);
+    return NULL;
 }
 
 static SSL_CTX *init_ssl(void) {
     SSL_library_init();
     SSL_load_error_strings();
     OpenSSL_add_all_algorithms();
-
+    
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     if (!ctx) return NULL;
-
+    
     if (SSL_CTX_use_certificate_file(ctx, "cert.pem", SSL_FILETYPE_PEM) <= 0)
         return NULL;
-
+    
     if (SSL_CTX_use_PrivateKey_file(ctx, "key.pem", SSL_FILETYPE_PEM) <= 0)
         return NULL;
-
+    
     SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
-
+    
     return ctx;
 }
 
 int main(void) {
     printf("Starting Security Server...\n");
     printf("Config path: %s\n", CONFIG_PATH);
-
+    
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGHUP, signal_handler);
     signal(SIGPIPE, SIG_IGN);
-
+    
     load_config(CONFIG_PATH);
     current_interval_ms = g_frame_interval_ms;
-
+    
     printf("\n=== Configuration ===\n");
     printf("Frame interval: %dms (%.1f fps)\n", g_frame_interval_ms, 1000.0/g_frame_interval_ms);
     printf("Frame size: %dx%d\n", g_frame_width, g_frame_height);
@@ -536,83 +645,84 @@ int main(void) {
     printf("Watchdog timeout: %dms\n", g_watchdog_timeout_ms);
     printf("Send SIGHUP (kill -HUP %d) to reload config\n", getpid());
     printf("========================\n\n");
-
+    
     srand(time(NULL));
-
+    
     history = malloc(g_max_history * sizeof(detection_record_t));
     if (!history) {
         printf("Failed to allocate history\n");
         return 1;
     }
-
+    
     html_cache = load_html();
     if (!html_cache) {
         printf("Warning: Failed to load HTML template\n");
     } else {
         printf("HTML template loaded (%zu bytes)\n", strlen(html_cache));
     }
-
+    
     g_frame = shared_frame_open();
     if (!g_frame) {
         printf("Failed to open shared frame\n");
         return 1;
     }
-
+    
     pthread_t updater;
     pthread_create(&updater, NULL, frame_updater, NULL);
-
+    
     pthread_t telemetry_thread;
     pthread_create(&telemetry_thread, NULL, telemetry_updater, NULL);
-
+    
     ssl_ctx = init_ssl();
     if (!ssl_ctx) {
         printf("SSL init failed. Generate cert.pem and key.pem\n");
         return 1;
     }
-
+    
     printf("SSL initialized\n");
-
+    
     int http_fd = socket(AF_INET, SOCK_STREAM, 0);
     int opt = 1;
     setsockopt(http_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
+    
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
         .sin_port = htons(g_port_http)
     };
-
+    
     if (bind(http_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
         perror("bind http");
         return 1;
     }
     listen(http_fd, 10);
     printf("HTTP on %d (redirects to HTTPS)\n", g_port_http);
-
+    
     int https_fd = socket(AF_INET, SOCK_STREAM, 0);
     setsockopt(https_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-
+    
     struct sockaddr_in addr_https = {
         .sin_family = AF_INET,
         .sin_addr.s_addr = INADDR_ANY,
         .sin_port = htons(g_port_https)
     };
-
+    
     if (bind(https_fd, (struct sockaddr *)&addr_https, sizeof(addr_https)) < 0) {
         perror("bind https");
         return 1;
     }
     listen(https_fd, 10);
-
+    
     printf("HTTPS on %d\n", g_port_https);
     printf("Open: https://192.168.137.100:%d/\n", g_port_https);
-
+    printf("\nStream: https://192.168.137.100:%d/stream (MJPEG)\n", g_port_https);
+    
     while (running) {
         fd_set fds;
         FD_ZERO(&fds);
         FD_SET(http_fd, &fds);
         FD_SET(https_fd, &fds);
-
+        
         int max_fd = (https_fd > http_fd) ? https_fd : http_fd;
         
         struct timeval tv;
@@ -632,7 +742,7 @@ int main(void) {
         if (ret == 0) {
             continue;
         }
-
+        
         if (FD_ISSET(http_fd, &fds)) {
             int fd = accept(http_fd, NULL, NULL);
             if (fd >= 0) {
@@ -641,28 +751,36 @@ int main(void) {
                 close(fd);
             }
         }
-
+        
         if (FD_ISSET(https_fd, &fds)) {
             int fd = accept(https_fd, NULL, NULL);
             if (fd >= 0) {
-                set_socket_timeout(fd, 10);
-                handle_https(fd);
+                // Spawn thread for this connection
+                pthread_t thread;
+                int *fd_ptr = malloc(sizeof(int));
+                if (fd_ptr) {
+                    *fd_ptr = fd;
+                    pthread_create(&thread, NULL, handle_https_thread, fd_ptr);
+                    pthread_detach(thread);  // Auto-cleanup when thread exits
+                } else {
+                    close(fd);
+                }
             }
         }
     }
-
+    
     printf("\nShutting down server...\n");
     
     // Wait for threads to finish
     pthread_join(updater, NULL);
     pthread_join(telemetry_thread, NULL);
-
+    
     close(http_fd);
     close(https_fd);
     SSL_CTX_free(ssl_ctx);
     free(html_cache);
     free(history);
-
+    
     printf("Server shutdown complete.\n");
     return 0;
 }
