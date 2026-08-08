@@ -69,6 +69,13 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
             OrtMemTypeDefault
         );
 
+std::cout 
+<< "INPUT MIN: "
+<< blob.at<float>(0,0,0,0)
+<< " MAX: "
+<< blob.at<float>(0,0,319,319)
+<< std::endl;
+
     Ort::Value input_tensor =
         Ort::Value::CreateTensor<float>(
             memory_info,
