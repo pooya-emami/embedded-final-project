@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 // Adjust these paths to match your environment
-#define MODEL_BASE_PATH "../models/"
+#define MODEL_BASE_PATH "../../models/"
 #define MODEL_FILE "blaze.onnx"
 
 typedef struct DetectionResult {
