@@ -1,8 +1,8 @@
-#ifndef DETECTOR_HPP
-#define DETECTOR_HPP
+#ifndef HUMAN_DETECTOR_HPP
+#define HUMAN_DETECTOR_HPP
 
-#include <stddef.h>
-#include <stdint.h>
+#include <cstddef>
+#include <cstdint>
 
 #ifdef __cplusplus
 extern "C" {
@@ -11,13 +11,14 @@ extern "C" {
 #define MODEL_BASE_PATH "../../models/"
 #define YOLO_MODEL_FILE "blaze.onnx"
 
-typedef struct {
-    uint8_t* jpeg_output;   // malloc'ed buffer
-    size_t   jpeg_length;   // number of bytes
-    int      width;         // output width
-    int      height;        // output height
-    int      person_count;  // detection count
+typedef struct DetectionResult {
+    uint8_t* jpeg_output;
+    size_t jpeg_length;
+    int width;
+    int height;
+    int person_count;
 } DetectionResult;
+
 
 DetectionResult process_frame(
     const uint8_t* jpeg_data,
@@ -26,10 +27,11 @@ DetectionResult process_frame(
     int output_height
 );
 
+
 void free_detection_result(DetectionResult* res);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif
+#endif // HUMAN_DETECTOR_HPP
