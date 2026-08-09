@@ -45,7 +45,7 @@ static void load_yolo()
     yolo_loaded = true;
 }
 
-static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
+static std::vector<cv::Rect> detectHumansBlaze(const cv::Mat &img320)
 {
     load_yolo(); // reuse your loader but point YOLO_MODEL_FILE to blaze.onnx
 
@@ -138,6 +138,94 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     return boxes;
 }
 
+extern "C" DetectionResult process_frame(
+    const uint8_t* jpeg_data,
+    size_t jpeg_len,
+    int output_width,
+    int output_height)
+{
+    DetectionResult result = {};
+    result.jpeg_output = NULL;
+    result.jpeg_length = 0;
+    result.width = 0;
+    result.height = 0;
+    result.person_count = 0;
+
+    std::vector<uint8_t> buf(jpeg_data, jpeg_data + jpeg_len);
+    cv::Mat frame_source = cv::imdecode(buf, cv::IMREAD_COLOR);
+
+    if (frame_source.empty()) {
+        return result;
+    }
+
+    cv::Mat frame_detection;
+    cv::resize(frame_source, frame_detection, cv::Size(320, 320));
+
+    auto boxes = detectHumans(frame_detection);
+
+    // Draw boxes
+    for (const auto &box : boxes)
+        cv::rectangle(frame_detection, box, cv::Scalar(0, 255, 0), 2);
+
+    // Add text overlays
+    auto now = std::chrono::system_clock::now();
+    auto now_time_t = std::chrono::system_clock::to_time_t(now);
+
+    std::stringstream ss;
+    ss << std::put_time(std::localtime(&now_time_t), "%Y-%m-%d %H:%M:%S");
+
+    cv::putText(frame_detection, "Student: 404300409",
+                cv::Point(10, 30), cv::FONT_HERSHEY_SIMPLEX,
+                0.6, cv::Scalar(0, 255, 255), 2);
+
+    cv::putText(frame_detection, ss.str(),
+                cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX,
+                0.6, cv::Scalar(255, 255, 255), 2);
+
+    cv::putText(frame_detection, "Persons: " + std::to_string(boxes.size()),
+                cv::Point(10, 90), cv::FONT_HERSHEY_SIMPLEX,
+                0.6, cv::Scalar(0, 255, 0), 2);
+
+    // FPS counter
+    static double fps = 0;
+    static int frame_count = 0;
+    static auto start = std::chrono::steady_clock::now();
+
+    auto current = std::chrono::steady_clock::now();
+    double elapsed = std::chrono::duration<double>(current - start).count();
+    frame_count++;
+
+    if (elapsed >= 1.0) {
+        fps = frame_count / elapsed;
+        frame_count = 0;
+        start = current;
+    }
+
+    std::string fps_str = std::to_string(fps).substr(0, 4);
+    cv::putText(frame_detection, "FPS: " + fps_str,
+                cv::Point(frame_detection.cols - 100, 30),
+                cv::FONT_HERSHEY_SIMPLEX,
+                0.6, cv::Scalar(0, 255, 0), 2);
+
+    // Resize to output size and encode as JPEG
+    cv::Mat frame_output;
+    cv::resize(frame_detection, frame_output, cv::Size(output_width, output_height));
+
+    std::vector<uint8_t> jpegBuf;
+    cv::imencode(".jpg", frame_output, jpegBuf);
+
+    result.jpeg_output = (uint8_t*)malloc(jpegBuf.size());
+    if (result.jpeg_output) {
+        result.jpeg_length = jpegBuf.size();
+        memcpy(result.jpeg_output, jpegBuf.data(), jpegBuf.size());
+    }
+
+    result.width = output_width;
+    result.height = output_height;
+    result.person_count = (int)boxes.size();
+
+    return result;
+}
 
 extern "C" void free_detection_result(DetectionResult* res)
 {
