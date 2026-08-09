@@ -17,9 +17,14 @@
 #include "human_detector.hpp"
 
 static char model_path[256] = {0};
-static Ort::Env ort_env(ORT_LOGGING_LEVEL_WARNING, "YOLO");
+static Ort::Env ort_env(ORT_LOGGING_LEVEL_WARNING, "BlazeFace");
 static Ort::Session* yolo_session = nullptr;
 static bool yolo_loaded = false;
+
+// BlazeFace constants
+const int INPUT_SIZE = 128;
+const float CONF_THRESH = 0.5f;
+const float IOU_THRESH = 0.3f;
 
 static void load_yolo()
 {
@@ -53,22 +58,26 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     if (!yolo_loaded)
         return boxes;
 
+    // Convert to 128x128 for BlazeFace
+    cv::Mat img128;
+    cv::resize(img320, img128, cv::Size(INPUT_SIZE, INPUT_SIZE));
+    
     cv::Mat rgb;
-    cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
+    cv::cvtColor(img128, rgb, cv::COLOR_BGR2RGB);
     rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f);
 
-    std::vector<float> input_tensor_values(1 * 3 * 320 * 320);
+    std::vector<float> input_tensor_values(1 * 3 * INPUT_SIZE * INPUT_SIZE);
 
-    for (int y = 0; y < 320; y++) {
-        for (int x = 0; x < 320; x++) {
+    for (int y = 0; y < INPUT_SIZE; y++) {
+        for (int x = 0; x < INPUT_SIZE; x++) {
             cv::Vec3f p = rgb.at<cv::Vec3f>(y, x);
-            input_tensor_values[y * 320 + x] = p[0];  // R
-            input_tensor_values[320 * 320 + y * 320 + x] = p[1];  // G
-            input_tensor_values[2 * 320 * 320 + y * 320 + x] = p[2];  // B
+            input_tensor_values[y * INPUT_SIZE + x] = p[0];  // R
+            input_tensor_values[INPUT_SIZE * INPUT_SIZE + y * INPUT_SIZE + x] = p[1];  // G
+            input_tensor_values[2 * INPUT_SIZE * INPUT_SIZE + y * INPUT_SIZE + x] = p[2];  // B
         }
     }
 
-    std::array<int64_t, 4> input_shape = {1, 3, 320, 320};
+    std::array<int64_t, 4> input_shape = {1, 3, INPUT_SIZE, INPUT_SIZE};
     Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
         OrtArenaAllocator, OrtMemTypeDefault);
 
@@ -100,46 +109,98 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         .GetTensorTypeAndShapeInfo()
         .GetShape();
 
-    int channels = shape[1];        // 84 (4 bbox + 80 class)
-    int num_predictions = shape[2]; // 2100
-
+    // Parse BlazeFace output
     struct Detection {
         float x1, y1, x2, y2;
         float confidence;
-        int class_id;
     };
     std::vector<Detection> detections;
 
-    // Process each prediction
-    for (int i = 0; i < num_predictions; i++) {
-        // Get bounding box coordinates (already in pixel space)
-        float x = out[0 * num_predictions + i];
-        float y = out[1 * num_predictions + i];
-        float w = out[2 * num_predictions + i];
-        float h = out[3 * num_predictions + i];
-
-        // Find best class from raw confidence scores
-        float best_score = 0.0f;
-        int best_class = -1;
-        for (int c = 4; c < channels; c++) {
-            float score = out[c * num_predictions + i];
-            if (score > best_score) {
-                best_score = score;
-                best_class = c - 4;
-            }
+    // Handle different output shapes
+    int num_detections = 0;
+    bool is_single_detection = false;
+    
+    if (shape.size() == 3 && shape[0] == 1) {
+        // Shape: {1, N, 16}
+        num_detections = shape[1];
+    } else if (shape.size() == 2 && shape[0] == 1 && shape[1] == 16) {
+        // Single detection: {1, 16}
+        num_detections = 1;
+        is_single_detection = true;
+    } else if (shape.size() == 2 && shape[0] > 0 && shape[1] == 16) {
+        // Shape: {N, 16}
+        num_detections = shape[0];
+    } else if (shape.size() == 1 && shape[0] % 16 == 0) {
+        // Flat array
+        num_detections = shape[0] / 16;
+    } else {
+        // Try to get from scores output
+        auto scores_shape = output_tensors[1].GetTensorTypeAndShapeInfo().GetShape();
+        if (!scores_shape.empty()) {
+            num_detections = scores_shape[0];
         }
+    }
 
-        // Filter: only person class with confidence threshold
-        if (best_class != 0) continue;
-        if (best_score < 0.25f) continue;
-
-        // Convert from center format to corner format and scale
-        float x1 = (x - w / 2.0f) * img320.cols / 320.0f;
-        float y1 = (y - h / 2.0f) * img320.rows / 320.0f;
-        float x2 = (x + w / 2.0f) * img320.cols / 320.0f;
-        float y2 = (y + h / 2.0f) * img320.rows / 320.0f;
+    // Parse detections
+    for (int i = 0; i < num_detections; i++) {
+        float y1, x1, y2, x2;
+        float score = 0.0f;
         
-        detections.push_back({x1, y1, x2, y2, best_score, best_class});
+        if (is_single_detection) {
+            // Single detection
+            y1 = out[0];
+            x1 = out[1];
+            y2 = out[2];
+            x2 = out[3];
+            // Get score if available
+            if (output_tensors.size() > 1) {
+                float* scores = output_tensors[1].GetTensorMutableData<float>();
+                score = scores[0];
+            } else {
+                score = 1.0f;
+            }
+        } else if (shape.size() == 3) {
+            // Shape: {1, N, 16}
+            int offset = i * 16;
+            y1 = out[offset + 0];
+            x1 = out[offset + 1];
+            y2 = out[offset + 2];
+            x2 = out[offset + 3];
+            
+            // Get score if available
+            if (output_tensors.size() > 1) {
+                float* scores = output_tensors[1].GetTensorMutableData<float>();
+                score = scores[i];
+            } else {
+                score = 1.0f;
+            }
+        } else {
+            // Flat array or other format
+            int offset = i * 16;
+            y1 = out[offset + 0];
+            x1 = out[offset + 1];
+            y2 = out[offset + 2];
+            x2 = out[offset + 3];
+            score = 1.0f;
+        }
+        
+        // Apply confidence threshold
+        if (score < CONF_THRESH) continue;
+        
+        // Validate detection
+        if (x1 < 0 || x1 > 1 || x2 < 0 || x2 > 1 ||
+            y1 < 0 || y1 > 1 || y2 < 0 || y2 > 1 ||
+            x2 <= x1 || y2 <= y1) {
+            continue;
+        }
+        
+        // Convert from normalized to pixel coordinates (320x320)
+        float px1 = x1 * img320.cols;
+        float py1 = y1 * img320.rows;
+        float px2 = x2 * img320.cols;
+        float py2 = y2 * img320.rows;
+        
+        detections.push_back({px1, py1, px2, py2, score});
     }
 
     // Apply NMS
@@ -158,7 +219,7 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         }
         
         std::vector<int> indices;
-        cv::dnn::NMSBoxes(rects, scores, 0.25f, 0.45f, indices);
+        cv::dnn::NMSBoxes(rects, scores, CONF_THRESH, IOU_THRESH, indices);
         
         for (int idx : indices) {
             boxes.push_back(rects[idx]);
@@ -168,7 +229,6 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     return boxes;
 }
 
-// This is the function that server.c is calling
 extern "C" DetectionResult process_frame(
     const uint8_t* jpeg_data,
     size_t jpeg_len,
@@ -213,7 +273,7 @@ extern "C" DetectionResult process_frame(
                 cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX,
                 0.6, cv::Scalar(255, 255, 255), 2);
 
-    cv::putText(frame_detection, "Persons: " + std::to_string(boxes.size()),
+    cv::putText(frame_detection, "Faces: " + std::to_string(boxes.size()),
                 cv::Point(10, 90), cv::FONT_HERSHEY_SIMPLEX,
                 0.6, cv::Scalar(0, 255, 0), 2);
 
