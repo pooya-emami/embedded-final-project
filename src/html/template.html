@@ -8,7 +8,7 @@
         h1 { background: #222; color: #fff; padding: 15px; }
         .container { display: flex; flex-wrap: wrap; gap: 20px; }
         .card { background: #fff; padding: 15px; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-        #stream { border: 3px solid #333; border-radius: 5px; max-width: 640px; background: #ddd; min-height: 200px; }
+        #stream { border: 3px solid #333; border-radius: 5px; max-width: 640px; background: #111; min-height: 200px; }
         #tele { font-size: 1.1em; }
         .status { font-size: 0.9em; color: #666; }
         .guard-toggle { margin: 10px 0; }
@@ -46,6 +46,12 @@
             margin: 5px 0;
             font-size: 0.85em;
             color: #666;
+            font-weight: bold;
+        }
+        .mode-hint {
+            font-size: 0.8em;
+            color: #999;
+            margin: 5px 0;
         }
     </style>
 </head>
@@ -58,14 +64,15 @@
         <h3>Live Stream</h3>
         
         <div class="mode-selector">
-            <button id="modeOff" class="active" onclick="setMode('off')">Off</button>
-            <button id="modeStream" onclick="setMode('stream')">Stream</button>
-            <button id="modeDetection" onclick="setMode('detection')">Detection</button>
+            <button id="modeIdle" class="active" onclick="setMode('idle')">⏸ Idle</button>
+            <button id="modeRaw" onclick="setMode('raw')">📹 Raw</button>
+            <button id="modeProcessed" onclick="setMode('processed')">🎯 Detection</button>
         </div>
-        <div class="mode-indicator" id="modeIndicator">Mode: Off</div>
+        <div class="mode-indicator" id="modeIndicator">Mode: Idle (Stream Off)</div>
+        <div class="mode-hint" id="modeHint">No stream - blank screen</div>
         
-        <img id="stream" src="" width="640" alt="Live Stream">
-        <div class="status" id="streamStatus">Stream: Off</div>
+        <img id="stream" src="/stream?t=0" width="640" alt="Live Stream">
+        <div class="status" id="streamStatus">Stream: Idle</div>
     </div>
 
     <div class="card">
@@ -85,50 +92,54 @@
 
 <script>
 let guardEnabled = false;
-let currentMode = 'off';
+let currentMode = 'idle';
 let streamInterval = null;
 
 function setMode(mode) {
     currentMode = mode;
     
     // Update button styles
-    document.getElementById('modeOff').className = (mode === 'off') ? 'active' : '';
-    document.getElementById('modeStream').className = (mode === 'stream') ? 'active' : '';
-    document.getElementById('modeDetection').className = (mode === 'detection') ? 'active' : '';
+    document.getElementById('modeIdle').className = (mode === 'idle') ? 'active' : '';
+    document.getElementById('modeRaw').className = (mode === 'raw') ? 'active' : '';
+    document.getElementById('modeProcessed').className = (mode === 'processed') ? 'active' : '';
     
     const modeNames = {
-        'off': 'Off (No Stream)',
-        'stream': 'Raw Camera Feed',
-        'detection': 'Detection (Processed)'
+        'idle': 'Idle (Stream Off)',
+        'raw': 'Raw Camera Feed',
+        'processed': 'Processed (Detection)'
+    };
+    const modeHints = {
+        'idle': 'No stream - blank screen (relay.service stopped)',
+        'raw': 'Direct camera feed (relay.service running)',
+        'processed': 'Camera with detection overlays (detection.service running)'
     };
     document.getElementById('modeIndicator').textContent = 'Mode: ' + modeNames[mode];
+    document.getElementById('modeHint').textContent = modeHints[mode];
     
+    // Send mode to server
+    fetch('/api/v1/stream_mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode: mode })
+    })
+    .then(response => response.json())
+    .then(data => {
+        console.log('Mode set to:', data.mode);
+    })
+    .catch(err => {
+        console.error('Mode switch error:', err);
+    });
+    
+    // Refresh stream
     const img = document.getElementById('stream');
+    img.src = '/stream?t=' + Date.now();
     const status = document.getElementById('streamStatus');
-    
-    // Clear existing interval
-    if (streamInterval) {
-        clearInterval(streamInterval);
-        streamInterval = null;
-    }
-    
-    if (mode === 'off') {
-        img.src = '';
-        img.alt = 'Stream Off';
-        status.textContent = 'Stream: Off';
-        return;
-    }
-    
-    // Choose endpoint based on mode
-    let endpoint = (mode === 'stream') ? '/raw_stream' : '/stream';
-    img.src = endpoint + '?t=' + Date.now();
-    img.alt = (mode === 'stream') ? 'Raw Stream' : 'Detection Stream';
-    status.textContent = 'Stream: ' + ((mode === 'stream') ? 'Raw' : 'Detection');
-    
-    // Refresh stream periodically
-    streamInterval = setInterval(function() {
-        img.src = endpoint + '?t=' + Date.now();
-    }, 100);
+    const modeLabels = {
+        'idle': 'Idle (Off)',
+        'raw': 'Raw Stream',
+        'processed': 'Detection Stream'
+    };
+    status.textContent = 'Stream: ' + modeLabels[mode];
 }
 
 function updateTelemetry() {
@@ -192,8 +203,14 @@ function updateGuardUI() {
     }
 }
 
-// Start with Off mode
-setMode('off');
+// Refresh stream every 100ms
+setInterval(function() {
+    const img = document.getElementById('stream');
+    img.src = '/stream?t=' + Date.now();
+}, 100);
+
+// Start with Idle mode
+setMode('idle');
 
 setInterval(updateTelemetry, 2000);
 setInterval(updatePersonCount, 3000);
