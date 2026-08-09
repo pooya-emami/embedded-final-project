@@ -45,6 +45,9 @@ static int g_mqtt_port = 1883;
 static char g_mqtt_user[128] = {0};
 static char g_mqtt_pass[128] = {0};
 
+// SQLite history database path
+static char g_db_path[256] = {0};
+
 // Static globals
 static shared_frame_t *g_frame = NULL;
 static unsigned char current_frame[BUFFER_SIZE];
@@ -189,6 +192,10 @@ void load_config(const char *filename) {
             loaded++;
         } else if (strcmp(key, "MQTT_PASS") == 0) {
             strcpy(g_mqtt_pass, value);
+            loaded++;
+        }
+        else if (strcmp(key, "HISTORY_DB_PATH") == 0) {
+            strcpy(g_db_path, value);
             loaded++;
         }
     }
@@ -1106,8 +1113,10 @@ int main(void) {
 
     srand(time(NULL));
 
-    if (history_db_init("/home/pooya/embproj/proj/security_history.db") != 0) {
+    if (history_db_init(g_db_path) != 0) {
         printf("Failed to initialize SQLite history DB\n");
+    } else {
+        printf("[SQLITE] Database initialized: %s\n", db_path);
     }
 
     history = malloc(g_max_history * sizeof(detection_record_t));
