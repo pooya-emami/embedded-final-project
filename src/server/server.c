@@ -78,10 +78,12 @@ static pthread_mutex_t person_mutex = PTHREAD_MUTEX_INITIALIZER;
 static time_t last_frame_time = 0;
 static int watchdog_alert_sent = 0;
 static int camera_restored_alert_sent = 0;
-static unsigned char prev_frame[BUFFER_SIZE] = {0};
+static pthread_mutex_t watchdog_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static unsigned char prev_frame[SHM_FRAME_BUF_SIZE] = {0};
 static size_t prev_frame_len = 0;
 static int first_frame_received = 0;
-static pthread_mutex_t watchdog_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int frame_stuck_count = 0;
 
 // Email debounce
 static time_t last_email_time = 0;
@@ -89,6 +91,7 @@ static time_t last_email_time = 0;
 // Guard event tracking
 static int active_detection_event = 0;
 
+static int stream_mode = 0;  // Default: idle (off)
 
 #define SHM_DETECTION_NAME "/guard_detection_result"
 #define SEM_DETECTION_NAME "/guard_detection_lock"
@@ -265,27 +268,6 @@ static float read_temp(void) {
         }
         fclose(f);
     }
-
-    f = fopen("/mnt/d/Users/ASUS/Documents/Virtual Machines/shared/cpu.txt", "r");
-    if (f) {
-        float t = -1;
-        if (fscanf(f, "%f", &t) == 1) {
-            fclose(f);
-            return t;
-        }
-        fclose(f);
-    }
-
-    f = fopen("/mnt/hgfs/shared/cpu.txt", "r");
-    if (f) {
-        float t = -1;
-        if (fscanf(f, "%f", &t) == 1) {
-            fclose(f);
-            return t;
-        }
-        fclose(f);
-    }
-
     return -1;
 }
 
@@ -355,9 +337,6 @@ static void *telemetry_updater(void *arg) {
         cached_cpu = read_cpu_usage();
         pthread_mutex_unlock(&telemetry_mutex);
         
-        // ============================================================
-        // THERMAL THROTTLING with Resolution and FPS reduction
-        // ============================================================
         if (cached_temp > g_temp_throttle_c) {
             if (!throttled) {
                 // Reduce FPS: increase interval by 50%
@@ -581,6 +560,149 @@ static void run_command(const char *cmd)
     (void)ret;
 }
 
+static unsigned char blank_jpeg[] = {
+    0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, 0x01, 0x01, 0x00, 0x48,
+    0x00, 0x48, 0x00, 0x00, 0xFF, 0xDB, 0x00, 0x43, 0x00, 0x10, 0x0B, 0x0C, 0x0E, 0x0C, 0x0A, 0x10,
+    0x0E, 0x0D, 0x0E, 0x12, 0x11, 0x10, 0x13, 0x18, 0x28, 0x1A, 0x18, 0x16, 0x16, 0x18, 0x31, 0x23,
+    0x25, 0x1D, 0x28, 0x3A, 0x33, 0x3D, 0x3C, 0x39, 0x33, 0x38, 0x37, 0x40, 0x48, 0x5C, 0x4E, 0x40,
+    0x44, 0x57, 0x45, 0x37, 0x38, 0x50, 0x6D, 0x51, 0x57, 0x5F, 0x62, 0x67, 0x68, 0x67, 0x3E, 0x4D,
+    0x71, 0x79, 0x70, 0x64, 0x78, 0x5C, 0x65, 0x67, 0x63, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x80,
+    0x00, 0x80, 0x01, 0x01, 0x11, 0x00, 0xFF, 0xC4, 0x00, 0x1F, 0x00, 0x00, 0x01, 0x05, 0x01, 0x01,
+    0x01, 0x01, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+    0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0xFF, 0xC4, 0x00, 0xB5, 0x10, 0x00, 0x02, 0x01, 0x03, 0x03,
+    0x02, 0x04, 0x03, 0x05, 0x05, 0x04, 0x04, 0x00, 0x00, 0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05,
+    0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07, 0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xA1,
+    0x08, 0x23, 0x42, 0xB1, 0xC1, 0x15, 0x52, 0xD1, 0xF0, 0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0A,
+    0x16, 0x17, 0x18, 0x19, 0x1A, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2A, 0x34, 0x35, 0x36, 0x37, 0x38,
+    0x39, 0x3A, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4A, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58,
+    0x59, 0x5A, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69, 0x6A, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78,
+    0x79, 0x7A, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97,
+    0x98, 0x99, 0x9A, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7, 0xA8, 0xA9, 0xAA, 0xB2, 0xB3, 0xB4, 0xB5,
+    0xB6, 0xB7, 0xB8, 0xB9, 0xBA, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8, 0xC9, 0xCA, 0xD2, 0xD3,
+    0xD4, 0xD5, 0xD6, 0xD7, 0xD8, 0xD9, 0xDA, 0xE1, 0xE2, 0xE3, 0xE4, 0xE5, 0xE6, 0xE7, 0xE8, 0xE9,
+    0xEA, 0xF1, 0xF2, 0xF3, 0xF4, 0xF5, 0xF6, 0xF7, 0xF8, 0xF9, 0xFA, 0xFF, 0xDA, 0x00, 0x0C, 0x03,
+    0x01, 0x00, 0x02, 0x11, 0x03, 0x11, 0x00, 0x3F, 0x00, 0xF9, 0xC2, 0x8A, 0x28, 0xA0, 0x0F, 0xFF,
+    0xD9
+};
+static size_t blank_jpeg_len = 0;
+
+static void handle_mjpeg_stream(SSL *ssl) {
+    const char *header =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: keep-alive\r\n"
+        "\r\n";
+
+    if (SSL_write(ssl, header, strlen(header)) <= 0) return;
+
+    // Initialize blank JPEG length
+    if (blank_jpeg_len == 0) {
+        blank_jpeg_len = sizeof(blank_jpeg);
+    }
+
+    struct timespec next_frame;
+    clock_gettime(CLOCK_MONOTONIC, &next_frame);
+
+    while (running) {
+        if (stream_mode == 0) {
+            char part_header[160];
+            int hlen = snprintf(part_header, sizeof(part_header),
+                "--frame\r\n"
+                "Content-Type: image/jpeg\r\n"
+                "Content-Length: %zu\r\n"
+                "\r\n", blank_jpeg_len);
+
+            size_t total = hlen + blank_jpeg_len + 2;
+            unsigned char *sendbuf = malloc(total);
+            if (sendbuf) {
+                memcpy(sendbuf, part_header, hlen);
+                memcpy(sendbuf + hlen, blank_jpeg, blank_jpeg_len);
+                sendbuf[hlen + blank_jpeg_len] = '\r';
+                sendbuf[hlen + blank_jpeg_len + 1] = '\n';
+
+                if (SSL_write(ssl, sendbuf, total) <= 0) {
+                    free(sendbuf);
+                    break;
+                }
+                free(sendbuf);
+            }
+            
+        } else if (stream_mode == 1) {
+            unsigned char raw_buf[SHM_FRAME_BUF_SIZE];
+            size_t raw_len = shared_frame_read(g_frame, raw_buf, SHM_FRAME_BUF_SIZE);
+            
+            if (raw_len > 0 && raw_buf[0] == 0xFF && raw_buf[1] == 0xD8) {
+                char part_header[160];
+                int hlen = snprintf(part_header, sizeof(part_header),
+                    "--frame\r\n"
+                    "Content-Type: image/jpeg\r\n"
+                    "Content-Length: %zu\r\n"
+                    "\r\n", raw_len);
+
+                size_t total = hlen + raw_len + 2;
+                unsigned char *sendbuf = malloc(total);
+                if (sendbuf) {
+                    memcpy(sendbuf, part_header, hlen);
+                    memcpy(sendbuf + hlen, raw_buf, raw_len);
+                    sendbuf[hlen + raw_len] = '\r';
+                    sendbuf[hlen + raw_len + 1] = '\n';
+
+                    if (SSL_write(ssl, sendbuf, total) <= 0) {
+                        free(sendbuf);
+                        break;
+                    }
+                    free(sendbuf);
+                }
+            }
+            
+        } else {
+            pthread_mutex_lock(&frame_mutex);
+            size_t len = current_len;
+            unsigned char *copy = NULL;
+            if (len > 0) {
+                copy = malloc(len);
+                if (copy) memcpy(copy, current_frame, len);
+            }
+            pthread_mutex_unlock(&frame_mutex);
+
+            if (copy && len > 0) {
+                char part_header[160];
+                int hlen = snprintf(part_header, sizeof(part_header),
+                    "--frame\r\n"
+                    "Content-Type: image/jpeg\r\n"
+                    "Content-Length: %zu\r\n"
+                    "\r\n", len);
+
+                size_t total = hlen + len + 2;
+                unsigned char *sendbuf = malloc(total);
+                if (sendbuf) {
+                    memcpy(sendbuf, part_header, hlen);
+                    memcpy(sendbuf + hlen, copy, len);
+                    sendbuf[hlen + len] = '\r';
+                    sendbuf[hlen + len + 1] = '\n';
+
+                    if (SSL_write(ssl, sendbuf, total) <= 0) {
+                        free(sendbuf);
+                        free(copy);
+                        break;
+                    }
+                    free(sendbuf);
+                }
+                free(copy);
+            }
+        }
+
+        long interval = current_interval_ms;
+        next_frame.tv_nsec += interval * 1000000L;
+        while (next_frame.tv_nsec >= 1000000000L) {
+            next_frame.tv_nsec -= 1000000000L;
+            next_frame.tv_sec += 1;
+        }
+        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_frame, NULL);
+    }
+}
+
 void *frame_updater(void *arg) {
     (void)arg;
 
@@ -591,6 +713,37 @@ void *frame_updater(void *arg) {
     int last_person_count = 0;
 
     while (running) {
+        unsigned char buf[SHM_FRAME_BUF_SIZE];
+        size_t len = shared_frame_read(g_frame, buf, SHM_FRAME_BUF_SIZE);
+        
+        if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
+            pthread_mutex_lock(&watchdog_mutex);
+            
+            if (!first_frame_received) {
+                memcpy(prev_frame, buf, len);
+                prev_frame_len = len;
+                last_frame_time = time(NULL);
+                frame_stuck_count = 0;
+                first_frame_received = 1;
+            } else if (len != prev_frame_len || memcmp(buf, prev_frame, len) != 0) {
+                memcpy(prev_frame, buf, len);
+                prev_frame_len = len;
+                last_frame_time = time(NULL);
+                frame_stuck_count = 0;
+                
+                if (watchdog_alert_sent && !camera_restored_alert_sent) {
+                    camera_restored_alert_sent = 1;
+                    watchdog_alert_sent = 0;
+                    send_watchdog_alert("restored");
+                    printf("[WATCHDOG] Camera restored!\n");
+                }
+            } else {
+                frame_stuck_count++;
+            }
+            
+            pthread_mutex_unlock(&watchdog_mutex);
+        }
+
         if (g_detection_result && g_detection_sem) {
             sem_wait(g_detection_sem);
             int count = g_detection_result->person_count;
@@ -686,12 +839,22 @@ void *watchdog_monitor(void *arg) {
                 watchdog_alert_sent = 1;
                 camera_restored_alert_sent = 0;
                 send_watchdog_alert("offline");
-                printf("[WATCHDOG] Camera offline/stuck! No change for %d seconds\n", timeout_seconds);
+                printf("[WATCHDOG] No frames for %d seconds!\n", timeout_seconds);
                 
-                // Restart the server via systemd
                 run_command("systemctl restart server.service 2>/dev/null &");
                 printf("[WATCHDOG] Server restart triggered\n");
+                running = 0;
+            }
+        }
+        else if (frame_stuck_count > 100) {
+            if (!watchdog_alert_sent) {
+                watchdog_alert_sent = 1;
+                camera_restored_alert_sent = 0;
+                send_watchdog_alert("stuck");
+                printf("[WATCHDOG] Camera STUCK! %d frames unchanged\n", frame_stuck_count);
                 
+                run_command("systemctl restart server.service 2>/dev/null &");
+                printf("[WATCHDOG] Server restart triggered\n");
                 running = 0;
             }
         }
@@ -729,65 +892,6 @@ void send_redirect(int fd, const char *host_header) {
         "<html>Redirecting...</html>",
         location);
     send(fd, msg, strlen(msg), 0);
-}
-
-static void handle_mjpeg_stream(SSL *ssl) {
-    const char *header =
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: keep-alive\r\n"
-        "\r\n";
-
-    if (SSL_write(ssl, header, strlen(header)) <= 0) return;
-
-    struct timespec next_frame;
-    clock_gettime(CLOCK_MONOTONIC, &next_frame);
-
-    while (running) {
-        pthread_mutex_lock(&frame_mutex);
-        size_t len = current_len;
-        unsigned char *copy = NULL;
-        if (len > 0) {
-            copy = malloc(len);
-            if (copy) memcpy(copy, current_frame, len);
-        }
-        pthread_mutex_unlock(&frame_mutex);
-
-        if (copy && len > 0) {
-            char part_header[160];
-            int hlen = snprintf(part_header, sizeof(part_header),
-                "--frame\r\n"
-                "Content-Type: image/jpeg\r\n"
-                "Content-Length: %zu\r\n"
-                "\r\n", len);
-
-            size_t total = hlen + len + 2;
-            unsigned char *sendbuf = malloc(total);
-            if (sendbuf) {
-                memcpy(sendbuf, part_header, hlen);
-                memcpy(sendbuf + hlen, copy, len);
-                sendbuf[hlen + len] = '\r';
-                sendbuf[hlen + len + 1] = '\n';
-
-                if (SSL_write(ssl, sendbuf, total) <= 0) {
-                    free(sendbuf);
-                    free(copy);
-                    break;
-                }
-                free(sendbuf);
-            }
-        }
-        free(copy);
-
-        long interval = current_interval_ms;
-        next_frame.tv_nsec += interval * 1000000L;
-        while (next_frame.tv_nsec >= 1000000000L) {
-            next_frame.tv_nsec -= 1000000000L;
-            next_frame.tv_sec += 1;
-        }
-        clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_frame, NULL);
-    }
 }
 
 static void *handle_https_thread(void *arg) {
@@ -853,25 +957,11 @@ static void *handle_https_thread(void *arg) {
 
     // GET /raw_stream
     if (strcmp(path, "/raw_stream") == 0) {
-        unsigned char raw_buf[BUFFER_SIZE];
-        size_t raw_len = shared_frame_read(g_frame, raw_buf, BUFFER_SIZE);
-        
-        if (raw_len > 0 && raw_buf[0] == 0xFF && raw_buf[1] == 0xD8) {
-            char header[256];
-            snprintf(header, sizeof(header),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: image/jpeg\r\n"
-                "Content-Length: %zu\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Connection: close\r\n"
-                "\r\n",
-                raw_len);
-            SSL_write(ssl, header, strlen(header));
-            SSL_write(ssl, raw_buf, raw_len);
-        } else {
-            const char *resp = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-            SSL_write(ssl, resp, strlen(resp));
-        }
+        // Temporarily switch to raw mode for this request
+        int saved_mode = stream_mode;
+        stream_mode = 1;
+        handle_mjpeg_stream(ssl);
+        stream_mode = saved_mode;
         SSL_free(ssl);
         close(fd);
         return NULL;
@@ -1019,6 +1109,65 @@ static void *handle_https_thread(void *arg) {
             strlen(json), json);
 
         SSL_write(ssl, header, strlen(header));
+        SSL_free(ssl);
+        close(fd);
+        return NULL;
+    }
+
+    // POST /api/v1/stream_mode
+    if (strcmp(path, "/api/v1/stream_mode") == 0) {
+        if (strcmp(method, "POST") == 0) {
+            char *body = strstr(req, "\r\n\r\n");
+            if (body) {
+                body += 4;
+                if (strstr(body, "\"mode\":\"idle\"")) {
+                    stream_mode = 0;
+                    printf("[STREAM] Mode set to: IDLE (OFF)\n");
+                } else if (strstr(body, "\"mode\":\"raw\"")) {
+                    stream_mode = 1;
+                    printf("[STREAM] Mode set to: RAW\n");
+                } else if (strstr(body, "\"mode\":\"processed\"")) {
+                    stream_mode = 2;
+                    printf("[STREAM] Mode set to: PROCESSED\n");
+                }
+            }
+            const char *mode_str = stream_mode == 0 ? "idle" : (stream_mode == 1 ? "raw" : "processed");
+            char resp[256];
+            snprintf(resp, sizeof(resp),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"mode\":\"%s\"}",
+                mode_str);
+            SSL_write(ssl, resp, strlen(resp));
+        } else {
+            const char *resp = 
+                "HTTP/1.1 405 Method Not Allowed\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 36\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"Method not allowed\"}";
+            SSL_write(ssl, resp, strlen(resp));
+        }
+        SSL_free(ssl);
+        close(fd);
+        return NULL;
+    }
+
+    // GET /api/v1/stream_mode
+    if (strcmp(path, "/api/v1/stream_mode") == 0) {
+        const char *mode_str = stream_mode == 0 ? "idle" : (stream_mode == 1 ? "raw" : "processed");
+        char resp[256];
+        snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"mode\":\"%s\"}",
+            mode_str);
+        SSL_write(ssl, resp, strlen(resp));
         SSL_free(ssl);
         close(fd);
         return NULL;
@@ -1225,6 +1374,9 @@ int main(void) {
         return 1;
     }
 
+    // ============================================================
+    // Connect to detection service shared memory
+    // ============================================================
     g_detection_sem = sem_open(SEM_DETECTION_NAME, O_CREAT, 0666, 1);
     if (g_detection_sem == SEM_FAILED) {
         perror("[SERVER] sem_open detection");
@@ -1397,5 +1549,3 @@ int main(void) {
     printf("Server stopped.\n");
     return 0;
 }
-
-
