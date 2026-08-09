@@ -77,20 +77,26 @@ static size_t prev_frame_len = 0;
 static int first_frame_received = 0;
 static pthread_mutex_t watchdog_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Email debounce global
+// Email debounce
 static time_t last_email_time = 0;
-
-// Detection state for async processing
-static int pending_detection_count = 0;
-static float pending_detection_temp = 0;
-static unsigned char pending_frame[BUFFER_SIZE] = {0};
-static size_t pending_frame_len = 0;
-static int pending_is_guard_event = 0;
-static int pending_processed = 0;
-static pthread_mutex_t pending_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Guard event tracking
 static int active_detection_event = 0;
+
+// ============================================================
+// EMAIL THREAD - Signal-based async
+// ============================================================
+static int email_pending = 0;
+static int email_count = 0;
+static float email_temp = 0;
+static unsigned char email_frame[BUFFER_SIZE];
+static size_t email_frame_len = 0;
+static int email_immediate = 0;
+static int email_has_frame = 0;
+static pthread_mutex_t email_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t email_cond = PTHREAD_COND_INITIALIZER;
+static int email_thread_running = 1;
+static pthread_t email_thread;
 
 static void trim(char *str) {
     char *start = str;
@@ -259,6 +265,34 @@ static float read_cpu_usage(void) {
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
+static void *telemetry_updater(void *arg) {
+    (void)arg;
+    while (running) {
+        pthread_mutex_lock(&telemetry_mutex);
+        cached_temp = read_temp();
+        cached_mem = read_mem_available();
+        cached_cpu = read_cpu_usage();
+        pthread_mutex_unlock(&telemetry_mutex);
+        
+        if (mqtt_initialized) {
+            mqtt_publish_telemetry(cached_temp, cached_mem, cached_cpu);
+        }
+        
+        if (cached_temp > g_temp_throttle_c && current_interval_ms > g_min_interval_ms) {
+            printf("[THERMAL] Temp %.1f C > %d C, throttling to %dms\n", 
+                   cached_temp, g_temp_throttle_c, g_min_interval_ms);
+            current_interval_ms = g_min_interval_ms;
+        } else if (cached_temp <= g_temp_throttle_c - 5 && current_interval_ms != g_frame_interval_ms) {
+            current_interval_ms = g_frame_interval_ms;
+            printf("[THERMAL] Temp %.1f C, restoring to %dms\n", 
+                   cached_temp, current_interval_ms);
+        }
+        
+        sleep(2);
+    }
+    return NULL;
+}
+
 void add_history(int count, float temp)
 {
     pthread_mutex_lock(&history_mutex);
@@ -274,33 +308,96 @@ void add_history(int count, float temp)
     pthread_mutex_unlock(&history_mutex);
 }
 
-static void send_detection_email(int count, float temp, const unsigned char *buf, size_t len, int immediate)
-{
-    time_t now = time(NULL);
+static void *email_thread_func(void *arg) {
+    (void)arg;
     
-    if (!immediate && (now - last_email_time < 30)) {
-        return;
-    }
-    
-    unsigned char *frame_copy = NULL;
-    size_t copy_len = 0;
-    
-    if (buf && len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
-        frame_copy = malloc(len);
-        if (frame_copy) {
-            memcpy(frame_copy, buf, len);
-            copy_len = len;
+    while (email_thread_running) {
+        int count = 0;
+        float temp = 0;
+        int immediate = 0;
+        unsigned char frame[BUFFER_SIZE];
+        size_t frame_len = 0;
+        int has_frame = 0;
+        
+        pthread_mutex_lock(&email_mutex);
+        while (!email_pending && email_thread_running) {
+            pthread_cond_wait(&email_cond, &email_mutex);
+        }
+        
+        if (!email_thread_running) {
+            pthread_mutex_unlock(&email_mutex);
+            break;
+        }
+        
+        if (email_pending) {
+            count = email_count;
+            temp = email_temp;
+            immediate = email_immediate;
+            has_frame = email_has_frame;
+            frame_len = email_frame_len;
+            if (has_frame && frame_len > 0 && frame_len < BUFFER_SIZE) {
+                memcpy(frame, email_frame, frame_len);
+            }
+            email_pending = 0;
+        }
+        pthread_mutex_unlock(&email_mutex);
+        
+        unsigned char *frame_copy = NULL;
+        if (has_frame && frame_len > 0) {
+            frame_copy = malloc(frame_len);
+            if (frame_copy) {
+                memcpy(frame_copy, frame, frame_len);
+            }
+        }
+        
+        if (immediate) {
+            if (frame_copy && frame_len > 0) {
+                email_send_alert_guard(count, temp, frame_copy, frame_len);
+            } else {
+                email_send_alert_guard(count, temp, NULL, 0);
+            }
+            free(frame_copy);
+            printf("[EMAIL] Guard email sent: %d person(s)\n", count);
+        } else {
+            time_t now = time(NULL);
+            if (now - last_email_time >= 30) {
+                if (frame_copy && frame_len > 0) {
+                    email_send_alert(count, temp, frame_copy, frame_len);
+                } else {
+                    email_send_alert(count, temp, NULL, 0);
+                }
+                free(frame_copy);
+                last_email_time = now;
+                printf("[EMAIL] Normal email sent: %d person(s)\n", count);
+            } else {
+                free(frame_copy);
+                printf("[EMAIL] Normal suppressed (debounce): %d person(s)\n", count);
+            }
         }
     }
+    return NULL;
+}
+
+static void send_detection_email(int count, float temp, const unsigned char *buf, size_t len, int immediate)
+{
+    pthread_mutex_lock(&email_mutex);
     
-    if (frame_copy && copy_len > 0) {
-        email_send_alert(count, temp, frame_copy, copy_len);
-        free(frame_copy);
+    email_count = count;
+    email_temp = temp;
+    email_immediate = immediate;
+    email_pending = 1;
+    
+    if (buf && len > 0 && len < BUFFER_SIZE) {
+        memcpy(email_frame, buf, len);
+        email_frame_len = len;
+        email_has_frame = 1;
     } else {
-        email_send_alert(count, temp, NULL, 0);
+        email_frame_len = 0;
+        email_has_frame = 0;
     }
     
-    last_email_time = now;
+    pthread_cond_signal(&email_cond);
+    pthread_mutex_unlock(&email_mutex);
 }
 
 // ============================================================
@@ -329,90 +426,8 @@ static void send_watchdog_alert(const char *status)
 }
 
 // ============================================================
-// Process pending detection (called from telemetry_updater)
+// frame_updater - Detection only, signals email thread
 // ============================================================
-static void process_pending_detection(void)
-{
-    int count = 0;
-    float temp = 0;
-    int is_guard_event = 0;
-    unsigned char frame[BUFFER_SIZE];
-    size_t frame_len = 0;
-    int should_process = 0;
-    
-    pthread_mutex_lock(&pending_mutex);
-    if (!pending_processed && pending_detection_count > 0) {
-        count = pending_detection_count;
-        temp = pending_detection_temp;
-        is_guard_event = pending_is_guard_event;
-        frame_len = pending_frame_len;
-        if (frame_len > 0 && frame_len < BUFFER_SIZE) {
-            memcpy(frame, pending_frame, frame_len);
-        }
-        pending_processed = 1;
-        should_process = 1;
-    }
-    pthread_mutex_unlock(&pending_mutex);
-    
-    if (!should_process) return;
-    
-    add_history(count, temp);
-    
-    if (mqtt_initialized) {
-        mqtt_publish_persons(count, temp);
-    }
-    
-    if (guard_enabled) {
-        if (mqtt_initialized) {
-            mqtt_publish_alarm(count, temp);
-        }
-        
-        if (is_guard_event) {
-            if (frame_len > 0) {
-                email_send_alert_guard(count, temp, frame, frame_len);
-            } else {
-                email_send_alert_guard(count, temp, NULL, 0);
-            }
-            printf("[PROCESS] GUARD email sent: %d person(s)\n", count);
-        } else {
-            printf("[PROCESS] GUARD email suppressed (same event): %d person(s)\n", count);
-        }
-        
-    } else {
-        send_detection_email(count, temp, frame, frame_len, 0);
-    }
-}
-
-static void *telemetry_updater(void *arg) {
-    (void)arg;
-    while (running) {
-        pthread_mutex_lock(&telemetry_mutex);
-        cached_temp = read_temp();
-        cached_mem = read_mem_available();
-        cached_cpu = read_cpu_usage();
-        pthread_mutex_unlock(&telemetry_mutex);
-        
-        process_pending_detection();
-        
-        if (mqtt_initialized) {
-            mqtt_publish_telemetry(cached_temp, cached_mem, cached_cpu);
-        }
-        
-        if (cached_temp > g_temp_throttle_c && current_interval_ms > g_min_interval_ms) {
-            printf("[THERMAL] Temp %.1f C > %d C, throttling to %dms\n", 
-                   cached_temp, g_temp_throttle_c, g_min_interval_ms);
-            current_interval_ms = g_min_interval_ms;
-        } else if (cached_temp <= g_temp_throttle_c - 5 && current_interval_ms != g_frame_interval_ms) {
-            current_interval_ms = g_frame_interval_ms;
-            printf("[THERMAL] Temp %.1f C, restoring to %dms\n", 
-                   cached_temp, current_interval_ms);
-        }
-        
-        sleep(1);
-    }
-    return NULL;
-}
-
 void *frame_updater(void *arg) {
     (void)arg;
 
@@ -482,20 +497,25 @@ void *frame_updater(void *arg) {
                     active_detection_event == 0) {
                     is_new_event = 1;
                     active_detection_event = 1;
+                    if (guard_enabled) {
+                        printf("[GUARD] New detection event started (count: %d)\n", res.person_count);
+                    }
                 }
                 last_person_count = res.person_count;
                 
-                pthread_mutex_lock(&pending_mutex);
-                pending_detection_count = res.person_count;
-                pending_detection_temp = temp;
-                pending_is_guard_event = guard_enabled && is_new_event;
-                pending_processed = 0;
+                // Add to history
+                add_history(res.person_count, temp);
                 
-                if (len > 0 && len < BUFFER_SIZE) {
-                    memcpy(pending_frame, buf, len);
-                    pending_frame_len = len;
+                // Publish MQTT
+                if (mqtt_initialized) {
+                    mqtt_publish_persons(res.person_count, temp);
+                    if (guard_enabled) {
+                        mqtt_publish_alarm(res.person_count, temp);
+                    }
                 }
-                pthread_mutex_unlock(&pending_mutex);
+                
+                int immediate = guard_enabled && is_new_event;
+                send_detection_email(res.person_count, temp, buf, len, immediate);
                 
             } else {
                 no_detection_frame_count++;
@@ -1066,6 +1086,12 @@ int main(void) {
 
     last_frame_time = time(NULL);
 
+    // ============================================================
+    // START EMAIL THREAD
+    // ============================================================
+    pthread_create(&email_thread, NULL, email_thread_func, NULL);
+    printf("[EMAIL] Email thread started\n");
+
     pthread_t updater, telemetry_thread, watchdog_thread;
     pthread_create(&updater, NULL, frame_updater, NULL);
     pthread_create(&telemetry_thread, NULL, telemetry_updater, NULL);
@@ -1170,6 +1196,15 @@ int main(void) {
     }
 
     printf("\nShutting down...\n");
+    
+    // ============================================================
+    // STOP EMAIL THREAD
+    // ============================================================
+    email_thread_running = 0;
+    pthread_cond_signal(&email_cond);
+    pthread_join(email_thread, NULL);
+    printf("[EMAIL] Email thread stopped\n");
+
     pthread_join(updater, NULL);
     pthread_join(telemetry_thread, NULL);
     pthread_join(watchdog_thread, NULL);
