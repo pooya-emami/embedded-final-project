@@ -352,9 +352,6 @@ void add_history(int count, float temp)
     pthread_mutex_unlock(&history_mutex);
 }
 
-// ============================================================
-// Process pending detection (called from telemetry_updater)
-// ============================================================
 static void process_pending_detection(void)
 {
     int count = 0;
@@ -380,9 +377,6 @@ static void process_pending_detection(void)
     
     if (!should_process) return;
     
-    // ============================================================
-    // HEAVY OPERATIONS - Runs in telemetry thread (every 2 seconds)
-    // ============================================================
     printf("[PROCESS] Processing detection: %d persons\n", count);
     
     // Add to history
@@ -422,9 +416,6 @@ static void *telemetry_updater(void *arg) {
         cached_cpu = read_cpu_usage();
         pthread_mutex_unlock(&telemetry_mutex);
         
-        // ============================================================
-        // Process pending detection (HEAVY OPS - runs every 2 seconds)
-        // ============================================================
         process_pending_detection();
         
         if (mqtt_initialized) {
@@ -446,9 +437,6 @@ static void *telemetry_updater(void *arg) {
     return NULL;
 }
 
-// ============================================================
-// frame_updater - FAST PATH (only detection)
-// ============================================================
 void *frame_updater(void *arg) {
     (void)arg;
 
@@ -489,9 +477,6 @@ void *frame_updater(void *arg) {
             pthread_mutex_unlock(&watchdog_mutex);
         }
 
-        // ============================================================
-        // DETECTION - FAST PATH (only detection, no heavy ops)
-        // ============================================================
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
             
@@ -529,9 +514,6 @@ void *frame_updater(void *arg) {
                 }
                 last_person_count = res.person_count;
                 
-                // ============================================================
-                // STORE for async processing (non-blocking, just copy data)
-                // ============================================================
                 pthread_mutex_lock(&pending_mutex);
                 pending_detection_count = res.person_count;
                 pending_detection_temp = temp;
@@ -542,9 +524,7 @@ void *frame_updater(void *arg) {
                     memcpy(pending_frame, buf, len);
                     pending_frame_len = len;
                 }
-                pthread_mutex_unlock(&pending_mutex);
-                
-                printf("[DETECTION] Person(s) detected: %d, queued for processing\n", res.person_count);
+                pthread_mutex_unlock(&pending_mutex); 
                 
             } else {
                 no_detection_frame_count++;
