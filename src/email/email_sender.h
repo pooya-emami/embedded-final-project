@@ -16,4 +16,6 @@ int email_send_alert_guard(int persons, float cpu_temp,
 
 int email_send_alert_watchdog(float cpu_temp);
 
+int email_send_alert_thermal(float cpu_temp);
+
 #endif

@@ -315,6 +315,17 @@ static void add_history_internal(int count, float temp)
 
 static void *telemetry_updater(void *arg) {
     (void)arg;
+    
+    static int original_width = 0;
+    static int original_height = 0;
+    static int throttled = 0;
+    static int throttle_email_sent = 0;
+    
+    if (original_width == 0) {
+        original_width = g_frame_width;
+        original_height = g_frame_height;
+    }
+    
     while (running) {
         pthread_mutex_lock(&telemetry_mutex);
         cached_temp = read_temp();
@@ -322,18 +333,51 @@ static void *telemetry_updater(void *arg) {
         cached_cpu = read_cpu_usage();
         pthread_mutex_unlock(&telemetry_mutex);
         
-        if (mqtt_initialized) {
-            mqtt_publish_telemetry(cached_temp, cached_mem, cached_cpu);
+        if (cached_temp > g_temp_throttle_c) {
+            if (!throttled) {
+                // Reduce FPS: increase interval by 50%
+                current_interval_ms = (int)(g_frame_interval_ms * 1.5);
+                if (current_interval_ms < g_min_interval_ms) {
+                    current_interval_ms = g_min_interval_ms;
+                }
+                
+                g_frame_width = original_width / 2;
+                g_frame_height = original_height / 2;
+                throttled = 1;
+                throttle_email_sent = 0;
+                
+                printf("[THERMAL] Temp %.1f C > %d C, throttling:\n", 
+                       cached_temp, g_temp_throttle_c);
+                printf("[THERMAL]   FPS: %.1f -> %.1f\n",
+                       1000.0 / g_frame_interval_ms, 1000.0 / current_interval_ms);
+                printf("[THERMAL]   Resolution: %dx%d -> %dx%d\n",
+                       original_width, original_height,
+                       g_frame_width, g_frame_height);
+            }
+            
+            if (!throttle_email_sent) {
+                email_send_alert_thermal(cached_temp);
+                throttle_email_sent = 1;
+            }
+            
+        } else if (cached_temp <= g_temp_throttle_c - 5 && throttled) {
+            current_interval_ms = g_frame_interval_ms;
+            g_frame_width = original_width;
+            g_frame_height = original_height;
+            throttled = 0;
+            throttle_email_sent = 0;
+            
+            printf("[THERMAL] Temp %.1f C <= %d C, restored:\n", 
+                   cached_temp, g_temp_throttle_c - 5);
+            printf("[THERMAL]   FPS: %.1f -> %.1f\n",
+                   1000.0 / current_interval_ms, 1000.0 / g_frame_interval_ms);
+            printf("[THERMAL]   Resolution: %dx%d -> %dx%d\n",
+                   original_width / 2, original_height / 2,
+                   original_width, original_height);
         }
         
-        if (cached_temp > g_temp_throttle_c && current_interval_ms > g_min_interval_ms) {
-            printf("[THERMAL] Temp %.1f C > %d C, throttling to %dms\n", 
-                   cached_temp, g_temp_throttle_c, g_min_interval_ms);
-            current_interval_ms = g_min_interval_ms;
-        } else if (cached_temp <= g_temp_throttle_c - 5 && current_interval_ms != g_frame_interval_ms) {
-            current_interval_ms = g_frame_interval_ms;
-            printf("[THERMAL] Temp %.1f C, restoring to %dms\n", 
-                   cached_temp, current_interval_ms);
+        if (mqtt_initialized) {
+            mqtt_publish_telemetry(cached_temp, cached_mem, cached_cpu);
         }
         
         sleep(2);
