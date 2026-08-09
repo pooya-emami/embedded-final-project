@@ -6,8 +6,8 @@ Requires=relay.service
 [Service]
 Type=simple
 User=pooya
-WorkingDirectory=/home/pooya/embproj/proj
-ExecStart=/home/pooya/embproj/proj/detection_server
+WorkingDirectory=/home/pooya/embproj/proj/src/detection
+ExecStart=/home/pooya/embproj/proj/src/detection/detection_server
 Restart=always
 RestartSec=5
 StandardOutput=journal
