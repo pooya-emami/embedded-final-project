@@ -1,7 +1,15 @@
 #ifndef MQTT_CLIENT_H
 #define MQTT_CLIENT_H
 
-void mqtt_init(const char *host, int port, const char *user, const char *pass);
+#include <stddef.h>
+
+#define STUDENT_ID "404300409"
+#define CLIENTID "pooya_security_client"
+
+// Called once with config values
+void mqtt_init(const char *host, int port, 
+               const char *user, const char *pass);
+
 void mqtt_publish_persons(int count, float temp);
 void mqtt_publish_telemetry(float temp, long mem, float cpu);
 void mqtt_publish_alarm(int count, float temp);

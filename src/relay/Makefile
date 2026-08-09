@@ -1,9 +1,9 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -std=gnu11 -I. -I../common
+CFLAGS = -Wall -Wextra -O2 -std=gnu11 -I. -I.. -I../common
 LDFLAGS = -lpthread -lrt
 
-SRC = $(wildcard *.c) ../common/shared_frame.c
-OBJ = $(SRC:.c=.o)
+SRC = mjpeg_relay.c ../common/shared_frame.c
+OBJ = mjpeg_relay.o shared_frame.o
 TARGET = mjpeg_relay
 
 all: $(TARGET)
@@ -11,7 +11,10 @@ all: $(TARGET)
 $(TARGET): $(OBJ)
 	$(CC) $(OBJ) -o $@ $(LDFLAGS)
 
-%.o: %.c
+mjpeg_relay.o: mjpeg_relay.c mjpeg_relay.h ../common/shared_frame.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+shared_frame.o: ../common/shared_frame.c ../common/shared_frame.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:

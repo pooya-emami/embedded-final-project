@@ -2,83 +2,122 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>Embedded Security System</title>
-
+    <title>Embedded Security System - 404300409</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            background: #f4f4f4;
-            margin: 0;
-            padding: 20px;
-        }
-        h1 {
-            background: #222;
-            color: #fff;
-            padding: 10px;
-        }
-        #tele {
-            background: #fff;
-            padding: 10px;
-            margin-top: 15px;
+        body { font-family: Arial, sans-serif; background: #f4f4f4; margin: 0; padding: 20px; }
+        h1 { background: #222; color: #fff; padding: 15px; }
+        .container { display: flex; flex-wrap: wrap; gap: 20px; }
+        .card { background: #fff; padding: 15px; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        #stream { border: 3px solid #333; border-radius: 5px; max-width: 640px; }
+        #tele { font-size: 1.1em; }
+        .status { font-size: 0.9em; color: #666; }
+        .guard-toggle { margin: 10px 0; }
+        .guard-toggle button { 
+            padding: 10px 20px; 
+            font-size: 1em; 
+            border: none; 
             border-radius: 5px;
-            width: 300px;
-            box-shadow: 0 0 5px rgba(0,0,0,0.2);
+            cursor: pointer;
         }
-        img {
-            border: 3px solid #333;
-            border-radius: 5px;
-            display: block;
-            margin-bottom: 10px;
-            /* Add a subtle loading indicator */
-            background: #ddd;
-        }
-        .status {
-            font-size: 0.9em;
-            color: #666;
-            margin: 5px 0;
-        }
+        .guard-on { background: #4CAF50; color: white; }
+        .guard-off { background: #f44336; color: white; }
     </style>
 </head>
-
 <body>
 
-<h1>Embedded Security System – Pooya Emami</h1>
+<h1>Embedded Security System – Pooya Emami (404300409)</h1>
 
-<!-- Live stream image -->
-<img id="stream" src="/stream" width="480" alt="Live Stream">
-<div class="status" id="streamStatus">Stream: Loading...</div>
+<div class="container">
+    <div class="card">
+        <h3>Live Stream</h3>
+        <img id="stream" src="/stream" width="640" alt="Live Stream">
+        <div class="status" id="streamStatus">Stream: Loading...</div>
+    </div>
 
-<h3>Telemetry</h3>
-<div id="tele">Loading...</div>
+    <div class="card">
+        <h3>Detection Status</h3>
+        <div id="personCount" style="font-size: 2em; color: #2196F3;">0 persons</div>
+        
+        <h3>Guard Mode</h3>
+        <div class="guard-toggle">
+            <button id="guardBtn" class="guard-off" onclick="toggleGuard()">Enable Guard</button>
+        </div>
+        <div id="guardStatus" style="font-size: 0.9em; color: #666;">Guard: disabled</div>
+
+        <h3>Telemetry</h3>
+        <div id="tele">Loading...</div>
+    </div>
+</div>
 
 <script>
-// Telemetry update
+let guardEnabled = false;
+
 function updateTelemetry() {
-    fetch('/telemetry')
+    fetch('/api/v1/telemetry')
         .then(response => response.json())
         .then(data => {
-            document.getElementById('tele').innerHTML =
-                "CPU Temp: " + data.temp + " °C<br>" +
-                "Free Memory: " + data.mem + " kB<br>" +
-                "CPU Load: " + data.cpu + " %";
+            document.getElementById('tele').innerHTML = 
+                "CPU Temp: " + (data.temp || 0).toFixed(1) + " °C<br>" +
+                "Free Memory: " + (data.mem || 0) + " kB<br>" +
+                "CPU Load: " + (data.cpu || 0).toFixed(1) + " %";
         })
-        .catch(err => {
+        .catch(() => {
             document.getElementById('tele').innerHTML = "Error loading telemetry";
         });
 }
 
-function updateStream() {
-    const img = document.getElementById('stream');
-    img.src = '/stream?t=' + Date.now(); 
-
+function updatePersonCount() {
+    fetch('/api/v1/persons')
+        .then(response => response.json())
+        .then(data => {
+            const el = document.getElementById('personCount');
+            const count = data.count || 0;
+            el.textContent = count + " person" + (count !== 1 ? "s" : "");
+            el.style.color = count > 0 ? '#f44336' : '#2196F3';
+        })
+        .catch(() => {
+            document.getElementById('personCount').textContent = "Error";
+        });
 }
 
+function toggleGuard() {
+    const newState = !guardEnabled;
+    fetch('/api/v1/guard', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: newState })
+    })
+    .then(response => response.json())
+    .then(data => {
+        guardEnabled = data.guard_enabled;
+        updateGuardUI();
+    })
+    .catch(err => {
+        console.error('Guard toggle error:', err);
+    });
+}
 
+function updateGuardUI() {
+    const btn = document.getElementById('guardBtn');
+    const status = document.getElementById('guardStatus');
+    if (guardEnabled) {
+        btn.textContent = 'Disable Guard';
+        btn.className = 'guard-on';
+        status.textContent = 'Guard: enabled (alerts active)';
+        status.style.color = '#4CAF50';
+    } else {
+        btn.textContent = 'Enable Guard';
+        btn.className = 'guard-off';
+        status.textContent = 'Guard: disabled (no alerts)';
+        status.style.color = '#f44336';
+    }
+}
+
+// Update telemetry every 2 seconds
 setInterval(updateTelemetry, 2000);
+setInterval(updatePersonCount, 5000);  // Update person count less frequently
 updateTelemetry();
-
-setInterval(updateStream, 1);
-updateStream(); 
+updatePersonCount();
 </script>
 
 </body>

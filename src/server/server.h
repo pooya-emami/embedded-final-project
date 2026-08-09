@@ -32,21 +32,16 @@ extern int g_temp_throttle_c;
 extern int g_min_interval_ms;
 extern int g_watchdog_timeout_ms;
 
+// SMTP config (accessible to email_sender.c)
+extern char g_smtp_server[128];
+extern char g_smtp_user[128];
+extern char g_smtp_pass[128];
+extern char g_smtp_to[128];
+
 // Functions
 void load_config(const char *filename);
 void reload_config(const char *filename);
-
-// Telemetry functions
-float read_cpu_temp(void);
-long  read_free_mem(void);
-float read_cpu_load(void);
-
-// Frame functions
-void send_frame(int client_fd);
-void send_html(int client_fd);
-void send_telemetry(int client_fd);
-
-// Frame updater thread
+void send_redirect(int fd, const char *host_header);
 void *frame_updater(void *arg);
 
 // History management

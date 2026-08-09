@@ -18,7 +18,11 @@
 #include "server.h"
 #include "shared_frame.h"
 #include "human_detector.hpp"
+#include "email_sender.h"
+#include "mqtt_client.h"
+#include "sqlite_history.h"
 
+// Global config variables
 int g_frame_interval_ms = DEFAULT_FRAME_INTERVAL_MS;
 int g_frame_width = DEFAULT_FRAME_WIDTH;
 int g_frame_height = DEFAULT_FRAME_HEIGHT;
@@ -29,27 +33,36 @@ int g_temp_throttle_c = DEFAULT_TEMP_THROTTLE_C;
 int g_min_interval_ms = DEFAULT_MIN_INTERVAL_MS;
 int g_watchdog_timeout_ms = DEFAULT_WATCHDOG_TIMEOUT_MS;
 
-static shared_frame_t *g_frame;
+// SMTP config - accessible to email_sender.c
+char g_smtp_server[128] = {0};
+char g_smtp_user[128] = {0};
+char g_smtp_pass[128] = {0};
+char g_smtp_to[128] = {0};
+
+// MQTT config - loaded from config file, NOT hardcoded
+static char g_mqtt_host[128] = {0};
+static int g_mqtt_port = 1883;
+static char g_mqtt_user[128] = {0};
+static char g_mqtt_pass[128] = {0};
+
+// Static globals
+static shared_frame_t *g_frame = NULL;
 static unsigned char current_frame[BUFFER_SIZE];
 static size_t current_len = 0;
-
 static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
 static volatile int running = 1;
-
 static SSL_CTX *ssl_ctx = NULL;
-
 static detection_record_t *history = NULL;
 static int history_count = 0;
 static pthread_mutex_t history_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 static char *html_cache = NULL;
-
 static float cached_temp = -1;
 static long cached_mem = -1;
 static float cached_cpu = 0;
 static pthread_mutex_t telemetry_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 static int current_interval_ms = 100;
+static int guard_enabled = 0;  // SINGLE declaration at file scope
+static int mqtt_initialized = 0;
 
 static void trim(char *str) {
     char *start = str;
@@ -114,6 +127,30 @@ void load_config(const char *filename) {
         } else if (strcmp(key, "WATCHDOG_TIMEOUT_MS") == 0) {
             g_watchdog_timeout_ms = atoi(value);
             loaded++;
+        } else if (strcmp(key, "SMTP_SERVER") == 0) {
+            strcpy(g_smtp_server, value);
+            loaded++;
+        } else if (strcmp(key, "SMTP_USER") == 0) {
+            strcpy(g_smtp_user, value);
+            loaded++;
+        } else if (strcmp(key, "SMTP_PASS") == 0) {
+            strcpy(g_smtp_pass, value);
+            loaded++;
+        } else if (strcmp(key, "SMTP_TO") == 0) {
+            strcpy(g_smtp_to, value);
+            loaded++;
+        } else if (strcmp(key, "MQTT_HOST") == 0) {
+            strcpy(g_mqtt_host, value);
+            loaded++;
+        } else if (strcmp(key, "MQTT_PORT") == 0) {
+            g_mqtt_port = atoi(value);
+            loaded++;
+        } else if (strcmp(key, "MQTT_USER") == 0) {
+            strcpy(g_mqtt_user, value);
+            loaded++;
+        } else if (strcmp(key, "MQTT_PASS") == 0) {
+            strcpy(g_mqtt_pass, value);
+            loaded++;
         }
     }
     
@@ -126,7 +163,7 @@ void reload_config(const char *filename) {
     load_config(filename);
     current_interval_ms = g_frame_interval_ms;
     printf("[RELOAD] New interval: %dms (%.1f fps)\n", 
-           current_interval_ms, 1000.0/current_interval_ms);
+           current_interval_ms, 1000.0 / current_interval_ms);
 }
 
 static void signal_handler(int sig) {
@@ -224,7 +261,11 @@ static void *telemetry_updater(void *arg) {
         cached_cpu = read_cpu_usage();
         pthread_mutex_unlock(&telemetry_mutex);
         
-        if (cached_temp > g_temp_throttle_c && g_frame_interval_ms < g_min_interval_ms) {
+        if (mqtt_initialized) {
+            mqtt_publish_telemetry(cached_temp, cached_mem, cached_cpu);
+        }
+        
+        if (cached_temp > g_temp_throttle_c && current_interval_ms > g_min_interval_ms) {
             printf("[THERMAL] Temp %.1f°C > %d°C, throttling to %dms\n", 
                    cached_temp, g_temp_throttle_c, g_min_interval_ms);
             current_interval_ms = g_min_interval_ms;
@@ -249,7 +290,58 @@ void add_history(int count, float temp) {
     history[history_count].timestamp = time(NULL);
     history[history_count].temp = temp;
     history_count++;
+    history_db_add(count, temp);
     pthread_mutex_unlock(&history_mutex);
+    
+    // ALWAYS publish person count
+    if (mqtt_initialized) {
+        mqtt_publish_persons(count, temp);
+    }
+    
+    // Only send alerts if guard mode is enabled
+    if (guard_enabled && count > 0) {
+        time_t now = time(NULL);
+        static time_t last_alert_time = 0;
+        static int last_alert_count = 0;
+        
+        int should_alert = 0;
+        if (now - last_alert_time >= 30) {
+            should_alert = 1;
+        } else if (count != last_alert_count) {
+            should_alert = 1;
+        }
+        
+        if (should_alert) {
+            last_alert_time = now;
+            last_alert_count = count;
+            
+            pthread_mutex_lock(&frame_mutex);
+            unsigned char *frame_copy = NULL;
+            size_t frame_len = 0;
+            if (current_len > 0) {
+                frame_copy = malloc(current_len);
+                if (frame_copy) {
+                    memcpy(frame_copy, current_frame, current_len);
+                    frame_len = current_len;
+                }
+            }
+            pthread_mutex_unlock(&frame_mutex);
+            
+            if (frame_copy && frame_len > 0) {
+                email_send_alert(count, temp, frame_copy, frame_len);
+                free(frame_copy);
+            }
+            
+            if (mqtt_initialized) {
+                mqtt_publish_alarm(count, temp);
+            }
+            
+            printf("[ALERT] %d person(s) detected, temp: %.1f°C\n", count, temp);
+        } else {
+            printf("[DEBOUNCE] Alert suppressed: %d person(s), next in %lds\n",
+                   count, 30 - (now - last_alert_time));
+        }
+    }
 }
 
 void *frame_updater(void *arg) {
@@ -267,8 +359,10 @@ void *frame_updater(void *arg) {
             pthread_mutex_lock(&frame_mutex);
             size_t copy_len = res.jpeg_length;
             if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
-            memcpy(current_frame, res.jpeg_output, copy_len);
-            current_len = copy_len;
+            if (res.jpeg_output) {
+                memcpy(current_frame, res.jpeg_output, copy_len);
+                current_len = copy_len;
+            }
             pthread_mutex_unlock(&frame_mutex);
             free_detection_result(&res);
         }
@@ -293,16 +387,26 @@ static void set_socket_timeout(int fd, int seconds) {
     setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 
-void send_redirect(int fd) {
-    const char *msg =
+void send_redirect(int fd, const char *host_header) {
+    char location[256];
+    if (host_header && strlen(host_header) > 0) {
+        snprintf(location, sizeof(location), 
+                 "https://%s:%d/", host_header, g_port_https);
+    } else {
+        snprintf(location, sizeof(location), 
+                 "https://localhost:%d/", g_port_https);
+    }
+    
+    char msg[512];
+    snprintf(msg, sizeof(msg),
         "HTTP/1.1 301 Moved Permanently\r\n"
-        "Location: https://192.168.137.100:8443/\r\n"
+        "Location: %s\r\n"
         "Content-Type: text/html\r\n"
         "Content-Length: 24\r\n"
         "Connection: close\r\n"
         "\r\n"
-        "<html>Redirecting...</html>";
-
+        "<html>Redirecting...</html>",
+        location);
     send(fd, msg, strlen(msg), 0);
 }
 
@@ -397,6 +501,7 @@ static void *handle_https_thread(void *arg) {
     char *q = strchr(path, '?');
     if (q) *q = '\0';
 
+    // GET /
     if (strcmp(path, "/") == 0) {
         if (html_cache) {
             char header[512];
@@ -417,6 +522,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /stream or /api/v1/stream
     if (strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) {
         handle_mjpeg_stream(ssl);
         SSL_free(ssl);
@@ -424,11 +530,11 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /snapshot or /api/v1/snapshot
     if (strcmp(path, "/snapshot") == 0 || strcmp(path, "/api/v1/snapshot") == 0) {
         pthread_mutex_lock(&frame_mutex);
         size_t len = current_len;
         unsigned char *copy = NULL;
-
         if (len > 0) {
             copy = malloc(len);
             if (copy) memcpy(copy, current_frame, len);
@@ -454,6 +560,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /telemetry or /api/v1/telemetry
     if (strcmp(path, "/telemetry") == 0 || strcmp(path, "/api/v1/telemetry") == 0) {
         pthread_mutex_lock(&telemetry_mutex);
         float temp = cached_temp;
@@ -482,8 +589,18 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /api/v1/persons
     if (strcmp(path, "/api/v1/persons") == 0) {
-        int count = (rand() % 4);
+        unsigned char buf[BUFFER_SIZE];
+        size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
+        
+        int count = 0;
+        if (len > 0) {
+            DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
+            count = res.person_count;
+            free_detection_result(&res);
+        }
+        
         pthread_mutex_lock(&telemetry_mutex);
         float temp = cached_temp;
         pthread_mutex_unlock(&telemetry_mutex);
@@ -513,30 +630,33 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /api/v1/history
     if (strcmp(path, "/api/v1/history") == 0) {
-        pthread_mutex_lock(&history_mutex);
-        
-        char json[1024];
+        history_record_t *records = malloc(sizeof(history_record_t) * g_max_history);
+        int n = history_db_get_last(records, g_max_history);
+
+        char json[2048];
         char *p = json;
         p += sprintf(p, "{\"history\":[");
-        
-        for (int i = 0; i < history_count; i++) {
-            p += sprintf(p, "{\"count\":%d,\"timestamp\":%ld,\"temp\":%.2f}",
-                         history[i].count, history[i].timestamp, history[i].temp);
-            if (i < history_count - 1) {
-                p += sprintf(p, ",");
-            }
-        }
-        
-        p += sprintf(p, "]}");
-        pthread_mutex_unlock(&history_mutex);
 
-        char header[2048];
+        for (int i = 0; i < n; i++) {
+            p += sprintf(p,
+                "{\"count\":%d,\"temp\":%.2f,\"timestamp\":%ld}",
+                records[i].count,
+                records[i].temp,
+                records[i].timestamp
+            );
+            if (i < n - 1) p += sprintf(p, ",");
+        }
+
+        p += sprintf(p, "]}");
+        free(records);
+
+        char header[4096];
         snprintf(header, sizeof(header),
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             "Content-Length: %zu\r\n"
-            "Cache-Control: no-cache\r\n"
             "Connection: close\r\n"
             "\r\n%s",
             strlen(json), json);
@@ -547,31 +667,50 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    if (strcmp(path, "/api/v1/command") == 0) {
+    // GET /api/v1/history_total
+    if (strcmp(path, "/api/v1/history_total") == 0) {
+        long total = history_db_total();
+
+        char json[128];
+        snprintf(json, sizeof(json),
+                 "{\"total\":%ld}", total);
+
+        char header[256];
+        snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %zu\r\n"
+            "Connection: close\r\n"
+            "\r\n%s",
+            strlen(json), json);
+
+        SSL_write(ssl, header, strlen(header));
+        SSL_free(ssl);
+        close(fd);
+        return NULL;
+    }
+
+    // POST /api/v1/guard
+    if (strcmp(path, "/api/v1/guard") == 0) {
         if (strcmp(method, "POST") == 0) {
             char *body = strstr(req, "\r\n\r\n");
             if (body) {
                 body += 4;
-                if (strstr(body, "reboot")) {
-                    const char *resp = 
-                        "HTTP/1.1 200 OK\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Content-Length: 40\r\n"
-                        "Connection: close\r\n"
-                        "\r\n"
-                        "{\"status\":\"success\",\"cmd\":\"reboot\"}";
-                    SSL_write(ssl, resp, strlen(resp));
-                } else {
-                    const char *resp = 
-                        "HTTP/1.1 400 Bad Request\r\n"
-                        "Content-Type: application/json\r\n"
-                        "Content-Length: 35\r\n"
-                        "Connection: close\r\n"
-                        "\r\n"
-                        "{\"error\":\"Unknown command\"}";
-                    SSL_write(ssl, resp, strlen(resp));
+                if (strstr(body, "\"enabled\":true")) {
+                    guard_enabled = 1;
+                } else if (strstr(body, "\"enabled\":false")) {
+                    guard_enabled = 0;
                 }
             }
+            char resp[256];
+            snprintf(resp, sizeof(resp),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: application/json\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"guard_enabled\":%s}",
+                guard_enabled ? "true" : "false");
+            SSL_write(ssl, resp, strlen(resp));
         } else {
             const char *resp = 
                 "HTTP/1.1 405 Method Not Allowed\r\n"
@@ -587,9 +726,112 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // POST /api/v1/command
+    if (strcmp(path, "/api/v1/command") == 0) {
+        if (strcmp(method, "POST") == 0) {
+            char *body = strstr(req, "\r\n\r\n");
+            char json_resp[256];
+            
+            if (body) {
+                body += 4;
+                char *cmd_start = strstr(body, "\"cmd\":\"");
+                if (cmd_start) {
+                    cmd_start += 7;
+                    char *cmd_end = strchr(cmd_start, '"');
+                    if (cmd_end) {
+                        *cmd_end = '\0';
+                        char command[64];
+                        strncpy(command, cmd_start, sizeof(command) - 1);
+                        command[sizeof(command) - 1] = '\0';
+                        
+                        if (strcmp(command, "reboot") == 0) {
+                            printf("[CMD] Executing reboot\n");
+                            snprintf(json_resp, sizeof(json_resp),
+                                     "{\"status\":\"success\",\"cmd\":\"reboot\"}");
+                            system("shutdown -r now &");
+                        } else if (strcmp(command, "shutdown") == 0) {
+                            printf("[CMD] Executing shutdown\n");
+                            snprintf(json_resp, sizeof(json_resp),
+                                     "{\"status\":\"success\",\"cmd\":\"shutdown\"}");
+                            system("shutdown -h now &");
+                        } else if (strcmp(command, "restart_detection") == 0) {
+                            printf("[CMD] Restarting detection\n");
+                            snprintf(json_resp, sizeof(json_resp),
+                                     "{\"status\":\"success\",\"cmd\":\"restart_detection\"}");
+                            system("systemctl restart detection.service 2>/dev/null &");
+                        } else {
+                            snprintf(json_resp, sizeof(json_resp),
+                                     "{\"status\":\"success\",\"cmd\":\"%s\"}", command);
+                            char sys_cmd[128];
+                            snprintf(sys_cmd, sizeof(sys_cmd), "%s &", command);
+                            system(sys_cmd);
+                        }
+                        
+                        char header[512];
+                        snprintf(header, sizeof(header),
+                            "HTTP/1.1 200 OK\r\n"
+                            "Content-Type: application/json\r\n"
+                            "Content-Length: %zu\r\n"
+                            "Connection: close\r\n"
+                            "\r\n%s",
+                            strlen(json_resp), json_resp);
+                        SSL_write(ssl, header, strlen(header));
+                        SSL_free(ssl);
+                        close(fd);
+                        return NULL;
+                    }
+                }
+            }
+            
+            const char *resp = 
+                "HTTP/1.1 400 Bad Request\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 42\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"Invalid or missing command\"}";
+            SSL_write(ssl, resp, strlen(resp));
+        } else {
+            const char *resp = 
+                "HTTP/1.1 405 Method Not Allowed\r\n"
+                "Content-Type: application/json\r\n"
+                "Content-Length: 36\r\n"
+                "Connection: close\r\n"
+                "\r\n"
+                "{\"error\":\"Method not allowed\"}";
+            SSL_write(ssl, resp, strlen(resp));
+        }
+        SSL_free(ssl);
+        close(fd);
+        return NULL;
+    }
+
+    // 404 Not Found
     SSL_write(ssl, "HTTP/1.1 404 Not Found\r\n\r\n", 26);
     SSL_free(ssl);
     close(fd);
+    return NULL;
+}
+
+void *watchdog_monitor(void *arg) {
+    (void)arg;
+    time_t last_frame_time = time(NULL);
+    
+    while (running) {
+        pthread_mutex_lock(&frame_mutex);
+        if (current_len > 0) last_frame_time = time(NULL);
+        pthread_mutex_unlock(&frame_mutex);
+
+        int timeout_seconds = g_watchdog_timeout_ms / 1000;
+        if (timeout_seconds <= 0) timeout_seconds = 30;
+        
+        if (time(NULL) - last_frame_time > timeout_seconds) {
+            printf("[WATCHDOG] No frame for %d seconds, restarting detection\n", timeout_seconds);
+            system("systemctl restart detection.service 2>/dev/null || true");
+            last_frame_time = time(NULL);
+        }
+        sleep(1);
+    }
     return NULL;
 }
 
@@ -608,7 +850,6 @@ static SSL_CTX *init_ssl(void) {
         return NULL;
 
     SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
-
     return ctx;
 }
 
@@ -621,12 +862,11 @@ int main(void) {
     signal(SIGHUP, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    // Load config
     load_config(CONFIG_PATH);
     current_interval_ms = g_frame_interval_ms;
 
     printf("\n=== Configuration ===\n");
-    printf("Frame interval: %dms (%.1f fps)\n", g_frame_interval_ms, 1000.0/g_frame_interval_ms);
+    printf("Frame interval: %dms (%.1f fps)\n", g_frame_interval_ms, 1000.0 / g_frame_interval_ms);
     printf("Frame size: %dx%d\n", g_frame_width, g_frame_height);
     printf("HTTP port: %d, HTTPS port: %d\n", g_port_http, g_port_https);
     printf("Max history: %d\n", g_max_history);
@@ -636,6 +876,10 @@ int main(void) {
     printf("========================\n\n");
 
     srand(time(NULL));
+
+    if (history_db_init("/home/pi/security_history.db") != 0) {
+        printf("Failed to initialize SQLite history DB\n");
+    }
 
     history = malloc(g_max_history * sizeof(detection_record_t));
     if (!history) {
@@ -656,18 +900,25 @@ int main(void) {
         return 1;
     }
 
-    pthread_t updater;
+    pthread_t updater, telemetry_thread, watchdog_thread;
     pthread_create(&updater, NULL, frame_updater, NULL);
-
-    pthread_t telemetry_thread;
     pthread_create(&telemetry_thread, NULL, telemetry_updater, NULL);
+    pthread_create(&watchdog_thread, NULL, watchdog_monitor, NULL);
+
+    // Initialize MQTT from config (NOT hardcoded)
+    if (strlen(g_mqtt_host) > 0) {
+        mqtt_init(g_mqtt_host, g_mqtt_port, g_mqtt_user, g_mqtt_pass);
+        mqtt_initialized = 1;
+        printf("[MQTT] Initialized with host: %s\n", g_mqtt_host);
+    } else {
+        printf("[MQTT] No host configured, skipping\n");
+    }
 
     ssl_ctx = init_ssl();
     if (!ssl_ctx) {
         printf("SSL init failed. Generate cert.pem and key.pem\n");
         return 1;
     }
-
     printf("SSL initialized\n");
 
     int http_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -701,9 +952,15 @@ int main(void) {
         return 1;
     }
     listen(https_fd, 10);
-
     printf("HTTPS on %d\n", g_port_https);
-    printf("Open: https://192.168.137.100:%d/\n", g_port_https);
+    printf("Open: https://localhost:%d/\n", g_port_https);
+
+    // Publish initial telemetry
+    if (mqtt_initialized) {
+        pthread_mutex_lock(&telemetry_mutex);
+        mqtt_publish_telemetry(cached_temp, cached_mem, cached_cpu);
+        pthread_mutex_unlock(&telemetry_mutex);
+    }
 
     while (running) {
         fd_set fds;
@@ -712,30 +969,21 @@ int main(void) {
         FD_SET(https_fd, &fds);
 
         int max_fd = (https_fd > http_fd) ? https_fd : http_fd;
-        
-        // Use a timeout so we can check running status periodically
         struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
         int ret = select(max_fd + 1, &fds, NULL, NULL, &tv);
         
-        // If select was interrupted or timed out, check running flag
         if (ret < 0) {
-            if (errno == EINTR) {
-                // Signal interrupted, check running flag
-                continue;
-            }
+            if (errno == EINTR) continue;
             break;
         }
         
-        if (ret == 0) {
-            // Timeout, check running flag
-            continue;
-        }
+        if (ret == 0) continue;
 
         if (FD_ISSET(http_fd, &fds)) {
             int fd = accept(http_fd, NULL, NULL);
             if (fd >= 0) {
                 set_socket_timeout(fd, 5);
-                send_redirect(fd);
+                send_redirect(fd, NULL);
                 close(fd);
             }
         }
@@ -743,7 +991,7 @@ int main(void) {
         if (FD_ISSET(https_fd, &fds)) {
             int fd = accept(https_fd, NULL, NULL);
             if (fd >= 0) {
-                set_socket_timeout(fd, 30);  // long-lived stream needs a longer timeout
+                set_socket_timeout(fd, 30);
                 pthread_t thread;
                 int *fd_ptr = malloc(sizeof(int));
                 if (fd_ptr) {
@@ -758,16 +1006,16 @@ int main(void) {
     }
 
     printf("\nShutting down...\n");
-    
-    // Wait for threads to finish
     pthread_join(updater, NULL);
     pthread_join(telemetry_thread, NULL);
+    pthread_join(watchdog_thread, NULL);
 
     close(http_fd);
     close(https_fd);
     SSL_CTX_free(ssl_ctx);
     free(html_cache);
     free(history);
+    history_db_close();
 
     printf("Server stopped.\n");
     return 0;

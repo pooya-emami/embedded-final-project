@@ -1,87 +1,110 @@
 #include "mqtt_client.h"
-#include <mosquitto.h>
+#include "MQTTClient.h"
 #include <stdio.h>
+#include <string.h>
 #include <time.h>
 
-static struct mosquitto *mosq = NULL;
-static const char *student_id = "404300409";
+#define QOS         1
+#define TIMEOUT     10000L
+
+static MQTTClient client;
+static int mqtt_connected = 0;
 
 void mqtt_init(const char *host, int port, const char *user, const char *pass)
 {
-    mosquitto_lib_init();
-    mosq = mosquitto_new(student_id, true, NULL);
+    char address[128];
+    snprintf(address, sizeof(address), "tcp://%s:%d", host, port);
 
-    mosquitto_username_pw_set(mosq, user, pass);
+    MQTTClient_connectOptions conn_opts = MQTTClient_connectOptions_initializer;
+    MQTTClient_willOptions will_opts = MQTTClient_willOptions_initializer;
 
-    mosquitto_will_set(
-        mosq,
-        "telemetry/404300409/home",
-        22,
-        "{\"status\":\"offline\"}",
-        1,
-        false
-    );
+    // LWT on telemetry topic - indicates board went offline
+    will_opts.topicName = "telemetry/" STUDENT_ID "/home";
+    will_opts.message = "{\"status\":\"offline\"}";
+    will_opts.qos = QOS;
+    will_opts.retained = 0;
 
-    if (mosquitto_connect(mosq, host, port, 60) != MOSQ_ERR_SUCCESS) {
-        printf("[MQTT] Connection failed\n");
+    conn_opts.keepAliveInterval = 20;
+    conn_opts.cleansession = 1;
+    conn_opts.will = &will_opts;
+    conn_opts.username = user;
+    conn_opts.password = pass;
+
+    MQTTClient_create(&client, address, CLIENTID,
+                      MQTTCLIENT_PERSISTENCE_NONE, NULL);
+
+    int rc = MQTTClient_connect(client, &conn_opts);
+    if (rc != MQTTCLIENT_SUCCESS) {
+        printf("[MQTT] Connect failed: %d\n", rc);
+        mqtt_connected = 0;
         return;
     }
 
-    mosquitto_loop_start(mosq);
-    printf("[MQTT] Connected\n");
+    mqtt_connected = 1;
+    printf("[MQTT] Connected to %s\n", address);
+}
+
+static void mqtt_publish(const char *topic, const char *payload)
+{
+    if (!mqtt_connected) {
+        printf("[MQTT] Not connected, skipping publish\n");
+        return;
+    }
+
+    MQTTClient_message pubmsg = MQTTClient_message_initializer;
+    pubmsg.payload = (void*)payload;
+    pubmsg.payloadlen = (int)strlen(payload);
+    pubmsg.qos = QOS;
+    pubmsg.retained = 0;
+
+    MQTTClient_deliveryToken token;
+    MQTTClient_publishMessage(client, topic, &pubmsg, &token);
+    MQTTClient_waitForCompletion(client, token, TIMEOUT);
 }
 
 void mqtt_publish_persons(int count, float temp)
 {
-    char msg[128];
-    snprintf(msg, sizeof(msg),
-             "{\"count\":%d,\"temp\":%.1f,\"timestamp\":%ld}",
-             count, temp, time(NULL));
+    char topic[128];
+    snprintf(topic, sizeof(topic), "persons/" STUDENT_ID "/home");
 
-    mosquitto_publish(
-        mosq, NULL,
-        "persons/404300409/home",
-        strlen(msg), msg,
-        1, false
-    );
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+        "{\"persons\":%d,\"temp\":%.2f,\"timestamp\":%ld}",
+        count, temp, time(NULL));
+
+    mqtt_publish(topic, payload);
 }
 
 void mqtt_publish_telemetry(float temp, long mem, float cpu)
 {
-    char msg[128];
-    snprintf(msg, sizeof(msg),
-             "{\"temp\":%.1f,\"mem\":%ld,\"cpu\":%.1f,\"timestamp\":%ld}",
-             temp, mem, cpu, time(NULL));
+    char topic[128];
+    snprintf(topic, sizeof(topic), "telemetry/" STUDENT_ID "/home");
 
-    mosquitto_publish(
-        mosq, NULL,
-        "telemetry/404300409/home",
-        strlen(msg), msg,
-        1, false
-    );
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+        "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f,\"timestamp\":%ld}",
+        temp, mem, cpu, time(NULL));
+
+    mqtt_publish(topic, payload);
 }
 
 void mqtt_publish_alarm(int count, float temp)
 {
-    char msg[128];
-    snprintf(msg, sizeof(msg),
-             "{\"count\":%d,\"temp\":%.1f,\"timestamp\":%ld}",
-             count, temp, time(NULL));
+    char topic[128];
+    snprintf(topic, sizeof(topic), "alarm/" STUDENT_ID "/home");
 
-    mosquitto_publish(
-        mosq, NULL,
-        "alarm/404300409/home",
-        strlen(msg), msg,
-        1, false
-    );
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+        "{\"persons\":%d,\"temp\":%.2f,\"timestamp\":%ld}",
+        count, temp, time(NULL));
+
+    mqtt_publish(topic, payload);
 }
 
 void mqtt_cleanup(void)
 {
-    if (mosq) {
-        mosquitto_disconnect(mosq);
-        mosquitto_loop_stop(mosq, true);
-        mosquitto_destroy(mosq);
+    if (mqtt_connected) {
+        MQTTClient_disconnect(client, 1000);
+        MQTTClient_destroy(&client);
     }
-    mosquitto_lib_cleanup();
 }
