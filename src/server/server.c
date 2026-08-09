@@ -68,6 +68,7 @@ static int g_person_count = 0;
 static time_t g_last_detection_time = 0;
 static pthread_mutex_t person_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Watchdog globals
 static time_t last_frame_time = 0;
 static int watchdog_alert_sent = 0;
 static int camera_restored_alert_sent = 0;
@@ -78,6 +79,17 @@ static pthread_mutex_t watchdog_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Email debounce global
 static time_t last_email_time = 0;
+
+// ============================================================
+// Detection state for async processing
+// ============================================================
+static int pending_detection_count = 0;
+static float pending_detection_temp = 0;
+static unsigned char pending_frame[BUFFER_SIZE] = {0};
+static size_t pending_frame_len = 0;
+static int pending_is_guard_event = 0;
+static int pending_processed = 0;
+static pthread_mutex_t pending_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void trim(char *str) {
     char *start = str;
@@ -214,27 +226,6 @@ static float read_temp(void) {
         }
         fclose(f);
     }
-
-    f = fopen("/mnt/d/Users/ASUS/Documents/Virtual Machines/shared/cpu.txt", "r");
-    if (f) {
-        float t = -1;
-        if (fscanf(f, "%f", &t) == 1) {
-            fclose(f);
-            return t;
-        }
-        fclose(f);
-    }
-
-    f = fopen("/mnt/hgfs/shared/cpu.txt", "r");
-    if (f) {
-        float t = -1;
-        if (fscanf(f, "%f", &t) == 1) {
-            fclose(f);
-            return t;
-        }
-        fclose(f);
-    }
-
     return -1;
 }
 
@@ -267,49 +258,6 @@ static float read_cpu_usage(void) {
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
-static void *telemetry_updater(void *arg) {
-    (void)arg;
-    while (running) {
-        pthread_mutex_lock(&telemetry_mutex);
-        cached_temp = read_temp();
-        cached_mem = read_mem_available();
-        cached_cpu = read_cpu_usage();
-        pthread_mutex_unlock(&telemetry_mutex);
-        
-        if (mqtt_initialized) {
-            mqtt_publish_telemetry(cached_temp, cached_mem, cached_cpu);
-        }
-        
-        if (cached_temp > g_temp_throttle_c && current_interval_ms > g_min_interval_ms) {
-            printf("[THERMAL] Temp %.1f C > %d C, throttling to %dms\n", 
-                   cached_temp, g_temp_throttle_c, g_min_interval_ms);
-            current_interval_ms = g_min_interval_ms;
-        } else if (cached_temp <= g_temp_throttle_c - 5 && current_interval_ms != g_frame_interval_ms) {
-            current_interval_ms = g_frame_interval_ms;
-            printf("[THERMAL] Temp %.1f C, restoring to %dms\n", 
-                   cached_temp, current_interval_ms);
-        }
-        
-        sleep(2);
-    }
-    return NULL;
-}
-
-void add_history(int count, float temp)
-{
-    pthread_mutex_lock(&history_mutex);
-    if (history_count >= g_max_history) {
-        memmove(&history[0], &history[1], (g_max_history - 1) * sizeof(detection_record_t));
-        history_count = g_max_history - 1;
-    }
-    history[history_count].count = count;
-    history[history_count].timestamp = time(NULL);
-    history[history_count].temp = temp;
-    history_count++;
-    history_db_add(count, temp);
-    pthread_mutex_unlock(&history_mutex);
-}
-
 static void send_watchdog_alert(const char *status)
 {
     time_t now = time(NULL);
@@ -336,7 +284,6 @@ static void send_detection_email(int count, float temp, const unsigned char *buf
     time_t now = time(NULL);
     
     // Always check debounce for Guard OFF
-    // Guard ON: immediate sends bypass debounce, then sets last_email_time
     if (!immediate && (now - last_email_time < 30)) {
         return;
     }
@@ -369,6 +316,118 @@ static void send_detection_email(int count, float temp, const unsigned char *buf
     }
 }
 
+void add_history(int count, float temp)
+{
+    pthread_mutex_lock(&history_mutex);
+    if (history_count >= g_max_history) {
+        memmove(&history[0], &history[1], (g_max_history - 1) * sizeof(detection_record_t));
+        history_count = g_max_history - 1;
+    }
+    history[history_count].count = count;
+    history[history_count].timestamp = time(NULL);
+    history[history_count].temp = temp;
+    history_count++;
+    history_db_add(count, temp);
+    pthread_mutex_unlock(&history_mutex);
+}
+
+// ============================================================
+// Process pending detection (called from telemetry_updater)
+// ============================================================
+static void process_pending_detection(void)
+{
+    int count = 0;
+    float temp = 0;
+    int is_guard_event = 0;
+    unsigned char frame[BUFFER_SIZE];
+    size_t frame_len = 0;
+    int should_process = 0;
+    
+    pthread_mutex_lock(&pending_mutex);
+    if (!pending_processed && pending_detection_count > 0) {
+        count = pending_detection_count;
+        temp = pending_detection_temp;
+        is_guard_event = pending_is_guard_event;
+        frame_len = pending_frame_len;
+        if (frame_len > 0 && frame_len < BUFFER_SIZE) {
+            memcpy(frame, pending_frame, frame_len);
+        }
+        pending_processed = 1;
+        should_process = 1;
+    }
+    pthread_mutex_unlock(&pending_mutex);
+    
+    if (!should_process) return;
+    
+    // ============================================================
+    // HEAVY OPERATIONS - Runs in telemetry thread (every 2 seconds)
+    // ============================================================
+    printf("[PROCESS] Processing detection: %d persons\n", count);
+    
+    // Add to history
+    add_history(count, temp);
+    
+    // Publish to MQTT persons topic
+    if (mqtt_initialized) {
+        mqtt_publish_persons(count, temp);
+    }
+    
+    // If guard mode is enabled
+    if (is_guard_event && guard_enabled) {
+        // Publish alarm immediately
+        if (mqtt_initialized) {
+            mqtt_publish_alarm(count, temp);
+        }
+        
+        // Send email (immediate for guard mode)
+        if (frame_len > 0) {
+            email_send_alert(count, temp, frame, frame_len);
+        } else {
+            email_send_alert(count, temp, NULL, 0);
+        }
+        printf("[PROCESS] Guard email sent: %d person(s)\n", count);
+    } else if (count > 0) {
+        // Normal mode: send email with debounce
+        send_detection_email(count, temp, frame, frame_len, 0);
+    }
+}
+
+static void *telemetry_updater(void *arg) {
+    (void)arg;
+    while (running) {
+        pthread_mutex_lock(&telemetry_mutex);
+        cached_temp = read_temp();
+        cached_mem = read_mem_available();
+        cached_cpu = read_cpu_usage();
+        pthread_mutex_unlock(&telemetry_mutex);
+        
+        // ============================================================
+        // Process pending detection (HEAVY OPS - runs every 2 seconds)
+        // ============================================================
+        process_pending_detection();
+        
+        if (mqtt_initialized) {
+            mqtt_publish_telemetry(cached_temp, cached_mem, cached_cpu);
+        }
+        
+        if (cached_temp > g_temp_throttle_c && current_interval_ms > g_min_interval_ms) {
+            printf("[THERMAL] Temp %.1f C > %d C, throttling to %dms\n", 
+                   cached_temp, g_temp_throttle_c, g_min_interval_ms);
+            current_interval_ms = g_min_interval_ms;
+        } else if (cached_temp <= g_temp_throttle_c - 5 && current_interval_ms != g_frame_interval_ms) {
+            current_interval_ms = g_frame_interval_ms;
+            printf("[THERMAL] Temp %.1f C, restoring to %dms\n", 
+                   cached_temp, current_interval_ms);
+        }
+        
+        sleep(2);
+    }
+    return NULL;
+}
+
+// ============================================================
+// frame_updater - FAST PATH (only detection)
+// ============================================================
 void *frame_updater(void *arg) {
     (void)arg;
 
@@ -383,6 +442,7 @@ void *frame_updater(void *arg) {
         unsigned char buf[BUFFER_SIZE];
         size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
 
+        // WATCHDOG
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             pthread_mutex_lock(&watchdog_mutex);
             
@@ -393,7 +453,6 @@ void *frame_updater(void *arg) {
                 first_frame_received = 1;
                 printf("[WATCHDOG] First frame received (%zu bytes)\n", len);
             } else if (len != prev_frame_len || memcmp(buf, prev_frame, len) != 0) {
-                // Frame changed - reset watchdog
                 memcpy(prev_frame, buf, len);
                 prev_frame_len = len;
                 last_frame_time = time(NULL);
@@ -409,14 +468,19 @@ void *frame_updater(void *arg) {
             pthread_mutex_unlock(&watchdog_mutex);
         }
 
+        // ============================================================
+        // DETECTION - FAST PATH (only detection, no heavy ops)
+        // ============================================================
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
             
+            // Update global person count
             pthread_mutex_lock(&person_mutex);
             g_person_count = res.person_count;
             g_last_detection_time = time(NULL);
             pthread_mutex_unlock(&person_mutex);
             
+            // Update stream frame
             pthread_mutex_lock(&frame_mutex);
             size_t copy_len = res.jpeg_length;
             if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
@@ -426,44 +490,40 @@ void *frame_updater(void *arg) {
             }
             pthread_mutex_unlock(&frame_mutex);
             
+            // Get temperature
             pthread_mutex_lock(&telemetry_mutex);
             float temp = cached_temp;
             pthread_mutex_unlock(&telemetry_mutex);
             
+            // If people detected, store for async processing
             if (res.person_count > 0) {
                 no_detection_frame_count = 0;
-                add_history(res.person_count, temp);
                 
-                if (mqtt_initialized) {
-                    mqtt_publish_persons(res.person_count, temp);
+                int is_new_event = 0;
+                if (no_detection_frame_count > 100 || 
+                    res.person_count != last_person_count ||
+                    active_detection_event == 0) {
+                    is_new_event = 1;
+                    active_detection_event = 1;
                 }
+                last_person_count = res.person_count;
                 
-                if (guard_enabled) {
-                    int is_new_event = 0;
-                    
-                    if (no_detection_frame_count > 100 || 
-                        res.person_count != last_person_count ||
-                        active_detection_event == 0) {
-                        is_new_event = 1;
-                        active_detection_event = 1;
-                        printf("[GUARD] New detection event started (count: %d)\n", res.person_count);
-                    }
-                    
-                    last_person_count = res.person_count;
-                    
-                    if (mqtt_initialized) {
-                        mqtt_publish_alarm(res.person_count, temp);
-                    }
-                    
-                    if (is_new_event) {
-                        send_detection_email(res.person_count, temp, buf, len, 1);
-                    } else {
-                        send_detection_email(res.person_count, temp, buf, len, 0);
-                    }
-                    
-                } else {
-                    send_detection_email(res.person_count, temp, buf, len, 0);
+                // ============================================================
+                // STORE for async processing (non-blocking, just copy data)
+                // ============================================================
+                pthread_mutex_lock(&pending_mutex);
+                pending_detection_count = res.person_count;
+                pending_detection_temp = temp;
+                pending_is_guard_event = guard_enabled && is_new_event;
+                pending_processed = 0;
+                
+                if (len > 0 && len < BUFFER_SIZE) {
+                    memcpy(pending_frame, buf, len);
+                    pending_frame_len = len;
                 }
+                pthread_mutex_unlock(&pending_mutex);
+                
+                printf("[DETECTION] Person(s) detected: %d, queued for processing\n", res.person_count);
                 
             } else {
                 no_detection_frame_count++;
@@ -640,6 +700,32 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /raw_stream - Raw camera feed (no detection overlay)
+    if (strcmp(path, "/raw_stream") == 0) {
+        unsigned char raw_buf[BUFFER_SIZE];
+        size_t raw_len = shared_frame_read(g_frame, raw_buf, BUFFER_SIZE);
+        
+        if (raw_len > 0 && raw_buf[0] == 0xFF && raw_buf[1] == 0xD8) {
+            char header[256];
+            snprintf(header, sizeof(header),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: image/jpeg\r\n"
+                "Content-Length: %zu\r\n"
+                "Cache-Control: no-cache\r\n"
+                "Connection: close\r\n"
+                "\r\n",
+                raw_len);
+            SSL_write(ssl, header, strlen(header));
+            SSL_write(ssl, raw_buf, raw_len);
+        } else {
+            const char *resp = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
+            SSL_write(ssl, resp, strlen(resp));
+        }
+        SSL_free(ssl);
+        close(fd);
+        return NULL;
+    }
+
     // GET /snapshot or /api/v1/snapshot
     if (strcmp(path, "/snapshot") == 0 || strcmp(path, "/api/v1/snapshot") == 0) {
         pthread_mutex_lock(&frame_mutex);
@@ -699,6 +785,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /api/v1/persons
     if (strcmp(path, "/api/v1/persons") == 0) {
         int count = 0;
         pthread_mutex_lock(&person_mutex);
@@ -938,6 +1025,7 @@ void *watchdog_monitor(void *arg) {
     }
     return NULL;
 }
+
 static SSL_CTX *init_ssl(void) {
     SSL_library_init();
     SSL_load_error_strings();
