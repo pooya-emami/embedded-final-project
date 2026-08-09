@@ -134,10 +134,23 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         if (best_score < 0.25f) continue;
 
         // Convert from center format to corner format and scale
-        float x1 = (x - w / 2.0f) * img320.cols / 320.0f;
-        float y1 = (y - h / 2.0f) * img320.rows / 320.0f;
-        float x2 = (x + w / 2.0f) * img320.cols / 320.0f;
-        float y2 = (y + h / 2.0f) * img320.rows / 320.0f;
+float x1 = x - w/2;
+float y1 = y - h/2;
+float x2 = x + w/2;
+float y2 = y + h/2;
+
+// undo padding
+x1 -= pad_x;
+x2 -= pad_x;
+y1 -= pad_y;
+y2 -= pad_y;
+
+// undo scaling
+x1 /= scale;
+x2 /= scale;
+y1 /= scale;
+y2 /= scale;
+
         
         detections.push_back({x1, y1, x2, y2, best_score, best_class});
     }
@@ -189,7 +202,23 @@ extern "C" DetectionResult process_frame(
     }
 
     cv::Mat frame_detection;
-    cv::resize(frame_source, frame_detection, cv::Size(320, 320));
+int new_w = 320, new_h = 320;
+int w = frame_source.cols;
+int h = frame_source.rows;
+
+float scale = std::min((float)new_w / w, (float)new_h / h);
+int resized_w = int(w * scale);
+int resized_h = int(h * scale);
+
+cv::Mat resized;
+cv::resize(frame_source, resized, cv::Size(resized_w, resized_h));
+
+cv::Mat frame_detection = cv::Mat::zeros(new_h, new_w, frame_source.type());
+int pad_x = (new_w - resized_w) / 2;
+int pad_y = (new_h - resized_h) / 2;
+
+resized.copyTo(frame_detection(cv::Rect(pad_x, pad_y, resized_w, resized_h)));
+
 
     auto boxes = detectHumans(frame_detection);
 
