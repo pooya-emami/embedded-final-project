@@ -352,6 +352,9 @@ void add_history(int count, float temp)
     pthread_mutex_unlock(&history_mutex);
 }
 
+// ============================================================
+// Process pending detection (called from telemetry_updater)
+// ============================================================
 static void process_pending_detection(void)
 {
     int count = 0;
@@ -377,8 +380,6 @@ static void process_pending_detection(void)
     
     if (!should_process) return;
     
-    printf("[PROCESS] Processing detection: %d persons\n", count);
-    
     // Add to history
     add_history(count, temp);
     
@@ -387,22 +388,29 @@ static void process_pending_detection(void)
         mqtt_publish_persons(count, temp);
     }
     
-    // If guard mode is enabled
+    // ============================================================
+    // GUARD MODE vs NORMAL MODE - Different email content
+    // ============================================================
     if (is_guard_event && guard_enabled) {
-        // Publish alarm immediately
+        // ============================================================
+        // GUARD MODE: Immediate alert with GUARD subject
+        // ============================================================
         if (mqtt_initialized) {
             mqtt_publish_alarm(count, temp);
         }
         
-        // Send email (immediate for guard mode)
+        // Send email with GUARD alert text
         if (frame_len > 0) {
-            email_send_alert(count, temp, frame, frame_len);
+            email_send_alert_guard(count, temp, frame, frame_len);
         } else {
-            email_send_alert(count, temp, NULL, 0);
+            email_send_alert_guard(count, temp, NULL, 0);
         }
-        printf("[PROCESS] Guard email sent: %d person(s)\n", count);
+        printf("[PROCESS] GUARD email sent: %d person(s)\n", count);
+        
     } else if (count > 0) {
-        // Normal mode: send email with debounce
+        // ============================================================
+        // NORMAL MODE: Regular detection with debounce
+        // ============================================================
         send_detection_email(count, temp, frame, frame_len, 0);
     }
 }
@@ -997,34 +1005,27 @@ static void *handle_https_thread(void *arg) {
     return NULL;
 }
 
-void *watchdog_monitor(void *arg) {
-    (void)arg;
+static void send_watchdog_alert(const char *status)
+{
+    time_t now = time(NULL);
     
-    while (running) {
-        pthread_mutex_lock(&watchdog_mutex);
-        
-        int timeout_seconds = g_watchdog_timeout_ms / 1000;
-        if (timeout_seconds <= 0) timeout_seconds = 30;
-        
-        time_t now = time(NULL);
-        
-        if (now - last_frame_time > timeout_seconds) {
-            if (!watchdog_alert_sent) {
-                watchdog_alert_sent = 1;
-                camera_restored_alert_sent = 0;
-                send_watchdog_alert("offline");
-                printf("[WATCHDOG] Camera offline/stuck! No change for %d seconds\n", timeout_seconds);
-                
-                // Optionally restart (commented out)
-                // system("systemctl restart server.service 2>/dev/null || true");
-                // printf("[WATCHDOG] Server restart triggered\n");
-            }
-        }
-        
-        pthread_mutex_unlock(&watchdog_mutex);
-        sleep(1);
+    if (strcmp(status, "offline") == 0 || strcmp(status, "stuck") == 0) {
+        email_send_alert_watchdog(cached_temp);
+        printf("[WATCHDOG] Camera %s - tamper alert sent\n", status);
+    } else {
+        printf("[WATCHDOG] Camera %s (no email sent)\n", status);
+        return;
     }
-    return NULL;
+    
+    if (mqtt_initialized) {
+        char topic[128];
+        snprintf(topic, sizeof(topic), "alarm/%s/home", STUDENT_ID);
+        char payload[256];
+        snprintf(payload, sizeof(payload),
+            "{\"status\":\"camera_%s\",\"timestamp\":%ld}",
+            status, now);
+        mqtt_publish_custom(topic, payload);
+    }
 }
 
 static SSL_CTX *init_ssl(void) {

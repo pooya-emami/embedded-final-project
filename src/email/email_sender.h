@@ -13,4 +13,11 @@ extern char g_smtp_to[128];
 int email_send_alert(int persons, float cpu_temp, 
                      const unsigned char *jpeg_buf, size_t jpeg_len);
 
+// Guard mode email with different subject/body
+int email_send_alert_guard(int persons, float cpu_temp,
+                           const unsigned char *jpeg_buf, size_t jpeg_len);
+
+// Watchdog tamper alert email
+int email_send_alert_watchdog(float cpu_temp);
+
 #endif
