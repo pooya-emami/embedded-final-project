@@ -83,9 +83,14 @@ static time_t last_email_time = 0;
 // Guard event tracking
 static int active_detection_event = 0;
 
-// ============================================================
-// EMAIL THREAD - Signal-based async
-// ============================================================
+static int history_pending = 0;
+static int history_count_val = 0;
+static float history_temp = 0;
+static pthread_mutex_t history_mutex_signal = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t history_cond = PTHREAD_COND_INITIALIZER;
+static int history_thread_running = 1;
+static pthread_t history_thread;
+
 static int email_pending = 0;
 static int email_count = 0;
 static float email_temp = 0;
@@ -265,10 +270,7 @@ static float read_cpu_usage(void) {
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
-// ============================================================
-// add_history - Only called from email thread (async)
-// ============================================================
-void add_history(int count, float temp)
+static void add_history_internal(int count, float temp)
 {
     pthread_mutex_lock(&history_mutex);
     if (history_count >= g_max_history) {
@@ -311,9 +313,6 @@ static void *telemetry_updater(void *arg) {
     return NULL;
 }
 
-// ============================================================
-// WATCHDOG ALERT - Only for tampering (offline/stuck)
-// ============================================================
 static void send_watchdog_alert(const char *status)
 {
     time_t now = time(NULL);
@@ -336,9 +335,46 @@ static void send_watchdog_alert(const char *status)
     }
 }
 
-// ============================================================
-// EMAIL THREAD FUNCTION - Waits for signal, sends email + history
-// ============================================================
+static void *history_thread_func(void *arg) {
+    (void)arg;
+    
+    while (history_thread_running) {
+        int count = 0;
+        float temp = 0;
+        
+        pthread_mutex_lock(&history_mutex_signal);
+        while (!history_pending && history_thread_running) {
+            pthread_cond_wait(&history_cond, &history_mutex_signal);
+        }
+        
+        if (!history_thread_running) {
+            pthread_mutex_unlock(&history_mutex_signal);
+            break;
+        }
+        
+        if (history_pending) {
+            count = history_count_val;
+            temp = history_temp;
+            history_pending = 0;
+        }
+        pthread_mutex_unlock(&history_mutex_signal);
+        
+        // Add to history (in separate thread)
+        add_history_internal(count, temp);
+    }
+    return NULL;
+}
+
+static void signal_history(int count, float temp)
+{
+    pthread_mutex_lock(&history_mutex_signal);
+    history_count_val = count;
+    history_temp = temp;
+    history_pending = 1;
+    pthread_cond_signal(&history_cond);
+    pthread_mutex_unlock(&history_mutex_signal);
+}
+
 static void *email_thread_func(void *arg) {
     (void)arg;
     
@@ -373,14 +409,7 @@ static void *email_thread_func(void *arg) {
         }
         pthread_mutex_unlock(&email_mutex);
         
-        // ============================================================
-        // ADD TO HISTORY (async - in email thread)
-        // ============================================================
-        add_history(count, temp);
-        
-        // ============================================================
-        // SEND EMAIL (async - in email thread)
-        // ============================================================
+        // Send email
         unsigned char *frame_copy = NULL;
         if (has_frame && frame_len > 0) {
             frame_copy = malloc(frame_len);
@@ -410,16 +439,12 @@ static void *email_thread_func(void *arg) {
                 printf("[EMAIL] Normal email sent: %d person(s)\n", count);
             } else {
                 free(frame_copy);
-                printf("[EMAIL] Normal suppressed (debounce): %d person(s)\n", count);
             }
         }
     }
     return NULL;
 }
 
-// ============================================================
-// SIGNAL EMAIL THREAD - Non-blocking
-// ============================================================
 static void send_detection_email(int count, float temp, const unsigned char *buf, size_t len, int immediate)
 {
     pthread_mutex_lock(&email_mutex);
@@ -442,9 +467,6 @@ static void send_detection_email(int count, float temp, const unsigned char *buf
     pthread_mutex_unlock(&email_mutex);
 }
 
-// ============================================================
-// frame_updater - Detection only, signals email thread
-// ============================================================
 void *frame_updater(void *arg) {
     (void)arg;
 
@@ -520,9 +542,6 @@ void *frame_updater(void *arg) {
                 }
                 last_person_count = res.person_count;
                 
-                // ============================================================
-                // MQTT (fast - non-blocking)
-                // ============================================================
                 if (mqtt_initialized) {
                     mqtt_publish_persons(res.person_count, temp);
                     if (guard_enabled) {
@@ -530,9 +549,8 @@ void *frame_updater(void *arg) {
                     }
                 }
                 
-                // ============================================================
-                // SIGNAL EMAIL THREAD (non-blocking - returns immediately!)
-                // ============================================================
+                signal_history(res.person_count, temp);
+                
                 int immediate = guard_enabled && is_new_event;
                 send_detection_email(res.person_count, temp, buf, len, immediate);
                 
@@ -1105,9 +1123,9 @@ int main(void) {
 
     last_frame_time = time(NULL);
 
-    // ============================================================
-    // START EMAIL THREAD
-    // ============================================================
+    pthread_create(&history_thread, NULL, history_thread_func, NULL);
+    printf("[HISTORY] History thread started\n");
+
     pthread_create(&email_thread, NULL, email_thread_func, NULL);
     printf("[EMAIL] Email thread started\n");
 
@@ -1216,9 +1234,11 @@ int main(void) {
 
     printf("\nShutting down...\n");
     
-    // ============================================================
-    // STOP EMAIL THREAD
-    // ============================================================
+    history_thread_running = 0;
+    pthread_cond_signal(&history_cond);
+    pthread_join(history_thread, NULL);
+    printf("[HISTORY] History thread stopped\n");
+
     email_thread_running = 0;
     pthread_cond_signal(&email_cond);
     pthread_join(email_thread, NULL);
