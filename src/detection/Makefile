@@ -5,7 +5,6 @@ CXXFLAGS = -Wall -Wextra -O2 -std=c++17 -I. -I.. -I../common -I/usr/include/open
 LDFLAGS = -lpthread -lrt -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lopencv_dnn \
           -lonnxruntime
 
-# Source files
 SRC = detection_server.c \
       ../common/shared_frame.c \
       ../common/shared_frame_processed.c \

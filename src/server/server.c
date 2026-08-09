@@ -345,6 +345,13 @@ static void *telemetry_updater(void *arg) {
                 throttled = 1;
                 throttle_email_sent = 0;
                 
+                if (g_processed) {
+                    processed_frame_t *pf = (processed_frame_t*)g_processed;
+                    pf->thermal_throttle_active = 1;
+                    pf->target_width = g_frame_width;
+                    pf->target_height = g_frame_height;
+                }
+                
                 printf("[THERMAL] Temp %.1f C > %d C, throttling:\n", 
                        cached_temp, g_temp_throttle_c);
                 printf("[THERMAL]   FPS: %.1f -> %.1f\n",
@@ -365,6 +372,13 @@ static void *telemetry_updater(void *arg) {
             g_frame_height = original_height;
             throttled = 0;
             throttle_email_sent = 0;
+            
+            if (g_processed) {
+                processed_frame_t *pf = (processed_frame_t*)g_processed;
+                pf->thermal_throttle_active = 0;
+                pf->target_width = g_frame_width;
+                pf->target_height = g_frame_height;
+            }
             
             printf("[THERMAL] Temp %.1f C <= %d C, restored:\n", 
                    cached_temp, g_temp_throttle_c - 5);
@@ -501,34 +515,31 @@ static void *email_thread_func(void *arg) {
         }
         pthread_mutex_unlock(&email_mutex);
         
+        unsigned char *frame_copy = NULL;
+        if (has_frame && frame_len > 0) {
+            frame_copy = malloc(frame_len);
+            if (frame_copy) {
+                memcpy(frame_copy, frame, frame_len);
+            }
+        }
+        
+        time_t now = time(NULL);
+        
         if (guard_enabled) {
-            if (immediate) {
-                unsigned char *frame_copy = NULL;
-                if (has_frame && frame_len > 0) {
-                    frame_copy = malloc(frame_len);
-                    if (frame_copy) {
-                        memcpy(frame_copy, frame, frame_len);
-                    }
-                }
-                
+            static time_t last_guard_email_time = 0;
+            
+            if (immediate && (now - last_guard_email_time >= 30)) {
                 if (frame_copy && frame_len > 0) {
                     email_send_alert_guard(count, temp, frame_copy, frame_len);
                 } else {
                     email_send_alert_guard(count, temp, NULL, 0);
                 }
-                free(frame_copy);
+                last_guard_email_time = now;
                 printf("[EMAIL] Guard email sent: %d person(s)\n", count);
             }
-        } else {
-            unsigned char *frame_copy = NULL;
-            if (has_frame && frame_len > 0) {
-                frame_copy = malloc(frame_len);
-                if (frame_copy) {
-                    memcpy(frame_copy, frame, frame_len);
-                }
-            }
+            free(frame_copy);
             
-            time_t now = time(NULL);
+        } else {
             if (now - last_email_time >= 30) {
                 if (frame_copy && frame_len > 0) {
                     email_send_alert(count, temp, frame_copy, frame_len);

@@ -2,6 +2,7 @@
 #define SHARED_FRAME_PROCESSED_H
 
 #include <stddef.h>
+#include <time.h>
 
 #define SHM_PROCESSED_NAME   "/guard_processed_frame"
 #define SEM_PROCESSED_NAME   "/guard_processed_lock"
@@ -13,6 +14,9 @@ typedef struct {
     float cpu_temp;
     time_t timestamp;
     unsigned char frame_buffer[SHM_PROCESSED_BUF_SIZE];
+    int thermal_throttle_active;
+    int target_width;
+    int target_height;
 } processed_frame_t;
 
 processed_frame_t *processed_frame_open(void);

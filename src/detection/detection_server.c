@@ -30,7 +30,6 @@ int main(void) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    // Open raw frame shared memory (from relay)
     g_frame = shared_frame_open();
     if (!g_frame) {
         fprintf(stderr, "[DETECTION] Failed to open shared frame\n");
@@ -45,17 +44,35 @@ int main(void) {
     }
     printf("[DETECTION] Processed shared memory opened\n");
 
-    // Temperature file
     FILE *temp_file = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
     float cpu_temp = -1;
     int frame_count = 0;
+    
+    int target_width = 320;
+    int target_height = 240;
+    int throttle_active = 0;
     
     while (running) {
         unsigned char buf[SHM_FRAME_BUF_SIZE];
         size_t len = shared_frame_read(g_frame, buf, SHM_FRAME_BUF_SIZE);
 
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
-            // Read temperature
+            if (g_processed) {
+                processed_frame_t *pf = (processed_frame_t*)g_processed;
+                if (pf->thermal_throttle_active != throttle_active) {
+                    throttle_active = pf->thermal_throttle_active;
+                    if (throttle_active) {
+                        target_width = pf->target_width;
+                        target_height = pf->target_height;
+                        printf("[DETECTION] Thermal throttling: %dx%d\n", target_width, target_height);
+                    } else {
+                        target_width = 320;
+                        target_height = 240;
+                        printf("[DETECTION] Thermal restored: %dx%d\n", target_width, target_height);
+                    }
+                }
+            }
+            
             if (temp_file) {
                 rewind(temp_file);
                 int t = 0;
@@ -64,7 +81,7 @@ int main(void) {
                 }
             }
 
-            DetectionResult res = process_frame(buf, len, 320, 240);
+            DetectionResult res = process_frame(buf, len, target_width, target_height);
             
             if (res.jpeg_output && res.jpeg_length > 0) {
                 processed_frame_write(g_processed, res.jpeg_output, res.jpeg_length, 
@@ -75,11 +92,12 @@ int main(void) {
             
             frame_count++;
             if (frame_count % 30 == 0) {
-                printf("[DETECTION] Frames: %d\n", frame_count);
+                printf("[DETECTION] Frames: %d, Resolution: %dx%d, Throttle: %d\n", 
+                       frame_count, target_width, target_height, throttle_active);
             }
         }
 
-        usleep(33000);  // ~30 FPS
+        usleep(33000);
     }
 
     printf("[DETECTION] Shutting down...\n");
