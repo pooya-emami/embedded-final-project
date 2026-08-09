@@ -303,20 +303,20 @@ static void send_detection_email(int count, float temp, const unsigned char *buf
     last_email_time = now;
 }
 
+// ============================================================
+// WATCHDOG ALERT - Only for tampering (offline/stuck)
+// ============================================================
 static void send_watchdog_alert(const char *status)
 {
     time_t now = time(NULL);
     
-    // Only send email for tamper events (offline or stuck)
     if (strcmp(status, "offline") == 0 || strcmp(status, "stuck") == 0) {
         email_send_alert_watchdog(cached_temp);
         printf("[WATCHDOG] Camera %s - tamper alert sent\n", status);
     } else {
-        // For restored, only log, no email
         printf("[WATCHDOG] Camera %s (no email sent)\n", status);
     }
     
-    // Publish to MQTT alarm topic for ALL watchdog events
     if (mqtt_initialized) {
         char topic[128];
         snprintf(topic, sizeof(topic), "alarm/%s/home", STUDENT_ID);
@@ -328,6 +328,9 @@ static void send_watchdog_alert(const char *status)
     }
 }
 
+// ============================================================
+// Process pending detection (called from telemetry_updater)
+// ============================================================
 static void process_pending_detection(void)
 {
     int count = 0;
@@ -359,22 +362,23 @@ static void process_pending_detection(void)
         mqtt_publish_persons(count, temp);
     }
     
-    if (is_guard_event) {
-        // MQTT alarm - ALWAYS send on every detection
+    if (guard_enabled) {
         if (mqtt_initialized) {
             mqtt_publish_alarm(count, temp);
         }
         
-        // Email - ONLY on NEW events (person just appeared)
-        if (frame_len > 0) {
-            email_send_alert_guard(count, temp, frame, frame_len);
+        if (is_guard_event) {
+            if (frame_len > 0) {
+                email_send_alert_guard(count, temp, frame, frame_len);
+            } else {
+                email_send_alert_guard(count, temp, NULL, 0);
+            }
+            printf("[PROCESS] GUARD email sent: %d person(s)\n", count);
         } else {
-            email_send_alert_guard(count, temp, NULL, 0);
+            printf("[PROCESS] GUARD email suppressed (same event): %d person(s)\n", count);
         }
-        printf("[PROCESS] GUARD email sent: %d person(s)\n", count);
         
     } else {
-        // Normal mode: send email with 30-second debounce
         send_detection_email(count, temp, frame, frame_len, 0);
     }
 }
@@ -404,7 +408,7 @@ static void *telemetry_updater(void *arg) {
                    cached_temp, current_interval_ms);
         }
         
-        sleep(2);
+        sleep(1);
     }
     return NULL;
 }
@@ -422,7 +426,7 @@ void *frame_updater(void *arg) {
         unsigned char buf[BUFFER_SIZE];
         size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
 
-        // WATCHDOG: Check if frame changed
+        // WATCHDOG
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             pthread_mutex_lock(&watchdog_mutex);
             
@@ -473,32 +477,34 @@ void *frame_updater(void *arg) {
                 no_detection_frame_count = 0;
                 
                 int is_new_event = 0;
-                if (guard_enabled && active_detection_event == 0) {
+                if (no_detection_frame_count > 100 || 
+                    res.person_count != last_person_count ||
+                    active_detection_event == 0) {
                     is_new_event = 1;
                     active_detection_event = 1;
-                    printf("[GUARD] New detection event started\n");
                 }
                 last_person_count = res.person_count;
                 
                 pthread_mutex_lock(&pending_mutex);
                 pending_detection_count = res.person_count;
                 pending_detection_temp = temp;
-                pending_is_guard_event = is_new_event;
+                pending_is_guard_event = guard_enabled && is_new_event;
                 pending_processed = 0;
                 
                 if (len > 0 && len < BUFFER_SIZE) {
                     memcpy(pending_frame, buf, len);
                     pending_frame_len = len;
                 }
-                pthread_mutex_unlock(&pending_mutex); 
+                pthread_mutex_unlock(&pending_mutex);
                 
             } else {
                 no_detection_frame_count++;
                 
-                // Person left - reset event after 100+ frames (~3 seconds)
-                if (guard_enabled && no_detection_frame_count > 100 && active_detection_event) {
+                if (no_detection_frame_count > 100 && active_detection_event) {
                     active_detection_event = 0;
-                    printf("[GUARD] Person left, resetting detection event\n");
+                    if (guard_enabled) {
+                        printf("[GUARD] Person left, resetting detection event\n");
+                    }
                 }
             }
             
@@ -694,7 +700,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // GET /raw_stream - Raw camera feed (no detection overlay)
+    // GET /raw_stream
     if (strcmp(path, "/raw_stream") == 0) {
         unsigned char raw_buf[BUFFER_SIZE];
         size_t raw_len = shared_frame_read(g_frame, raw_buf, BUFFER_SIZE);
@@ -875,8 +881,11 @@ static void *handle_https_thread(void *arg) {
                 body += 4;
                 if (strstr(body, "\"enabled\":true")) {
                     guard_enabled = 1;
+                    active_detection_event = 0;
+                    printf("[GUARD] Guard ENABLED - event state reset\n");
                 } else if (strstr(body, "\"enabled\":false")) {
                     guard_enabled = 0;
+                    printf("[GUARD] Guard DISABLED\n");
                 }
             }
             char resp[256];
