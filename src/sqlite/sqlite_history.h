@@ -10,6 +10,7 @@ typedef struct {
 } history_record_t;
 
 int history_db_init(const char *path);
+void history_db_set_max_records(int limit);
 int history_db_add(int count, float temp);
 int history_db_get_last(history_record_t *out, int max_records);
 long history_db_total(void);
