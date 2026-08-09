@@ -47,22 +47,21 @@ static void load_yolo()
 
 static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 {
-    load_yolo(); // reuse your loader but point YOLO_MODEL_FILE to blaze.onnx
+    load_yolo(); // but YOLO_MODEL_FILE must point to blaze.onnx
 
     std::vector<cv::Rect> boxes;
     if (!yolo_loaded)
         return boxes;
 
-    // Preprocess
+    // BlazeFace expects 128x128 RGB normalized
     cv::Mat rgb;
     cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
     rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f);
 
-    std::vector<float> input_tensor_values(1 * 3 * 128 * 128);
-
     cv::Mat resized;
     cv::resize(rgb, resized, cv::Size(128, 128));
 
+    std::vector<float> input_tensor_values(1 * 3 * 128 * 128);
     int idx = 0;
     for (int c = 0; c < 3; c++)
         for (int y = 0; y < 128; y++)
@@ -86,15 +85,15 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     auto input_name = yolo_session->GetInputNameAllocated(0, allocator);
 
     // BlazeFace has 3 outputs
-    auto out_scores_name = yolo_session->GetOutputNameAllocated(0, allocator);
-    auto out_boxes_name  = yolo_session->GetOutputNameAllocated(1, allocator);
-    auto out_nms_name    = yolo_session->GetOutputNameAllocated(2, allocator);
+    auto scores_name = yolo_session->GetOutputNameAllocated(0, allocator);
+    auto boxes_name  = yolo_session->GetOutputNameAllocated(1, allocator);
+    auto nms_name    = yolo_session->GetOutputNameAllocated(2, allocator);
 
     const char* input_names[] = {input_name.get()};
     const char* output_names[] = {
-        out_scores_name.get(),
-        out_boxes_name.get(),
-        out_nms_name.get()
+        scores_name.get(),
+        boxes_name.get(),
+        nms_name.get()
     };
 
     auto output_tensors = yolo_session->Run(
@@ -103,14 +102,14 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         output_names, 3
     );
 
-    // selectedBoxes = NMS output
+    // Use BlazeFace NMS output
     float* selected = output_tensors[2].GetTensorMutableData<float>();
 
     auto shape = output_tensors[2]
         .GetTensorTypeAndShapeInfo()
         .GetShape();
 
-    int num_selected = shape[1];   // number of final detections
+    int num_selected = shape[1];   // N detections
     int fields = shape[2];         // 16 fields per detection
 
     for (int i = 0; i < num_selected; i++) {
@@ -121,7 +120,6 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         float y2 = det[2];
         float x2 = det[3];
 
-        // BlazeFace outputs normalized coordinates (0..1)
         int X1 = x1 * img320.cols;
         int Y1 = y1 * img320.rows;
         int X2 = x2 * img320.cols;
@@ -137,6 +135,7 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 
     return boxes;
 }
+
 
 extern "C" DetectionResult process_frame(
     const uint8_t* jpeg_data,
