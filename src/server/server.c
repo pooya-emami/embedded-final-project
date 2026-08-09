@@ -45,7 +45,7 @@ static int g_mqtt_port = 1883;
 static char g_mqtt_user[128] = {0};
 static char g_mqtt_pass[128] = {0};
 
-// Static globals
+// Static globals (add watchdog globals here)
 static shared_frame_t *g_frame = NULL;
 static unsigned char current_frame[BUFFER_SIZE];
 static size_t current_len = 0;
@@ -67,6 +67,20 @@ static int mqtt_initialized = 0;
 static int g_person_count = 0;
 static time_t g_last_detection_time = 0;
 static pthread_mutex_t person_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// ============================================================
+// WATCHDOG GLOBALS - ADD THESE
+// ============================================================
+static time_t last_frame_time = 0;
+static int watchdog_alert_sent = 0;
+static int camera_restored_alert_sent = 0;
+static unsigned char prev_frame[BUFFER_SIZE] = {0};
+static size_t prev_frame_len = 0;
+static int first_frame_received = 0;
+static pthread_mutex_t watchdog_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Email debounce global
+static time_t last_email_time = 0;
 
 // ============================================================
 // WATCHDOG GLOBALS
@@ -376,9 +390,6 @@ static void send_detection_email(int count, float temp, const unsigned char *buf
     }
 }
 
-// ============================================================
-// frame_updater - Complete implementation with your mechanism
-// ============================================================
 void *frame_updater(void *arg) {
     (void)arg;
 
@@ -394,7 +405,7 @@ void *frame_updater(void *arg) {
         size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
 
         // ============================================================
-        // SIMPLE WATCHDOG: Compare frame directly
+        // WATCHDOG: Check if frame changed
         // ============================================================
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             pthread_mutex_lock(&watchdog_mutex);
@@ -404,6 +415,7 @@ void *frame_updater(void *arg) {
                 prev_frame_len = len;
                 last_frame_time = time(NULL);
                 first_frame_received = 1;
+                printf("[WATCHDOG] First frame received (%zu bytes)\n", len);
             } else if (len != prev_frame_len || memcmp(buf, prev_frame, len) != 0) {
                 // Frame changed - reset watchdog
                 memcpy(prev_frame, buf, len);
@@ -421,6 +433,9 @@ void *frame_updater(void *arg) {
             pthread_mutex_unlock(&watchdog_mutex);
         }
 
+        // ============================================================
+        // Detection logic
+        // ============================================================
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
             
@@ -921,9 +936,6 @@ static void *handle_https_thread(void *arg) {
     return NULL;
 }
 
-// ============================================================
-// watchdog_monitor - Camera tamper detection
-// ============================================================
 void *watchdog_monitor(void *arg) {
     (void)arg;
     
@@ -935,15 +947,14 @@ void *watchdog_monitor(void *arg) {
         
         time_t now = time(NULL);
         
-        // Check if no frame received for timeout period
         if (now - last_frame_time > timeout_seconds) {
             if (!watchdog_alert_sent) {
                 watchdog_alert_sent = 1;
                 camera_restored_alert_sent = 0;
                 send_watchdog_alert("offline");
-                printf("[WATCHDOG] Camera offline! No frame for %d seconds\n", timeout_seconds);
+                printf("[WATCHDOG] Camera offline/stuck! No change for %d seconds\n", timeout_seconds);
                 
-                // Optionally restart the server (commented out for now)
+                // Optionally restart (commented out)
                 // system("systemctl restart server.service 2>/dev/null || true");
                 // printf("[WATCHDOG] Server restart triggered\n");
             }
@@ -954,7 +965,6 @@ void *watchdog_monitor(void *arg) {
     }
     return NULL;
 }
-
 static SSL_CTX *init_ssl(void) {
     SSL_library_init();
     SSL_load_error_strings();

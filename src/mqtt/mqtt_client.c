@@ -44,10 +44,9 @@ void mqtt_init(const char *host, int port, const char *user, const char *pass)
     printf("[MQTT] Connected to %s\n", address);
 }
 
-static void mqtt_publish(const char *topic, const char *payload)
+void mqtt_publish_custom(const char *topic, const char *payload)
 {
     if (!mqtt_connected) {
-        printf("[MQTT] Not connected, skipping publish\n");
         return;
     }
 
