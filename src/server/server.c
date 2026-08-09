@@ -315,21 +315,43 @@ void add_history(int count, float temp) {
             last_alert_time = now;
             last_alert_count = count;
             
+            // Get frame directly from current_frame
             pthread_mutex_lock(&frame_mutex);
+            
+            // Verify JPEG header before copying
+            int has_valid_frame = 0;
             unsigned char *frame_copy = NULL;
             size_t frame_len = 0;
-            if (current_len > 0) {
-                frame_copy = malloc(current_len);
-                if (frame_copy) {
-                    memcpy(frame_copy, current_frame, current_len);
-                    frame_len = current_len;
+            
+            if (current_len > 10) {
+                // Check JPEG header (FF D8)
+                if (current_frame[0] == 0xFF && current_frame[1] == 0xD8) {
+                    frame_copy = malloc(current_len);
+                    if (frame_copy) {
+                        memcpy(frame_copy, current_frame, current_len);
+                        frame_len = current_len;
+                        has_valid_frame = 1;
+                        printf("[EMAIL] Captured frame: %zu bytes (valid JPEG)\n", frame_len);
+                    }
+                } else {
+                    printf("[EMAIL] ⚠️ Invalid JPEG header in current_frame: %02X %02X\n", 
+                           current_frame[0], current_frame[1]);
                 }
+            } else {
+                printf("[EMAIL] ⚠️ current_frame too small: %zu bytes\n", current_len);
             }
+            
             pthread_mutex_unlock(&frame_mutex);
             
+            // Send email with frame
             if (frame_copy && frame_len > 0) {
-                email_send_alert(count, temp, frame_copy, frame_len);
+                int result = email_send_alert(count, temp, frame_copy, frame_len);
+                printf("[EMAIL] email_send_alert returned: %d\n", result);
                 free(frame_copy);
+            } else {
+                printf("[EMAIL] No valid frame available for email\n");
+                // Send email without attachment as fallback
+                email_send_alert(count, temp, NULL, 0);
             }
             
             if (mqtt_initialized) {
