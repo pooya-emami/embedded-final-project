@@ -11,7 +11,7 @@ SRC = server.c \
       ../mqtt/mqtt_client.c \
       ../sqlite/sqlite_history.c
 
-OBJ = server.o shared_frame.o email_sender.o mqtt_client.o sqlite_history.o
+OBJ = server.o shared_frame.o shared_frame_processed.o email_sender.o mqtt_client.o sqlite_history.o
 TARGET = server
 
 all: $(TARGET)
@@ -23,6 +23,9 @@ server.o: server.c server.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 shared_frame.o: ../common/shared_frame.c ../common/shared_frame.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+shared_frame_processed.o: ../common/shared_frame_processed.c ../common/shared_frame_processed.h
 	$(CC) $(CFLAGS) -c $< -o $@
 
 email_sender.o: ../email/email_sender.c ../email/email_sender.h
