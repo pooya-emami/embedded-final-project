@@ -8,21 +8,18 @@
 extern "C" {
 #endif
 
-// Adjust these paths to match your environment
 #define MODEL_BASE_PATH "../../models/"
-#define MODEL_FILE "blaze.onnx"
+#define YOLO_MODEL_FILE "yolov5n.onnx"
 
 typedef struct DetectionResult {
     uint8_t* jpeg_output;
     size_t jpeg_length;
     int width;
     int height;
-    int person_count;  // Now counts faces
+    int person_count;
 } DetectionResult;
 
-/**
- * Process a JPEG image frame and detect faces using BlazeFace
- */
+
 DetectionResult process_frame(
     const uint8_t* jpeg_data,
     size_t jpeg_len,
@@ -30,9 +27,7 @@ DetectionResult process_frame(
     int output_height
 );
 
-/**
- * Free memory allocated for DetectionResult
- */
+
 void free_detection_result(DetectionResult* res);
 
 #ifdef __cplusplus
