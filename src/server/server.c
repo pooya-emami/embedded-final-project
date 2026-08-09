@@ -45,7 +45,7 @@ static int g_mqtt_port = 1883;
 static char g_mqtt_user[128] = {0};
 static char g_mqtt_pass[128] = {0};
 
-// Static globals (add watchdog globals here)
+// Static globals
 static shared_frame_t *g_frame = NULL;
 static unsigned char current_frame[BUFFER_SIZE];
 static size_t current_len = 0;
@@ -71,6 +71,9 @@ static pthread_mutex_t person_mutex = PTHREAD_MUTEX_INITIALIZER;
 static time_t last_frame_time = 0;
 static int watchdog_alert_sent = 0;
 static int camera_restored_alert_sent = 0;
+static unsigned char prev_frame[BUFFER_SIZE] = {0};
+static size_t prev_frame_len = 0;
+static int first_frame_received = 0;
 static pthread_mutex_t watchdog_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Email debounce global
