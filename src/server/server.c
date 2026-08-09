@@ -607,9 +607,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // ============================================================
-    // GET /api/v1/persons - Just return the global count
-    // ============================================================
     if (strcmp(path, "/api/v1/persons") == 0) {
         int count = 0;
         pthread_mutex_lock(&person_mutex);

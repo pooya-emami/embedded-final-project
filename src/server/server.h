@@ -10,7 +10,7 @@
 #define HTML_PATH "../html/template.html"
 #define CONFIG_PATH "server.conf"
 
-// Default values (used if config file not found)
+// Default values
 #define DEFAULT_FRAME_INTERVAL_MS 100
 #define DEFAULT_FRAME_WIDTH 1280
 #define DEFAULT_FRAME_HEIGHT 720
@@ -32,7 +32,7 @@ extern int g_temp_throttle_c;
 extern int g_min_interval_ms;
 extern int g_watchdog_timeout_ms;
 
-// SMTP config (accessible to email_sender.c)
+// SMTP config
 extern char g_smtp_server[128];
 extern char g_smtp_user[128];
 extern char g_smtp_pass[128];
@@ -51,6 +51,6 @@ typedef struct {
     float temp;
 } detection_record_t;
 
-void add_history(int count, float temp, const unsigned char *frame, size_t frame_len);
+void add_history(int count, float temp);
 
 #endif /* SERVER_H */
