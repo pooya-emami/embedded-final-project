@@ -67,6 +67,8 @@ static int current_interval_ms = 100;
 static int guard_enabled = 0;
 static int mqtt_initialized = 0;
 
+static int no_detection_frame_count = 0;
+static int last_person_count = 0;
 static int g_person_count = 0;
 static time_t g_last_detection_time = 0;
 static pthread_mutex_t person_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -698,8 +700,6 @@ void *frame_updater(void *arg) {
     struct timespec next_time;
     clock_gettime(CLOCK_MONOTONIC, &next_time);
 
-    int no_detection_frame_count = 0;
-    int last_person_count = 0;
     int count = 0;
     float temp = 0;
 
@@ -1095,16 +1095,39 @@ static void *handle_https_thread(void *arg) {
             char *body = strstr(req, "\r\n\r\n");
             if (body) {
                 body += 4;
+                pthread_mutex_lock(&watchdog_mutex);
                 if (strstr(body, "\"mode\":\"idle\"")) {
                     stream_mode = 0;
+                    last_frame_time = time(NULL);
+                    frame_stuck_count = 0;
+                    watchdog_alert_sent = 0;
+                    camera_restored_alert_sent = 0;
+                    no_detection_frame_count = 0;
+                    last_person_count = 0;
+                    active_detection_event = 0;
                     printf("[STREAM] Mode set to: IDLE (OFF)\n");
                 } else if (strstr(body, "\"mode\":\"raw\"")) {
                     stream_mode = 1;
+                    last_frame_time = time(NULL);
+                    frame_stuck_count = 0;
+                    watchdog_alert_sent = 0;
+                    camera_restored_alert_sent = 0;
+                    no_detection_frame_count = 0;
+                    last_person_count = 0;
+                    active_detection_event = 0;
                     printf("[STREAM] Mode set to: RAW\n");
                 } else if (strstr(body, "\"mode\":\"processed\"")) {
                     stream_mode = 2;
+                    last_frame_time = time(NULL);
+                    frame_stuck_count = 0;
+                    watchdog_alert_sent = 0;
+                    camera_restored_alert_sent = 0;
+                    no_detection_frame_count = 0;
+                    last_person_count = 0;
+                    active_detection_event = 0;
                     printf("[STREAM] Mode set to: PROCESSED\n");
                 }
+                pthread_mutex_unlock(&watchdog_mutex);
             }
             const char *mode_str = stream_mode == 0 ? "idle" : (stream_mode == 1 ? "raw" : "processed");
             char resp[256];
@@ -1131,22 +1154,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    if (strcmp(path, "/api/v1/stream_mode") == 0) {
-        const char *mode_str = stream_mode == 0 ? "idle" : (stream_mode == 1 ? "raw" : "processed");
-        char resp[256];
-        snprintf(resp, sizeof(resp),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Connection: close\r\n"
-            "\r\n"
-            "{\"mode\":\"%s\"}",
-            mode_str);
-        SSL_write(ssl, resp, strlen(resp));
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
     if (strcmp(path, "/api/v1/guard") == 0) {
         if (strcmp(method, "POST") == 0) {
             char *body = strstr(req, "\r\n\r\n");
@@ -1154,7 +1161,11 @@ static void *handle_https_thread(void *arg) {
                 body += 4;
                 if (strstr(body, "\"enabled\":true")) {
                     guard_enabled = 1;
+                    pthread_mutex_lock(&watchdog_mutex);
                     active_detection_event = 0;
+                    no_detection_frame_count = 0;
+                    last_person_count = 0;
+                    pthread_mutex_unlock(&watchdog_mutex);
                     printf("[GUARD] Guard ENABLED - event state reset\n");
                 } else if (strstr(body, "\"enabled\":false")) {
                     guard_enabled = 0;
@@ -1321,8 +1332,6 @@ int main(void) {
     
     if (history_db_init(db_path) != 0) {
         printf("Failed to initialize SQLite history DB\n");
-    } else {
-        printf("[SQLITE] Database initialized: %s\n", db_path);
     }
 
     history = malloc(g_max_history * sizeof(detection_record_t));
