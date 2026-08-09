@@ -21,15 +21,11 @@
 
 #include "server.h"
 #include "shared_frame.h"
+#include "shared_frame_processed.h"
 #include "email_sender.h"
 #include "mqtt_client.h"
 #include "sqlite_history.h"
-#include "shared_frame_processed.h"
 
-
-
-
-// Global config variables
 int g_frame_interval_ms = DEFAULT_FRAME_INTERVAL_MS;
 int g_frame_width = DEFAULT_FRAME_WIDTH;
 int g_frame_height = DEFAULT_FRAME_HEIGHT;
@@ -40,24 +36,20 @@ int g_temp_throttle_c = DEFAULT_TEMP_THROTTLE_C;
 int g_min_interval_ms = DEFAULT_MIN_INTERVAL_MS;
 int g_watchdog_timeout_ms = DEFAULT_WATCHDOG_TIMEOUT_MS;
 
-// SMTP config - accessible to email_sender.c
 char g_smtp_server[128] = {0};
 char g_smtp_user[128] = {0};
 char g_smtp_pass[128] = {0};
 char g_smtp_to[128] = {0};
 
-// MQTT config - loaded from config file, NOT hardcoded
 static char g_mqtt_host[128] = {0};
 static int g_mqtt_port = 1883;
 static char g_mqtt_user[128] = {0};
 static char g_mqtt_pass[128] = {0};
 
-// SQLite database path from config
 static char g_db_path[256] = {0};
 
-// Static globals
-static processed_frame_t *g_processed = NULL;
 static shared_frame_t *g_frame = NULL;
+static processed_frame_t *g_processed = NULL;
 static unsigned char current_frame[BUFFER_SIZE];
 static size_t current_len = 0;
 static pthread_mutex_t frame_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -79,7 +71,6 @@ static int g_person_count = 0;
 static time_t g_last_detection_time = 0;
 static pthread_mutex_t person_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Watchdog globals
 static time_t last_frame_time = 0;
 static int watchdog_alert_sent = 0;
 static int camera_restored_alert_sent = 0;
@@ -90,13 +81,9 @@ static size_t prev_frame_len = 0;
 static int first_frame_received = 0;
 static int frame_stuck_count = 0;
 
-// Email debounce
 static time_t last_email_time = 0;
-
-// Guard event tracking
 static int active_detection_event = 0;
-
-static int stream_mode = 0;  // Default: idle (off)
+static int stream_mode = 0;
 
 #define SHM_DETECTION_NAME "/guard_detection_result"
 #define SEM_DETECTION_NAME "/guard_detection_lock"
@@ -105,15 +92,12 @@ typedef struct {
     int person_count;
     float cpu_temp;
     time_t timestamp;
-    unsigned char frame_buffer[SHM_FRAME_BUF_SIZE];
-    size_t frame_size;
     int valid;
 } detection_result_t;
 
 static detection_result_t *g_detection_result = NULL;
 static sem_t *g_detection_sem = NULL;
 
-// History thread
 static int history_pending = 0;
 static int history_count_val = 0;
 static float history_temp = 0;
@@ -122,7 +106,6 @@ static pthread_cond_t history_cond = PTHREAD_COND_INITIALIZER;
 static int history_thread_running = 1;
 static pthread_t history_thread;
 
-// Email thread
 static int email_pending = 0;
 static int email_count = 0;
 static float email_temp = 0;
@@ -323,13 +306,11 @@ static void add_history_internal(int count, float temp)
 static void *telemetry_updater(void *arg) {
     (void)arg;
     
-    // Store original resolution for restoration
     static int original_width = 0;
     static int original_height = 0;
     static int throttled = 0;
     static int throttle_email_sent = 0;
     
-    // Set original resolution on first run
     if (original_width == 0) {
         original_width = g_frame_width;
         original_height = g_frame_height;
@@ -344,13 +325,11 @@ static void *telemetry_updater(void *arg) {
         
         if (cached_temp > g_temp_throttle_c) {
             if (!throttled) {
-                // Reduce FPS: increase interval by 50%
                 current_interval_ms = (int)(g_frame_interval_ms * 1.5);
                 if (current_interval_ms < g_min_interval_ms) {
                     current_interval_ms = g_min_interval_ms;
                 }
                 
-                // Reduce resolution by 50%
                 g_frame_width = original_width / 2;
                 g_frame_height = original_height / 2;
                 throttled = 1;
@@ -365,14 +344,12 @@ static void *telemetry_updater(void *arg) {
                        g_frame_width, g_frame_height);
             }
             
-            // Send throttle email (only once per throttle event)
             if (!throttle_email_sent) {
                 email_send_alert_thermal(cached_temp);
                 throttle_email_sent = 1;
             }
             
         } else if (cached_temp <= g_temp_throttle_c - 5 && throttled) {
-            // Restore original settings
             current_interval_ms = g_frame_interval_ms;
             g_frame_width = original_width;
             g_frame_height = original_height;
@@ -601,7 +578,6 @@ static void handle_mjpeg_stream(SSL *ssl) {
 
     if (SSL_write(ssl, header, strlen(header)) <= 0) return;
 
-    // Initialize blank JPEG length
     if (blank_jpeg_len == 0) {
         blank_jpeg_len = sizeof(blank_jpeg);
     }
@@ -716,67 +692,61 @@ void *frame_updater(void *arg) {
 
     int no_detection_frame_count = 0;
     int last_person_count = 0;
+    int count = 0;
+    float temp = 0;
 
     while (running) {
-        int count = 0;
-        float temp = 0;
-        unsigned char proc_buf[BUFFER_SIZE];
-        size_t proc_len = 0;
-        
         if (stream_mode == 2 && g_processed) {
-            // Read processed frame (with overlays)
-            proc_len = processed_frame_read(g_processed, proc_buf, BUFFER_SIZE, &count, &temp);
-        }
-        
-        if (proc_len > 0 && stream_mode == 2) {
-            // Use processed frame
-            pthread_mutex_lock(&frame_mutex);
-            size_t copy_len = proc_len;
-            if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
-            memcpy(current_frame, proc_buf, copy_len);
-            current_len = copy_len;
-            pthread_mutex_unlock(&frame_mutex);
+            unsigned char proc_buf[BUFFER_SIZE];
+            size_t proc_len = processed_frame_read(g_processed, proc_buf, BUFFER_SIZE, &count, &temp);
             
-            // Update person count
-            pthread_mutex_lock(&person_mutex);
-            g_person_count = count;
-            g_last_detection_time = time(NULL);
-            pthread_mutex_unlock(&person_mutex);
-            
-            // Process detection (history, MQTT, email)
-            if (count > 0) {
-                no_detection_frame_count = 0;
+            if (proc_len > 0) {
+                pthread_mutex_lock(&frame_mutex);
+                size_t copy_len = proc_len;
+                if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
+                memcpy(current_frame, proc_buf, copy_len);
+                current_len = copy_len;
+                pthread_mutex_unlock(&frame_mutex);
                 
-                int is_new_event = 0;
-                if (no_detection_frame_count > 100 || 
-                    count != last_person_count ||
-                    active_detection_event == 0) {
-                    is_new_event = 1;
-                    active_detection_event = 1;
-                    if (guard_enabled) {
-                        printf("[GUARD] New detection event started (count: %d)\n", count);
+                pthread_mutex_lock(&person_mutex);
+                g_person_count = count;
+                g_last_detection_time = time(NULL);
+                pthread_mutex_unlock(&person_mutex);
+                
+                if (count > 0) {
+                    no_detection_frame_count = 0;
+                    
+                    int is_new_event = 0;
+                    if (no_detection_frame_count > 100 || 
+                        count != last_person_count ||
+                        active_detection_event == 0) {
+                        is_new_event = 1;
+                        active_detection_event = 1;
+                        if (guard_enabled) {
+                            printf("[GUARD] New detection event started (count: %d)\n", count);
+                        }
                     }
-                }
-                last_person_count = count;
-                
-                if (mqtt_initialized) {
-                    mqtt_publish_persons(count, temp);
-                    if (guard_enabled) {
-                        mqtt_publish_alarm(count, temp);
+                    last_person_count = count;
+                    
+                    if (mqtt_initialized) {
+                        mqtt_publish_persons(count, temp);
+                        if (guard_enabled) {
+                            mqtt_publish_alarm(count, temp);
+                        }
                     }
-                }
-                
-                signal_history(count, temp);
-                
-                int immediate = guard_enabled && is_new_event;
-                signal_email(count, temp, current_frame, current_len, immediate);
-            } else {
-                no_detection_frame_count++;
-                
-                if (no_detection_frame_count > 100 && active_detection_event) {
-                    active_detection_event = 0;
-                    if (guard_enabled) {
-                        printf("[GUARD] Person left, resetting detection event\n");
+                    
+                    signal_history(count, temp);
+                    
+                    int immediate = guard_enabled && is_new_event;
+                    signal_email(count, temp, current_frame, current_len, immediate);
+                } else {
+                    no_detection_frame_count++;
+                    
+                    if (no_detection_frame_count > 100 && active_detection_event) {
+                        active_detection_event = 0;
+                        if (guard_enabled) {
+                            printf("[GUARD] Person left, resetting detection event\n");
+                        }
                     }
                 }
             }
@@ -792,7 +762,6 @@ void *frame_updater(void *arg) {
                 current_len = copy_len;
                 pthread_mutex_unlock(&frame_mutex);
                 
-                // Watchdog tracking
                 pthread_mutex_lock(&watchdog_mutex);
                 if (!first_frame_received) {
                     memcpy(prev_frame, raw_buf, raw_len);
@@ -934,7 +903,6 @@ static void *handle_https_thread(void *arg) {
     char *q = strchr(path, '?');
     if (q) *q = '\0';
 
-    // GET /
     if (strcmp(path, "/") == 0) {
         if (html_cache) {
             char header[512];
@@ -955,7 +923,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // GET /stream or /api/v1/stream
     if (strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) {
         handle_mjpeg_stream(ssl);
         SSL_free(ssl);
@@ -963,9 +930,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // GET /raw_stream
     if (strcmp(path, "/raw_stream") == 0) {
-        // Temporarily switch to raw mode for this request
         int saved_mode = stream_mode;
         stream_mode = 1;
         handle_mjpeg_stream(ssl);
@@ -975,7 +940,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // GET /snapshot or /api/v1/snapshot
     if (strcmp(path, "/snapshot") == 0 || strcmp(path, "/api/v1/snapshot") == 0) {
         pthread_mutex_lock(&frame_mutex);
         size_t len = current_len;
@@ -1005,7 +969,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // GET /telemetry or /api/v1/telemetry
     if (strcmp(path, "/telemetry") == 0 || strcmp(path, "/api/v1/telemetry") == 0) {
         pthread_mutex_lock(&telemetry_mutex);
         float temp = cached_temp;
@@ -1034,7 +997,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // GET /api/v1/persons
     if (strcmp(path, "/api/v1/persons") == 0) {
         int count = 0;
         pthread_mutex_lock(&person_mutex);
@@ -1062,7 +1024,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // GET /api/v1/history
     if (strcmp(path, "/api/v1/history") == 0) {
         history_record_t *records = malloc(sizeof(history_record_t) * g_max_history);
         int n = history_db_get_last(records, g_max_history);
@@ -1099,7 +1060,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // GET /api/v1/history_total
     if (strcmp(path, "/api/v1/history_total") == 0) {
         long total = history_db_total();
 
@@ -1122,7 +1082,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // POST /api/v1/stream_mode
     if (strcmp(path, "/api/v1/stream_mode") == 0) {
         if (strcmp(method, "POST") == 0) {
             char *body = strstr(req, "\r\n\r\n");
@@ -1164,7 +1123,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // GET /api/v1/stream_mode
     if (strcmp(path, "/api/v1/stream_mode") == 0) {
         const char *mode_str = stream_mode == 0 ? "idle" : (stream_mode == 1 ? "raw" : "processed");
         char resp[256];
@@ -1181,7 +1139,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // POST /api/v1/guard
     if (strcmp(path, "/api/v1/guard") == 0) {
         if (strcmp(method, "POST") == 0) {
             char *body = strstr(req, "\r\n\r\n");
@@ -1220,7 +1177,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // POST /api/v1/command
     if (strcmp(path, "/api/v1/command") == 0) {
         if (strcmp(method, "POST") == 0) {
             char *body = strstr(req, "\r\n\r\n");
@@ -1300,7 +1256,6 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // 404 Not Found
     SSL_write(ssl, "HTTP/1.1 404 Not Found\r\n\r\n", 26);
     SSL_free(ssl);
     close(fd);
@@ -1349,7 +1304,6 @@ int main(void) {
 
     srand(time(NULL));
 
-    // Initialize database
     char db_path[256];
     if (strlen(g_db_path) > 0) {
         strcpy(db_path, g_db_path);
@@ -1382,32 +1336,11 @@ int main(void) {
         return 1;
     }
 
-    // ============================================================
-    // Connect to detection service shared memory
-    // ============================================================
-    g_detection_sem = sem_open(SEM_DETECTION_NAME, O_CREAT, 0666, 1);
-    if (g_detection_sem == SEM_FAILED) {
-        perror("[SERVER] sem_open detection");
-        printf("[SERVER] Detection service not available - continuing\n");
+    g_processed = processed_frame_open();
+    if (!g_processed) {
+        printf("[SERVER] Failed to open processed shared memory\n");
     } else {
-        int shm_fd = shm_open(SHM_DETECTION_NAME, O_RDWR, 0666);
-        if (shm_fd < 0) {
-            perror("[SERVER] shm_open detection");
-            sem_close(g_detection_sem);
-            g_detection_sem = NULL;
-        } else {
-            g_detection_result = mmap(NULL, sizeof(detection_result_t),
-                                       PROT_READ, MAP_SHARED, shm_fd, 0);
-            close(shm_fd);
-            if (g_detection_result == MAP_FAILED) {
-                perror("[SERVER] mmap detection");
-                g_detection_result = NULL;
-                sem_close(g_detection_sem);
-                g_detection_sem = NULL;
-            } else {
-                printf("[SERVER] Connected to detection service\n");
-            }
-        }
+        printf("[SERVER] Processed shared memory opened\n");
     }
 
     last_frame_time = time(NULL);
@@ -1536,16 +1469,6 @@ int main(void) {
     pthread_join(updater, NULL);
     pthread_join(telemetry_thread, NULL);
     pthread_join(watchdog_thread, NULL);
-
-    // Clean up detection shared memory
-    if (g_detection_sem) {
-        sem_close(g_detection_sem);
-        g_detection_sem = NULL;
-    }
-    if (g_detection_result) {
-        munmap(g_detection_result, sizeof(detection_result_t));
-        g_detection_result = NULL;
-    }
 
     close(http_fd);
     close(https_fd);
