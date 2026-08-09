@@ -342,13 +342,13 @@ static void *telemetry_updater(void *arg) {
         
         if (cached_temp > g_temp_throttle_c) {
             if (!throttled) {
-                current_interval_ms = (int)(g_frame_interval_ms * 1.5);
+                current_interval_ms = (int)(g_frame_interval_ms * 3);
                 if (current_interval_ms < g_min_interval_ms) {
                     current_interval_ms = g_min_interval_ms;
                 }
                 
-                g_frame_width = original_width / 2;
-                g_frame_height = original_height / 2;
+                g_frame_width = original_width / 4;
+                g_frame_height = original_height / 4;
                 throttled = 1;
                 throttle_email_sent = 0;
                 
