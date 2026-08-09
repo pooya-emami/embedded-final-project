@@ -33,7 +33,7 @@ static void load_model()
         return;
 
     snprintf(model_path, sizeof(model_path),
-             "%s%s", MODEL_BASE_PATH, YOLO_MODEL_FILE);
+             "%s%s", MODEL_BASE_PATH, MODEL_FILE);
 
     printf("Loading BlazeFace model from: %s\n", model_path);
 
