@@ -85,19 +85,6 @@ static time_t last_email_time = 0;
 static int active_detection_event = 0;
 static int stream_mode = 0;
 
-#define SHM_DETECTION_NAME "/guard_detection_result"
-#define SEM_DETECTION_NAME "/guard_detection_lock"
-
-typedef struct {
-    int person_count;
-    float cpu_temp;
-    time_t timestamp;
-    int valid;
-} detection_result_t;
-
-static detection_result_t *g_detection_result = NULL;
-static sem_t *g_detection_sem = NULL;
-
 static int history_pending = 0;
 static int history_count_val = 0;
 static float history_temp = 0;
