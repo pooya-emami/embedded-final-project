@@ -12,21 +12,11 @@
 #include <errno.h>
 
 #include "../common/shared_frame.h"
+#include "../common/shared_frame_processed.h"
 #include "human_detector.hpp"
 
-#define SHM_DETECTION_NAME "/guard_detection_result"
-#define SEM_DETECTION_NAME "/guard_detection_lock"
-
-typedef struct {
-    int person_count;
-    float cpu_temp;
-    time_t timestamp;
-    unsigned char frame_buffer[SHM_FRAME_BUF_SIZE];
-    size_t frame_size;
-    int valid;
-} detection_result_t;
-
 static shared_frame_t *g_frame = NULL;
+static processed_frame_t *g_processed = NULL;
 static volatile int running = 1;
 
 static void signal_handler(int sig) {
@@ -40,44 +30,25 @@ int main(void) {
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
 
-    // Open shared frame
+    // Open raw frame shared memory (from relay)
     g_frame = shared_frame_open();
     if (!g_frame) {
         fprintf(stderr, "[DETECTION] Failed to open shared frame\n");
         return 1;
     }
-    printf("[DETECTION] Shared frame opened\n");
+    printf("[DETECTION] Raw frame shared memory opened\n");
 
-    // Open shared memory for detection results
-    sem_t *result_sem = sem_open(SEM_DETECTION_NAME, O_CREAT, 0666, 1);
-    if (result_sem == SEM_FAILED) {
-        perror("[DETECTION] sem_open");
+    g_processed = processed_frame_open();
+    if (!g_processed) {
+        fprintf(stderr, "[DETECTION] Failed to open processed shared memory\n");
         return 1;
     }
-
-    int shm_fd = shm_open(SHM_DETECTION_NAME, O_CREAT | O_RDWR, 0666);
-    if (shm_fd < 0) {
-        perror("[DETECTION] shm_open");
-        return 1;
-    }
-    
-    if (ftruncate(shm_fd, sizeof(detection_result_t)) < 0) {
-        perror("[DETECTION] ftruncate");
-        return 1;
-    }
-
-    detection_result_t *result = mmap(NULL, sizeof(detection_result_t),
-                                      PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    close(shm_fd);
-    
-    if (result == MAP_FAILED) {
-        perror("[DETECTION] mmap");
-        return 1;
-    }
+    printf("[DETECTION] Processed shared memory opened\n");
 
     // Temperature file
     FILE *temp_file = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
     float cpu_temp = -1;
+    int frame_count = 0;
     
     while (running) {
         unsigned char buf[SHM_FRAME_BUF_SIZE];
@@ -93,36 +64,25 @@ int main(void) {
                 }
             }
 
-            // Run detection
             DetectionResult res = process_frame(buf, len, 320, 240);
             
-            // Write result to shared memory
-            sem_wait(result_sem);
-            result->person_count = res.person_count;
-            result->cpu_temp = cpu_temp;
-            result->timestamp = time(NULL);
-            result->valid = 1;
-            
             if (res.jpeg_output && res.jpeg_length > 0) {
-                size_t copy_len = res.jpeg_length;
-                if (copy_len > SHM_FRAME_BUF_SIZE) copy_len = SHM_FRAME_BUF_SIZE;
-                memcpy(result->frame_buffer, res.jpeg_output, copy_len);
-                result->frame_size = copy_len;
+                processed_frame_write(g_processed, res.jpeg_output, res.jpeg_length, 
+                                      res.person_count, cpu_temp);
             }
-            sem_post(result_sem);
             
             free_detection_result(&res);
+            
+            frame_count++;
+            if (frame_count % 30 == 0) {
+                printf("[DETECTION] Frames: %d\n", frame_count);
+            }
         }
 
         usleep(33000);  // ~30 FPS
     }
 
     printf("[DETECTION] Shutting down...\n");
-    
-    sem_close(result_sem);
-    sem_unlink(SEM_DETECTION_NAME);
-    shm_unlink(SHM_DETECTION_NAME);
     if (temp_file) fclose(temp_file);
-    
     return 0;
 }

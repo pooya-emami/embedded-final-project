@@ -6,7 +6,8 @@ LDFLAGS = -lpthread -lrt -lopencv_core -lopencv_imgproc -lopencv_imgcodecs -lope
           -lonnxruntime
 
 # Source files
-SRC = detection_server.c ../common/shared_frame.c human_detector.cpp
+SRC = detection_server.c ../common/shared_frame.c  \
+           ../common/shared_frame_processed.c human_detector.cpp
 OBJ = detection_server.o shared_frame.o human_detector.o
 TARGET = detection_server
 

@@ -24,6 +24,10 @@
 #include "email_sender.h"
 #include "mqtt_client.h"
 #include "sqlite_history.h"
+#include "shared_frame_processed.h"
+
+
+
 
 // Global config variables
 int g_frame_interval_ms = DEFAULT_FRAME_INTERVAL_MS;
@@ -52,6 +56,7 @@ static char g_mqtt_pass[128] = {0};
 static char g_db_path[256] = {0};
 
 // Static globals
+static processed_frame_t *g_processed = NULL;
 static shared_frame_t *g_frame = NULL;
 static unsigned char current_frame[BUFFER_SIZE];
 static size_t current_len = 0;
@@ -713,102 +718,105 @@ void *frame_updater(void *arg) {
     int last_person_count = 0;
 
     while (running) {
-        unsigned char buf[SHM_FRAME_BUF_SIZE];
-        size_t len = shared_frame_read(g_frame, buf, SHM_FRAME_BUF_SIZE);
+        int count = 0;
+        float temp = 0;
+        unsigned char proc_buf[BUFFER_SIZE];
+        size_t proc_len = 0;
         
-        if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
-            pthread_mutex_lock(&watchdog_mutex);
-            
-            if (!first_frame_received) {
-                memcpy(prev_frame, buf, len);
-                prev_frame_len = len;
-                last_frame_time = time(NULL);
-                frame_stuck_count = 0;
-                first_frame_received = 1;
-            } else if (len != prev_frame_len || memcmp(buf, prev_frame, len) != 0) {
-                memcpy(prev_frame, buf, len);
-                prev_frame_len = len;
-                last_frame_time = time(NULL);
-                frame_stuck_count = 0;
-                
-                if (watchdog_alert_sent && !camera_restored_alert_sent) {
-                    camera_restored_alert_sent = 1;
-                    watchdog_alert_sent = 0;
-                    send_watchdog_alert("restored");
-                    printf("[WATCHDOG] Camera restored!\n");
-                }
-            } else {
-                frame_stuck_count++;
-            }
-            
-            pthread_mutex_unlock(&watchdog_mutex);
+        if (stream_mode == 2 && g_processed) {
+            // Read processed frame (with overlays)
+            proc_len = processed_frame_read(g_processed, proc_buf, BUFFER_SIZE, &count, &temp);
         }
-
-        if (g_detection_result && g_detection_sem) {
-            sem_wait(g_detection_sem);
-            int count = g_detection_result->person_count;
-            float temp = g_detection_result->cpu_temp;
-            time_t timestamp = g_detection_result->timestamp;
-            int valid = g_detection_result->valid;
-            size_t frame_len = g_detection_result->frame_size;
+        
+        if (proc_len > 0 && stream_mode == 2) {
+            // Use processed frame
+            pthread_mutex_lock(&frame_mutex);
+            size_t copy_len = proc_len;
+            if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
+            memcpy(current_frame, proc_buf, copy_len);
+            current_len = copy_len;
+            pthread_mutex_unlock(&frame_mutex);
             
-            if (valid) {
-                // Update global person count
-                pthread_mutex_lock(&person_mutex);
-                g_person_count = count;
-                g_last_detection_time = timestamp;
-                pthread_mutex_unlock(&person_mutex);
+            // Update person count
+            pthread_mutex_lock(&person_mutex);
+            g_person_count = count;
+            g_last_detection_time = time(NULL);
+            pthread_mutex_unlock(&person_mutex);
+            
+            // Process detection (history, MQTT, email)
+            if (count > 0) {
+                no_detection_frame_count = 0;
                 
-                // Update frame for streaming
-                pthread_mutex_lock(&frame_mutex);
-                size_t copy_len = frame_len;
-                if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
-                if (copy_len > 0) {
-                    memcpy(current_frame, g_detection_result->frame_buffer, copy_len);
-                    current_len = copy_len;
+                int is_new_event = 0;
+                if (no_detection_frame_count > 100 || 
+                    count != last_person_count ||
+                    active_detection_event == 0) {
+                    is_new_event = 1;
+                    active_detection_event = 1;
+                    if (guard_enabled) {
+                        printf("[GUARD] New detection event started (count: %d)\n", count);
+                    }
                 }
+                last_person_count = count;
+                
+                if (mqtt_initialized) {
+                    mqtt_publish_persons(count, temp);
+                    if (guard_enabled) {
+                        mqtt_publish_alarm(count, temp);
+                    }
+                }
+                
+                signal_history(count, temp);
+                
+                int immediate = guard_enabled && is_new_event;
+                signal_email(count, temp, current_frame, current_len, immediate);
+            } else {
+                no_detection_frame_count++;
+                
+                if (no_detection_frame_count > 100 && active_detection_event) {
+                    active_detection_event = 0;
+                    if (guard_enabled) {
+                        printf("[GUARD] Person left, resetting detection event\n");
+                    }
+                }
+            }
+        } else {
+            unsigned char raw_buf[SHM_FRAME_BUF_SIZE];
+            size_t raw_len = shared_frame_read(g_frame, raw_buf, SHM_FRAME_BUF_SIZE);
+            
+            if (raw_len > 0 && raw_buf[0] == 0xFF && raw_buf[1] == 0xD8) {
+                pthread_mutex_lock(&frame_mutex);
+                size_t copy_len = raw_len;
+                if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
+                memcpy(current_frame, raw_buf, copy_len);
+                current_len = copy_len;
                 pthread_mutex_unlock(&frame_mutex);
                 
-                // Process detection (history, MQTT, email)
-                if (count > 0) {
-                    no_detection_frame_count = 0;
+                // Watchdog tracking
+                pthread_mutex_lock(&watchdog_mutex);
+                if (!first_frame_received) {
+                    memcpy(prev_frame, raw_buf, raw_len);
+                    prev_frame_len = raw_len;
+                    last_frame_time = time(NULL);
+                    frame_stuck_count = 0;
+                    first_frame_received = 1;
+                } else if (raw_len != prev_frame_len || memcmp(raw_buf, prev_frame, raw_len) != 0) {
+                    memcpy(prev_frame, raw_buf, raw_len);
+                    prev_frame_len = raw_len;
+                    last_frame_time = time(NULL);
+                    frame_stuck_count = 0;
                     
-                    int is_new_event = 0;
-                    if (no_detection_frame_count > 100 || 
-                        count != last_person_count ||
-                        active_detection_event == 0) {
-                        is_new_event = 1;
-                        active_detection_event = 1;
-                        if (guard_enabled) {
-                            printf("[GUARD] New detection event started (count: %d)\n", count);
-                        }
+                    if (watchdog_alert_sent && !camera_restored_alert_sent) {
+                        camera_restored_alert_sent = 1;
+                        watchdog_alert_sent = 0;
+                        send_watchdog_alert("restored");
+                        printf("[WATCHDOG] Camera restored!\n");
                     }
-                    last_person_count = count;
-                    
-                    if (mqtt_initialized) {
-                        mqtt_publish_persons(count, temp);
-                        if (guard_enabled) {
-                            mqtt_publish_alarm(count, temp);
-                        }
-                    }
-                    
-                    signal_history(count, temp);
-                    
-                    int immediate = guard_enabled && is_new_event;
-                    signal_email(count, temp, g_detection_result->frame_buffer, 
-                                frame_len, immediate);
                 } else {
-                    no_detection_frame_count++;
-                    
-                    if (no_detection_frame_count > 100 && active_detection_event) {
-                        active_detection_event = 0;
-                        if (guard_enabled) {
-                            printf("[GUARD] Person left, resetting detection event\n");
-                        }
-                    }
+                    frame_stuck_count++;
                 }
+                pthread_mutex_unlock(&watchdog_mutex);
             }
-            sem_post(g_detection_sem);
         }
 
         long interval = current_interval_ms;

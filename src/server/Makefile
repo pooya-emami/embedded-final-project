@@ -6,6 +6,7 @@ LDFLAGS = -lpthread -lrt -lssl -lcrypto -lcurl -lsqlite3 -lpaho-mqtt3c
 # Source files
 SRC = server.c \
       ../common/shared_frame.c \
+      ../common/shared_frame_processed.c \
       ../email/email_sender.c \
       ../mqtt/mqtt_client.c \
       ../sqlite/sqlite_history.c
