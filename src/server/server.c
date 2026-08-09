@@ -378,17 +378,6 @@ void *frame_updater(void *arg) {
             }
             pthread_mutex_unlock(&frame_mutex);
             
-            // Get temp and add history with the ORIGINAL frame
-            pthread_mutex_lock(&telemetry_mutex);
-            float temp = cached_temp;
-            pthread_mutex_unlock(&telemetry_mutex);
-            
-            // Pass the ORIGINAL frame (buf) to add_history
-            // This ensures the email gets the same frame used for detection
-            if (res.person_count > 0) {
-                add_history(res.person_count, temp, buf, len);
-            }
-            
             free_detection_result(&res);
         }
 
