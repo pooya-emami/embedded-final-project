@@ -25,6 +25,7 @@ static bool yolo_loaded = false;
 const int INPUT_SIZE = 128;
 const float CONF_THRESH = 0.5f;
 const float IOU_THRESH = 0.3f;
+const int MAX_DETECTIONS = 25;
 
 static void load_yolo()
 {
@@ -81,106 +82,158 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
         OrtArenaAllocator, OrtMemTypeDefault);
 
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+    // Get input names and prepare inputs
+    Ort::AllocatorWithDefaultOptions allocator;
+    
+    // Get all input names
+    std::vector<const char*> input_names;
+    std::vector<std::unique_ptr<char, Ort::AllocatedFree>> input_names_alloc;
+    std::vector<Ort::Value> input_tensors;
+    
+    for (int i = 0; i < yolo_session->GetInputCount(); i++) {
+        auto name = yolo_session->GetInputNameAllocated(i, allocator);
+        input_names_alloc.push_back(std::move(name));
+        input_names.push_back(input_names_alloc.back().get());
+    }
+
+    // Create input tensors for all inputs
+    // 1. Image tensor
+    Ort::Value image_tensor = Ort::Value::CreateTensor<float>(
         mem_info,
         input_tensor_values.data(),
         input_tensor_values.size(),
         input_shape.data(),
         input_shape.size()
     );
+    input_tensors.push_back(std::move(image_tensor));
+    
+    // 2. conf_threshold
+    float conf_thresh = CONF_THRESH;
+    std::array<int64_t, 1> conf_shape = {1};
+    Ort::Value conf_tensor = Ort::Value::CreateTensor<float>(
+        mem_info,
+        &conf_thresh,
+        1,
+        conf_shape.data(),
+        conf_shape.size()
+    );
+    input_tensors.push_back(std::move(conf_tensor));
+    
+    // 3. max_detections
+    int64_t max_det = MAX_DETECTIONS;
+    std::array<int64_t, 1> max_shape = {1};
+    Ort::Value max_tensor = Ort::Value::CreateTensor<int64_t>(
+        mem_info,
+        &max_det,
+        1,
+        max_shape.data(),
+        max_shape.size()
+    );
+    input_tensors.push_back(std::move(max_tensor));
+    
+    // 4. iou_threshold
+    float iou_thresh = IOU_THRESH;
+    std::array<int64_t, 1> iou_shape = {1};
+    Ort::Value iou_tensor = Ort::Value::CreateTensor<float>(
+        mem_info,
+        &iou_thresh,
+        1,
+        iou_shape.data(),
+        iou_shape.size()
+    );
+    input_tensors.push_back(std::move(iou_tensor));
 
-    Ort::AllocatorWithDefaultOptions allocator;
-
-    auto input_name = yolo_session->GetInputNameAllocated(0, allocator);
-    auto output_name = yolo_session->GetOutputNameAllocated(0, allocator);
-
-    const char* input_names[] = {input_name.get()};
-    const char* output_names[] = {output_name.get()};
+    // Get output names
+    std::vector<const char*> output_names;
+    std::vector<std::unique_ptr<char, Ort::AllocatedFree>> output_names_alloc;
+    
+    for (int i = 0; i < yolo_session->GetOutputCount(); i++) {
+        auto name = yolo_session->GetOutputNameAllocated(i, allocator);
+        output_names_alloc.push_back(std::move(name));
+        output_names.push_back(output_names_alloc.back().get());
+    }
 
     // Run inference
     auto output_tensors = yolo_session->Run(
         Ort::RunOptions{nullptr},
-        input_names, &input_tensor, 1,
-        output_names, 1);
+        input_names.data(), input_tensors.data(), input_tensors.size(),
+        output_names.data(), output_names.size());
 
-    float* out = output_tensors[0].GetTensorMutableData<float>();
+    if (output_tensors.empty()) {
+        return boxes;
+    }
 
-    auto shape = output_tensors[0]
-        .GetTensorTypeAndShapeInfo()
-        .GetShape();
+    // Parse outputs
+    float* boxes_data = output_tensors[0].GetTensorMutableData<float>();
+    auto boxes_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
+    
+    float* scores_data = nullptr;
+    std::vector<int64_t> scores_shape;
+    
+    if (output_tensors.size() > 1) {
+        scores_data = output_tensors[1].GetTensorMutableData<float>();
+        scores_shape = output_tensors[1].GetTensorTypeAndShapeInfo().GetShape();
+    }
 
-    // Parse BlazeFace output
+    // Determine number of detections
+    int num_detections = 0;
+    if (!boxes_shape.empty()) {
+        if (boxes_shape.size() == 3 && boxes_shape[0] == 1) {
+            // Shape: {1, N, 16}
+            num_detections = boxes_shape[1];
+        } else if (boxes_shape.size() == 2 && boxes_shape[0] == 1 && boxes_shape[1] == 16) {
+            // Single detection: {1, 16}
+            num_detections = 1;
+        } else if (boxes_shape.size() == 2 && boxes_shape[0] > 0 && boxes_shape[1] == 16) {
+            // Shape: {N, 16}
+            num_detections = boxes_shape[0];
+        } else if (boxes_shape.size() == 1 && boxes_shape[0] % 16 == 0) {
+            // Flat array
+            num_detections = boxes_shape[0] / 16;
+        }
+    }
+
+    if (num_detections <= 0 || boxes_data == nullptr) {
+        return boxes;
+    }
+
+    // Parse detections
     struct Detection {
         float x1, y1, x2, y2;
         float confidence;
     };
     std::vector<Detection> detections;
 
-    // Handle different output shapes
-    int num_detections = 0;
-    bool is_single_detection = false;
-    
-    if (shape.size() == 3 && shape[0] == 1) {
-        // Shape: {1, N, 16}
-        num_detections = shape[1];
-    } else if (shape.size() == 2 && shape[0] == 1 && shape[1] == 16) {
-        // Single detection: {1, 16}
-        num_detections = 1;
-        is_single_detection = true;
-    } else if (shape.size() == 2 && shape[0] > 0 && shape[1] == 16) {
-        // Shape: {N, 16}
-        num_detections = shape[0];
-    } else if (shape.size() == 1 && shape[0] % 16 == 0) {
-        // Flat array
-        num_detections = shape[0] / 16;
-    } else {
-        // Try to get from scores output
-        auto scores_shape = output_tensors[1].GetTensorTypeAndShapeInfo().GetShape();
-        if (!scores_shape.empty()) {
-            num_detections = scores_shape[0];
-        }
-    }
-
-    // Parse detections
     for (int i = 0; i < num_detections; i++) {
         float y1, x1, y2, x2;
         float score = 0.0f;
         
-        if (is_single_detection) {
-            // Single detection
-            y1 = out[0];
-            x1 = out[1];
-            y2 = out[2];
-            x2 = out[3];
-            // Get score if available
-            if (output_tensors.size() > 1) {
-                float* scores = output_tensors[1].GetTensorMutableData<float>();
-                score = scores[0];
-            } else {
-                score = 1.0f;
-            }
-        } else if (shape.size() == 3) {
+        if (boxes_shape.size() == 3 && boxes_shape[0] == 1) {
             // Shape: {1, N, 16}
             int offset = i * 16;
-            y1 = out[offset + 0];
-            x1 = out[offset + 1];
-            y2 = out[offset + 2];
-            x2 = out[offset + 3];
-            
-            // Get score if available
-            if (output_tensors.size() > 1) {
-                float* scores = output_tensors[1].GetTensorMutableData<float>();
-                score = scores[i];
-            } else {
-                score = 1.0f;
-            }
+            y1 = boxes_data[offset + 0];
+            x1 = boxes_data[offset + 1];
+            y2 = boxes_data[offset + 2];
+            x2 = boxes_data[offset + 3];
+        } else if (boxes_shape.size() == 2 && boxes_shape[0] == 1 && boxes_shape[1] == 16) {
+            // Single detection
+            y1 = boxes_data[0];
+            x1 = boxes_data[1];
+            y2 = boxes_data[2];
+            x2 = boxes_data[3];
         } else {
-            // Flat array or other format
+            // Other format
             int offset = i * 16;
-            y1 = out[offset + 0];
-            x1 = out[offset + 1];
-            y2 = out[offset + 2];
-            x2 = out[offset + 3];
+            y1 = boxes_data[offset + 0];
+            x1 = boxes_data[offset + 1];
+            y2 = boxes_data[offset + 2];
+            x2 = boxes_data[offset + 3];
+        }
+        
+        // Get score
+        if (scores_data != nullptr && i < scores_shape[0]) {
+            score = scores_data[i];
+        } else {
             score = 1.0f;
         }
         
