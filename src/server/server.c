@@ -214,6 +214,27 @@ static float read_temp(void) {
         }
         fclose(f);
     }
+
+    f = fopen("/mnt/d/Users/ASUS/Documents/Virtual Machines/shared/cpu.txt", "r");
+    if (f) {
+        float t = -1;
+        if (fscanf(f, "%f", &t) == 1) {
+            fclose(f);
+            return t;
+        }
+        fclose(f);
+    }
+
+    f = fopen("/mnt/hgfs/shared/cpu.txt", "r");
+    if (f) {
+        float t = -1;
+        if (fscanf(f, "%f", &t) == 1) {
+            fclose(f);
+            return t;
+        }
+        fclose(f);
+    }
+
     return -1;
 }
 
