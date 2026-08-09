@@ -472,9 +472,8 @@ void *frame_updater(void *arg) {
             if (res.person_count > 0) {
                 no_detection_frame_count = 0;
                 
-                // Check if this is a NEW event (person just appeared)
                 int is_new_event = 0;
-                if (active_detection_event == 0) {
+                if (guard_enabled && active_detection_event == 0) {
                     is_new_event = 1;
                     active_detection_event = 1;
                     printf("[GUARD] New detection event started\n");
@@ -484,7 +483,7 @@ void *frame_updater(void *arg) {
                 pthread_mutex_lock(&pending_mutex);
                 pending_detection_count = res.person_count;
                 pending_detection_temp = temp;
-                pending_is_guard_event = guard_enabled && is_new_event;
+                pending_is_guard_event = is_new_event;
                 pending_processed = 0;
                 
                 if (len > 0 && len < BUFFER_SIZE) {
@@ -497,7 +496,7 @@ void *frame_updater(void *arg) {
                 no_detection_frame_count++;
                 
                 // Person left - reset event after 100+ frames (~3 seconds)
-                if (no_detection_frame_count > 100 && active_detection_event) {
+                if (guard_enabled && no_detection_frame_count > 100 && active_detection_event) {
                     active_detection_event = 0;
                     printf("[GUARD] Person left, resetting detection event\n");
                 }
@@ -520,9 +519,6 @@ void *frame_updater(void *arg) {
     return NULL;
 }
 
-// ============================================================
-// WATCHDOG MONITOR - Checks for camera tampering
-// ============================================================
 void *watchdog_monitor(void *arg) {
     (void)arg;
     
