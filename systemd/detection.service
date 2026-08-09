@@ -1,0 +1,17 @@
+[Unit]
+Description=Detection Service
+After=relay.service
+Requires=relay.service
+
+[Service]
+Type=simple
+User=pooya
+WorkingDirectory=/home/pooya/embproj/proj
+ExecStart=/home/pooya/embproj/proj/detection_server
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

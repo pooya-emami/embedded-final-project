@@ -1,7 +1,7 @@
 [Unit]
 Description=Embedded Web Server
-After=network.target relay.service
-Requires=relay.service
+After=relay.service detection.service
+Requires=relay.service detection.service
 
 [Service]
 Type=simple

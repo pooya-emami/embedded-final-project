@@ -14,10 +14,13 @@
 #include <stdint.h>
 #include <ctype.h>
 #include <errno.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <semaphore.h>
 
 #include "server.h"
 #include "shared_frame.h"
-#include "human_detector.hpp"
 #include "email_sender.h"
 #include "mqtt_client.h"
 #include "sqlite_history.h"
@@ -45,7 +48,7 @@ static int g_mqtt_port = 1883;
 static char g_mqtt_user[128] = {0};
 static char g_mqtt_pass[128] = {0};
 
-// SQLite history database path
+// SQLite database path from config
 static char g_db_path[256] = {0};
 
 // Static globals
@@ -86,6 +89,23 @@ static time_t last_email_time = 0;
 // Guard event tracking
 static int active_detection_event = 0;
 
+
+#define SHM_DETECTION_NAME "/guard_detection_result"
+#define SEM_DETECTION_NAME "/guard_detection_lock"
+
+typedef struct {
+    int person_count;
+    float cpu_temp;
+    time_t timestamp;
+    unsigned char frame_buffer[SHM_FRAME_BUF_SIZE];
+    size_t frame_size;
+    int valid;
+} detection_result_t;
+
+static detection_result_t *g_detection_result = NULL;
+static sem_t *g_detection_sem = NULL;
+
+// History thread
 static int history_pending = 0;
 static int history_count_val = 0;
 static float history_temp = 0;
@@ -94,6 +114,7 @@ static pthread_cond_t history_cond = PTHREAD_COND_INITIALIZER;
 static int history_thread_running = 1;
 static pthread_t history_thread;
 
+// Email thread
 static int email_pending = 0;
 static int email_count = 0;
 static float email_temp = 0;
@@ -193,8 +214,7 @@ void load_config(const char *filename) {
         } else if (strcmp(key, "MQTT_PASS") == 0) {
             strcpy(g_mqtt_pass, value);
             loaded++;
-        }
-        else if (strcmp(key, "HISTORY_DB_PATH") == 0) {
+        } else if (strcmp(key, "HISTORY_DB_PATH") == 0) {
             strcpy(g_db_path, value);
             loaded++;
         }
@@ -298,12 +318,6 @@ static float read_cpu_usage(void) {
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
-static void run_command(const char *cmd)
-{
-    int ret = system(cmd);
-    (void)ret;
-}
-
 static void add_history_internal(int count, float temp)
 {
     pthread_mutex_lock(&history_mutex);
@@ -322,11 +336,13 @@ static void add_history_internal(int count, float temp)
 static void *telemetry_updater(void *arg) {
     (void)arg;
     
+    // Store original resolution for restoration
     static int original_width = 0;
     static int original_height = 0;
     static int throttled = 0;
     static int throttle_email_sent = 0;
     
+    // Set original resolution on first run
     if (original_width == 0) {
         original_width = g_frame_width;
         original_height = g_frame_height;
@@ -339,6 +355,9 @@ static void *telemetry_updater(void *arg) {
         cached_cpu = read_cpu_usage();
         pthread_mutex_unlock(&telemetry_mutex);
         
+        // ============================================================
+        // THERMAL THROTTLING with Resolution and FPS reduction
+        // ============================================================
         if (cached_temp > g_temp_throttle_c) {
             if (!throttled) {
                 // Reduce FPS: increase interval by 50%
@@ -347,6 +366,7 @@ static void *telemetry_updater(void *arg) {
                     current_interval_ms = g_min_interval_ms;
                 }
                 
+                // Reduce resolution by 50%
                 g_frame_width = original_width / 2;
                 g_frame_height = original_height / 2;
                 throttled = 1;
@@ -361,12 +381,14 @@ static void *telemetry_updater(void *arg) {
                        g_frame_width, g_frame_height);
             }
             
+            // Send throttle email (only once per throttle event)
             if (!throttle_email_sent) {
                 email_send_alert_thermal(cached_temp);
                 throttle_email_sent = 1;
             }
             
         } else if (cached_temp <= g_temp_throttle_c - 5 && throttled) {
+            // Restore original settings
             current_interval_ms = g_frame_interval_ms;
             g_frame_width = original_width;
             g_frame_height = original_height;
@@ -553,6 +575,12 @@ static void *email_thread_func(void *arg) {
     return NULL;
 }
 
+static void run_command(const char *cmd)
+{
+    int ret = system(cmd);
+    (void)ret;
+}
+
 void *frame_updater(void *arg) {
     (void)arg;
 
@@ -563,105 +591,79 @@ void *frame_updater(void *arg) {
     int last_person_count = 0;
 
     while (running) {
-        unsigned char buf[BUFFER_SIZE];
-        size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
-
-        // WATCHDOG
-        if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
-            pthread_mutex_lock(&watchdog_mutex);
+        if (g_detection_result && g_detection_sem) {
+            sem_wait(g_detection_sem);
+            int count = g_detection_result->person_count;
+            float temp = g_detection_result->cpu_temp;
+            time_t timestamp = g_detection_result->timestamp;
+            int valid = g_detection_result->valid;
+            size_t frame_len = g_detection_result->frame_size;
             
-            if (!first_frame_received) {
-                memcpy(prev_frame, buf, len);
-                prev_frame_len = len;
-                last_frame_time = time(NULL);
-                first_frame_received = 1;
-                printf("[WATCHDOG] First frame received (%zu bytes)\n", len);
-            } else if (len != prev_frame_len || memcmp(buf, prev_frame, len) != 0) {
-                memcpy(prev_frame, buf, len);
-                prev_frame_len = len;
-                last_frame_time = time(NULL);
+            if (valid) {
+                // Update global person count
+                pthread_mutex_lock(&person_mutex);
+                g_person_count = count;
+                g_last_detection_time = timestamp;
+                pthread_mutex_unlock(&person_mutex);
                 
-                if (watchdog_alert_sent && !camera_restored_alert_sent) {
-                    camera_restored_alert_sent = 1;
-                    watchdog_alert_sent = 0;
-                    send_watchdog_alert("restored");
-                    printf("[WATCHDOG] Camera restored!\n");
+                // Update frame for streaming
+                pthread_mutex_lock(&frame_mutex);
+                size_t copy_len = frame_len;
+                if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
+                if (copy_len > 0) {
+                    memcpy(current_frame, g_detection_result->frame_buffer, copy_len);
+                    current_len = copy_len;
                 }
-            }
-            
-            pthread_mutex_unlock(&watchdog_mutex);
-        }
-
-        if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
-            DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
-            
-            pthread_mutex_lock(&person_mutex);
-            g_person_count = res.person_count;
-            g_last_detection_time = time(NULL);
-            pthread_mutex_unlock(&person_mutex);
-            
-            pthread_mutex_lock(&frame_mutex);
-            size_t copy_len = res.jpeg_length;
-            if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
-            if (res.jpeg_output) {
-                memcpy(current_frame, res.jpeg_output, copy_len);
-                current_len = copy_len;
-            }
-            pthread_mutex_unlock(&frame_mutex);
-            
-            pthread_mutex_lock(&telemetry_mutex);
-            float temp = cached_temp;
-            pthread_mutex_unlock(&telemetry_mutex);
-            
-            if (res.person_count > 0) {
-                no_detection_frame_count = 0;
+                pthread_mutex_unlock(&frame_mutex);
                 
-                int is_new_event = 0;
-                if (no_detection_frame_count > 100 || 
-                    res.person_count != last_person_count ||
-                    active_detection_event == 0) {
-                    is_new_event = 1;
-                    active_detection_event = 1;
-                    if (guard_enabled) {
-                        printf("[GUARD] New detection event started (count: %d)\n", res.person_count);
+                // Process detection (history, MQTT, email)
+                if (count > 0) {
+                    no_detection_frame_count = 0;
+                    
+                    int is_new_event = 0;
+                    if (no_detection_frame_count > 100 || 
+                        count != last_person_count ||
+                        active_detection_event == 0) {
+                        is_new_event = 1;
+                        active_detection_event = 1;
+                        if (guard_enabled) {
+                            printf("[GUARD] New detection event started (count: %d)\n", count);
+                        }
                     }
-                }
-                last_person_count = res.person_count;
-                
-                if (mqtt_initialized) {
-                    mqtt_publish_persons(res.person_count, temp);
-                    if (guard_enabled) {
-                        mqtt_publish_alarm(res.person_count, temp);
+                    last_person_count = count;
+                    
+                    if (mqtt_initialized) {
+                        mqtt_publish_persons(count, temp);
+                        if (guard_enabled) {
+                            mqtt_publish_alarm(count, temp);
+                        }
                     }
-                }
-                
-                signal_history(res.person_count, temp);
-                
-                int immediate = guard_enabled && is_new_event;
-                signal_email(res.person_count, temp, buf, len, immediate);
-                
-            } else {
-                no_detection_frame_count++;
-                
-                if (no_detection_frame_count > 100 && active_detection_event) {
-                    active_detection_event = 0;
-                    if (guard_enabled) {
-                        printf("[GUARD] Person left, resetting detection event\n");
+                    
+                    signal_history(count, temp);
+                    
+                    int immediate = guard_enabled && is_new_event;
+                    signal_email(count, temp, g_detection_result->frame_buffer, 
+                                frame_len, immediate);
+                } else {
+                    no_detection_frame_count++;
+                    
+                    if (no_detection_frame_count > 100 && active_detection_event) {
+                        active_detection_event = 0;
+                        if (guard_enabled) {
+                            printf("[GUARD] Person left, resetting detection event\n");
+                        }
                     }
                 }
             }
-            
-            free_detection_result(&res);
+            sem_post(g_detection_sem);
         }
 
         long interval = current_interval_ms;
         next_time.tv_nsec += interval * 1000000L;
-
         while (next_time.tv_nsec >= 1000000000L) {
             next_time.tv_nsec -= 1000000000L;
             next_time.tv_sec += 1;
         }
-
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_time, NULL);
     }
 
@@ -686,8 +688,11 @@ void *watchdog_monitor(void *arg) {
                 send_watchdog_alert("offline");
                 printf("[WATCHDOG] Camera offline/stuck! No change for %d seconds\n", timeout_seconds);
                 
+                // Restart the server via systemd
                 run_command("systemctl restart server.service 2>/dev/null &");
                 printf("[WATCHDOG] Server restart triggered\n");
+                
+                running = 0;
             }
         }
         
@@ -1187,10 +1192,18 @@ int main(void) {
 
     srand(time(NULL));
 
-    if (history_db_init(g_db_path) != 0) {
+    // Initialize database
+    char db_path[256];
+    if (strlen(g_db_path) > 0) {
+        strcpy(db_path, g_db_path);
+    } else {
+        snprintf(db_path, sizeof(db_path), "%s/security_history.db", getenv("HOME"));
+    }
+    
+    if (history_db_init(db_path) != 0) {
         printf("Failed to initialize SQLite history DB\n");
     } else {
-        printf("[SQLITE] Database initialized: %s\n", g_db_path);
+        printf("[SQLITE] Database initialized: %s\n", db_path);
     }
 
     history = malloc(g_max_history * sizeof(detection_record_t));
@@ -1210,6 +1223,31 @@ int main(void) {
     if (!g_frame) {
         printf("Failed to open shared frame\n");
         return 1;
+    }
+
+    g_detection_sem = sem_open(SEM_DETECTION_NAME, O_CREAT, 0666, 1);
+    if (g_detection_sem == SEM_FAILED) {
+        perror("[SERVER] sem_open detection");
+        printf("[SERVER] Detection service not available - continuing\n");
+    } else {
+        int shm_fd = shm_open(SHM_DETECTION_NAME, O_RDWR, 0666);
+        if (shm_fd < 0) {
+            perror("[SERVER] shm_open detection");
+            sem_close(g_detection_sem);
+            g_detection_sem = NULL;
+        } else {
+            g_detection_result = mmap(NULL, sizeof(detection_result_t),
+                                       PROT_READ, MAP_SHARED, shm_fd, 0);
+            close(shm_fd);
+            if (g_detection_result == MAP_FAILED) {
+                perror("[SERVER] mmap detection");
+                g_detection_result = NULL;
+                sem_close(g_detection_sem);
+                g_detection_sem = NULL;
+            } else {
+                printf("[SERVER] Connected to detection service\n");
+            }
+        }
     }
 
     last_frame_time = time(NULL);
@@ -1339,6 +1377,16 @@ int main(void) {
     pthread_join(telemetry_thread, NULL);
     pthread_join(watchdog_thread, NULL);
 
+    // Clean up detection shared memory
+    if (g_detection_sem) {
+        sem_close(g_detection_sem);
+        g_detection_sem = NULL;
+    }
+    if (g_detection_result) {
+        munmap(g_detection_result, sizeof(detection_result_t));
+        g_detection_result = NULL;
+    }
+
     close(http_fd);
     close(https_fd);
     SSL_CTX_free(ssl_ctx);
@@ -1349,3 +1397,5 @@ int main(void) {
     printf("Server stopped.\n");
     return 0;
 }
+
+
