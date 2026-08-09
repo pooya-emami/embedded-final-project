@@ -68,23 +68,6 @@ static int g_person_count = 0;
 static time_t g_last_detection_time = 0;
 static pthread_mutex_t person_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// ============================================================
-// WATCHDOG GLOBALS - ADD THESE
-// ============================================================
-static time_t last_frame_time = 0;
-static int watchdog_alert_sent = 0;
-static int camera_restored_alert_sent = 0;
-static unsigned char prev_frame[BUFFER_SIZE] = {0};
-static size_t prev_frame_len = 0;
-static int first_frame_received = 0;
-static pthread_mutex_t watchdog_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-// Email debounce global
-static time_t last_email_time = 0;
-
-// ============================================================
-// WATCHDOG GLOBALS
-// ============================================================
 static time_t last_frame_time = 0;
 static int watchdog_alert_sent = 0;
 static int camera_restored_alert_sent = 0;
