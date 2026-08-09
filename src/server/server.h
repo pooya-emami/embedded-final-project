@@ -51,6 +51,6 @@ typedef struct {
     float temp;
 } detection_record_t;
 
-void add_history(int count, float temp);
+void add_history(int count, float temp, const unsigned char *frame, size_t frame_len);
 
 #endif /* SERVER_H */

@@ -280,7 +280,8 @@ static void *telemetry_updater(void *arg) {
     return NULL;
 }
 
-void add_history(int count, float temp) {
+void add_history(int count, float temp, const unsigned char *frame, size_t frame_len)
+{
     pthread_mutex_lock(&history_mutex);
     if (history_count >= g_max_history) {
         memmove(&history[0], &history[1], (g_max_history - 1) * sizeof(detection_record_t));
@@ -315,42 +316,30 @@ void add_history(int count, float temp) {
             last_alert_time = now;
             last_alert_count = count;
             
-            // Get frame directly from current_frame
-            pthread_mutex_lock(&frame_mutex);
-            
-            // Verify JPEG header before copying
-            int has_valid_frame = 0;
+            // Use the frame passed to this function
             unsigned char *frame_copy = NULL;
-            size_t frame_len = 0;
+            size_t copy_len = 0;
             
-            if (current_len > 10) {
-                // Check JPEG header (FF D8)
-                if (current_frame[0] == 0xFF && current_frame[1] == 0xD8) {
-                    frame_copy = malloc(current_len);
+            if (frame && frame_len > 0) {
+                // Verify JPEG header
+                if (frame[0] == 0xFF && frame[1] == 0xD8) {
+                    frame_copy = malloc(frame_len);
                     if (frame_copy) {
-                        memcpy(frame_copy, current_frame, current_len);
-                        frame_len = current_len;
-                        has_valid_frame = 1;
-                        printf("[EMAIL] Captured frame: %zu bytes (valid JPEG)\n", frame_len);
+                        memcpy(frame_copy, frame, frame_len);
+                        copy_len = frame_len;
+                        printf("[EMAIL] Using frame from detection: %zu bytes\n", copy_len);
                     }
                 } else {
-                    printf("[EMAIL] ⚠️ Invalid JPEG header in current_frame: %02X %02X\n", 
-                           current_frame[0], current_frame[1]);
+                    printf("[EMAIL] ⚠️ Invalid JPEG header in provided frame\n");
                 }
-            } else {
-                printf("[EMAIL] ⚠️ current_frame too small: %zu bytes\n", current_len);
             }
             
-            pthread_mutex_unlock(&frame_mutex);
-            
             // Send email with frame
-            if (frame_copy && frame_len > 0) {
-                int result = email_send_alert(count, temp, frame_copy, frame_len);
-                printf("[EMAIL] email_send_alert returned: %d\n", result);
+            if (frame_copy && copy_len > 0) {
+                email_send_alert(count, temp, frame_copy, copy_len);
                 free(frame_copy);
             } else {
-                printf("[EMAIL] No valid frame available for email\n");
-                // Send email without attachment as fallback
+                printf("[EMAIL] No valid frame, sending without attachment\n");
                 email_send_alert(count, temp, NULL, 0);
             }
             
@@ -378,6 +367,8 @@ void *frame_updater(void *arg) {
 
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
+            
+            // Update current_frame for streaming
             pthread_mutex_lock(&frame_mutex);
             size_t copy_len = res.jpeg_length;
             if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
@@ -386,6 +377,18 @@ void *frame_updater(void *arg) {
                 current_len = copy_len;
             }
             pthread_mutex_unlock(&frame_mutex);
+            
+            // Get temp and add history with the ORIGINAL frame
+            pthread_mutex_lock(&telemetry_mutex);
+            float temp = cached_temp;
+            pthread_mutex_unlock(&telemetry_mutex);
+            
+            // Pass the ORIGINAL frame (buf) to add_history
+            // This ensures the email gets the same frame used for detection
+            if (res.person_count > 0) {
+                add_history(res.person_count, temp, buf, len);
+            }
+            
             free_detection_result(&res);
         }
 
@@ -612,45 +615,47 @@ static void *handle_https_thread(void *arg) {
     }
 
     // GET /api/v1/persons
-    if (strcmp(path, "/api/v1/persons") == 0) {
-        unsigned char buf[BUFFER_SIZE];
-        size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
-        
-        int count = 0;
-        if (len > 0) {
-            DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
-            count = res.person_count;
-            free_detection_result(&res);
-        }
+if (strcmp(path, "/api/v1/persons") == 0) {
+    unsigned char buf[BUFFER_SIZE];
+    size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
+    
+    int count = 0;
+    if (len > 0) {
+        DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
+        count = res.person_count;
         
         pthread_mutex_lock(&telemetry_mutex);
         float temp = cached_temp;
         pthread_mutex_unlock(&telemetry_mutex);
         
         if (count > 0) {
-            add_history(count, temp);
+            // Pass the SAME frame (buf) to add_history
+            add_history(count, temp, buf, len);
         }
-
-        char json[128];
-        snprintf(json, sizeof(json),
-                 "{\"count\":%d,\"timestamp\":%ld}",
-                 count, time(NULL));
-
-        char header[512];
-        snprintf(header, sizeof(header),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: %zu\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: close\r\n"
-            "\r\n%s",
-            strlen(json), json);
-
-        SSL_write(ssl, header, strlen(header));
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
+        
+        free_detection_result(&res);
     }
+
+    char json[128];
+    snprintf(json, sizeof(json),
+             "{\"count\":%d,\"timestamp\":%ld}",
+             count, time(NULL));
+
+    char header[512];
+    snprintf(header, sizeof(header),
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %zu\r\n"
+        "Cache-Control: no-cache\r\n"
+        "Connection: close\r\n"
+        "\r\n%s",
+        strlen(json), json);
+
+    SSL_write(ssl, header, strlen(header));
+    SSL_free(ssl);
+    close(fd);
+    return NULL;
+}
 
     // GET /api/v1/history
     if (strcmp(path, "/api/v1/history") == 0) {
