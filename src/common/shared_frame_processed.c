@@ -55,7 +55,6 @@ void processed_frame_write(processed_frame_t *pf, const unsigned char *data, siz
 
 size_t processed_frame_read(processed_frame_t *pf, unsigned char *buf, size_t max, int *count, float *temp) {
     size_t n;
-    time_t ts;
 
     sem_wait(g_lock);
     n = pf->frame_size;
@@ -63,7 +62,6 @@ size_t processed_frame_read(processed_frame_t *pf, unsigned char *buf, size_t ma
     if (n > 0) memcpy(buf, pf->frame_buffer, n);
     *count = pf->person_count;
     *temp = pf->cpu_temp;
-    ts = pf->timestamp;
     sem_post(g_lock);
 
     return n;
