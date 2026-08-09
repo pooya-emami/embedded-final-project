@@ -10,6 +10,8 @@ extern char g_smtp_user[128];
 extern char g_smtp_pass[128];
 extern char g_smtp_to[128];
 
+extern int g_temp_throttle_c;
+
 static time_t last_email_time = 0;
 static time_t last_watchdog_email_time = 0;
 static time_t last_thermal_email_time = 0;
@@ -18,7 +20,6 @@ static int send_email_with_subject(const char *subject, const char *body_prefix,
                                    int persons, float cpu_temp,
                                    const unsigned char *jpeg_buf, size_t jpeg_len)
 {
-    time_t now = time(NULL);
     
     // Check SMTP config
     if (strlen(g_smtp_server) == 0 || strlen(g_smtp_user) == 0 || 
@@ -117,7 +118,6 @@ static int send_email_with_subject(const char *subject, const char *body_prefix,
 
 static int send_watchdog_email(const char *subject, const char *body_prefix, float cpu_temp)
 {
-    time_t now = time(NULL);
     
     // Check SMTP config
     if (strlen(g_smtp_server) == 0 || strlen(g_smtp_user) == 0 || 
@@ -294,8 +294,6 @@ int email_send_alert_thermal(float cpu_temp)
     curl_mime *mime = curl_mime_init(curl);
     curl_mimepart *part;
 
-    // Email body
-    char email_body[1024];
     time_t now_time = time(NULL);
     struct tm *tm_info = localtime(&now_time);
     char timestamp[64];

@@ -298,6 +298,12 @@ static float read_cpu_usage(void) {
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
+static void run_command(const char *cmd)
+{
+    int ret = system(cmd);
+    (void)ret;
+}
+
 static void add_history_internal(int count, float temp)
 {
     pthread_mutex_lock(&history_mutex);
@@ -680,7 +686,7 @@ void *watchdog_monitor(void *arg) {
                 send_watchdog_alert("offline");
                 printf("[WATCHDOG] Camera offline/stuck! No change for %d seconds\n", timeout_seconds);
                 
-                system("systemctl restart server.service 2>/dev/null &");
+                run_command("systemctl restart server.service 2>/dev/null &");
                 printf("[WATCHDOG] Server restart triggered\n");
             }
         }
@@ -1074,23 +1080,23 @@ static void *handle_https_thread(void *arg) {
                             printf("[CMD] Executing reboot\n");
                             snprintf(json_resp, sizeof(json_resp),
                                      "{\"status\":\"success\",\"cmd\":\"reboot\"}");
-                            system("shutdown -r now &");
+                            run_command("shutdown -r now &");
                         } else if (strcmp(command, "shutdown") == 0) {
                             printf("[CMD] Executing shutdown\n");
                             snprintf(json_resp, sizeof(json_resp),
                                      "{\"status\":\"success\",\"cmd\":\"shutdown\"}");
-                            system("shutdown -h now &");
+                            run_command("shutdown -h now &");
                         } else if (strcmp(command, "restart_detection") == 0) {
                             printf("[CMD] Restarting detection\n");
                             snprintf(json_resp, sizeof(json_resp),
                                      "{\"status\":\"success\",\"cmd\":\"restart_detection\"}");
-                            system("systemctl restart detection.service 2>/dev/null &");
+                            run_command("systemctl restart detection.service 2>/dev/null &");
                         } else {
                             snprintf(json_resp, sizeof(json_resp),
                                      "{\"status\":\"success\",\"cmd\":\"%s\"}", command);
                             char sys_cmd[128];
                             snprintf(sys_cmd, sizeof(sys_cmd), "%s &", command);
-                            system(sys_cmd);
+                            run_command(sys_cmd);
                         }
                         
                         char header[512];
