@@ -1116,7 +1116,7 @@ int main(void) {
     if (history_db_init(g_db_path) != 0) {
         printf("Failed to initialize SQLite history DB\n");
     } else {
-        printf("[SQLITE] Database initialized: %s\n", db_path);
+        printf("[SQLITE] Database initialized: %s\n", g_db_path);
     }
 
     history = malloc(g_max_history * sizeof(detection_record_t));
