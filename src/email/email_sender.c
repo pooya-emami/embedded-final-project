@@ -5,7 +5,6 @@
 #include <stdlib.h>
 #include "email_sender.h"
 
-// These are defined in server.c
 extern char g_smtp_server[128];
 extern char g_smtp_user[128];
 extern char g_smtp_pass[128];
@@ -13,7 +12,6 @@ extern char g_smtp_to[128];
 
 static time_t last_email_time = 0;
 static time_t last_watchdog_email_time = 0;
-
 
 static int send_email_with_subject(const char *subject, const char *body_prefix,
                                    int persons, float cpu_temp,

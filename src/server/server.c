@@ -80,9 +80,7 @@ static pthread_mutex_t watchdog_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Email debounce global
 static time_t last_email_time = 0;
 
-// ============================================================
 // Detection state for async processing
-// ============================================================
 static int pending_detection_count = 0;
 static float pending_detection_temp = 0;
 static unsigned char pending_frame[BUFFER_SIZE] = {0};
@@ -226,27 +224,6 @@ static float read_temp(void) {
         }
         fclose(f);
     }
-
-    f = fopen("/mnt/d/Users/ASUS/Documents/Virtual Machines/shared/cpu.txt", "r");
-    if (f) {
-        float t = -1;
-        if (fscanf(f, "%f", &t) == 1) {
-            fclose(f);
-            return t;
-        }
-        fclose(f);
-    }
-
-    f = fopen("/mnt/hgfs/shared/cpu.txt", "r");
-    if (f) {
-        float t = -1;
-        if (fscanf(f, "%f", &t) == 1) {
-            fclose(f);
-            return t;
-        }
-        fclose(f);
-    }
-
     return -1;
 }
 
@@ -279,37 +256,29 @@ static float read_cpu_usage(void) {
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
-static void send_watchdog_alert(const char *status)
+void add_history(int count, float temp)
 {
-    time_t now = time(NULL);
-    
-    // Send email alert (regardless of guard mode)
-    email_send_alert(0, cached_temp, NULL, 0);
-    
-    // Publish to MQTT alarm topic
-    if (mqtt_initialized) {
-        char topic[128];
-        snprintf(topic, sizeof(topic), "alarm/%s/home", STUDENT_ID);
-        char payload[256];
-        snprintf(payload, sizeof(payload),
-            "{\"status\":\"camera_%s\",\"timestamp\":%ld}",
-            status, now);
-        mqtt_publish_custom(topic, payload);
+    pthread_mutex_lock(&history_mutex);
+    if (history_count >= g_max_history) {
+        memmove(&history[0], &history[1], (g_max_history - 1) * sizeof(detection_record_t));
+        history_count = g_max_history - 1;
     }
-    
-    printf("[WATCHDOG] Camera %s alert sent\n", status);
+    history[history_count].count = count;
+    history[history_count].timestamp = time(NULL);
+    history[history_count].temp = temp;
+    history_count++;
+    history_db_add(count, temp);
+    pthread_mutex_unlock(&history_mutex);
 }
 
 static void send_detection_email(int count, float temp, const unsigned char *buf, size_t len, int immediate)
 {
     time_t now = time(NULL);
     
-    // Always check debounce for Guard OFF
     if (!immediate && (now - last_email_time < 30)) {
         return;
     }
     
-    // Copy frame for email
     unsigned char *frame_copy = NULL;
     size_t copy_len = 0;
     
@@ -329,27 +298,34 @@ static void send_detection_email(int count, float temp, const unsigned char *buf
     }
     
     last_email_time = now;
-    
-    if (immediate) {
-        printf("[GUARD] Immediate email sent: %d person(s)\n", count);
-    } else {
-        printf("[EMAIL] Email sent: %d person(s)\n", count);
-    }
 }
 
-void add_history(int count, float temp)
+// ============================================================
+// WATCHDOG ALERT - Only for tampering (offline/stuck)
+// ============================================================
+static void send_watchdog_alert(const char *status)
 {
-    pthread_mutex_lock(&history_mutex);
-    if (history_count >= g_max_history) {
-        memmove(&history[0], &history[1], (g_max_history - 1) * sizeof(detection_record_t));
-        history_count = g_max_history - 1;
+    time_t now = time(NULL);
+    
+    // Only send email for tamper events (offline or stuck)
+    if (strcmp(status, "offline") == 0 || strcmp(status, "stuck") == 0) {
+        email_send_alert_watchdog(cached_temp);
+        printf("[WATCHDOG] Camera %s - tamper alert sent\n", status);
+    } else {
+        // For restored, only log, no email
+        printf("[WATCHDOG] Camera %s (no email sent)\n", status);
     }
-    history[history_count].count = count;
-    history[history_count].timestamp = time(NULL);
-    history[history_count].temp = temp;
-    history_count++;
-    history_db_add(count, temp);
-    pthread_mutex_unlock(&history_mutex);
+    
+    // Publish to MQTT alarm topic for ALL watchdog events
+    if (mqtt_initialized) {
+        char topic[128];
+        snprintf(topic, sizeof(topic), "alarm/%s/home", STUDENT_ID);
+        char payload[256];
+        snprintf(payload, sizeof(payload),
+            "{\"status\":\"camera_%s\",\"timestamp\":%ld}",
+            status, now);
+        mqtt_publish_custom(topic, payload);
+    }
 }
 
 // ============================================================
@@ -380,26 +356,17 @@ static void process_pending_detection(void)
     
     if (!should_process) return;
     
-    // Add to history
     add_history(count, temp);
     
-    // Publish to MQTT persons topic
     if (mqtt_initialized) {
         mqtt_publish_persons(count, temp);
     }
     
-    // ============================================================
-    // GUARD MODE vs NORMAL MODE - Different email content
-    // ============================================================
     if (is_guard_event && guard_enabled) {
-        // ============================================================
-        // GUARD MODE: Immediate alert with GUARD subject
-        // ============================================================
         if (mqtt_initialized) {
             mqtt_publish_alarm(count, temp);
         }
         
-        // Send email with GUARD alert text
         if (frame_len > 0) {
             email_send_alert_guard(count, temp, frame, frame_len);
         } else {
@@ -408,9 +375,6 @@ static void process_pending_detection(void)
         printf("[PROCESS] GUARD email sent: %d person(s)\n", count);
         
     } else if (count > 0) {
-        // ============================================================
-        // NORMAL MODE: Regular detection with debounce
-        // ============================================================
         send_detection_email(count, temp, frame, frame_len, 0);
     }
 }
@@ -459,7 +423,7 @@ void *frame_updater(void *arg) {
         unsigned char buf[BUFFER_SIZE];
         size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
 
-        // WATCHDOG
+        // WATCHDOG: Check if frame changed
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             pthread_mutex_lock(&watchdog_mutex);
             
@@ -488,13 +452,11 @@ void *frame_updater(void *arg) {
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
             
-            // Update global person count
             pthread_mutex_lock(&person_mutex);
             g_person_count = res.person_count;
             g_last_detection_time = time(NULL);
             pthread_mutex_unlock(&person_mutex);
             
-            // Update stream frame
             pthread_mutex_lock(&frame_mutex);
             size_t copy_len = res.jpeg_length;
             if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
@@ -504,12 +466,10 @@ void *frame_updater(void *arg) {
             }
             pthread_mutex_unlock(&frame_mutex);
             
-            // Get temperature
             pthread_mutex_lock(&telemetry_mutex);
             float temp = cached_temp;
             pthread_mutex_unlock(&telemetry_mutex);
             
-            // If people detected, store for async processing
             if (res.person_count > 0) {
                 no_detection_frame_count = 0;
                 
@@ -557,6 +517,35 @@ void *frame_updater(void *arg) {
         clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &next_time, NULL);
     }
 
+    return NULL;
+}
+
+// ============================================================
+// WATCHDOG MONITOR - Checks for camera tampering
+// ============================================================
+void *watchdog_monitor(void *arg) {
+    (void)arg;
+    
+    while (running) {
+        pthread_mutex_lock(&watchdog_mutex);
+        
+        int timeout_seconds = g_watchdog_timeout_ms / 1000;
+        if (timeout_seconds <= 0) timeout_seconds = 30;
+        
+        time_t now = time(NULL);
+        
+        if (now - last_frame_time > timeout_seconds) {
+            if (!watchdog_alert_sent) {
+                watchdog_alert_sent = 1;
+                camera_restored_alert_sent = 0;
+                send_watchdog_alert("offline");
+                printf("[WATCHDOG] Camera offline/stuck! No change for %d seconds\n", timeout_seconds);
+            }
+        }
+        
+        pthread_mutex_unlock(&watchdog_mutex);
+        sleep(1);
+    }
     return NULL;
 }
 
@@ -1005,29 +994,6 @@ static void *handle_https_thread(void *arg) {
     return NULL;
 }
 
-static void send_watchdog_alert(const char *status)
-{
-    time_t now = time(NULL);
-    
-    if (strcmp(status, "offline") == 0 || strcmp(status, "stuck") == 0) {
-        email_send_alert_watchdog(cached_temp);
-        printf("[WATCHDOG] Camera %s - tamper alert sent\n", status);
-    } else {
-        printf("[WATCHDOG] Camera %s (no email sent)\n", status);
-        return;
-    }
-    
-    if (mqtt_initialized) {
-        char topic[128];
-        snprintf(topic, sizeof(topic), "alarm/%s/home", STUDENT_ID);
-        char payload[256];
-        snprintf(payload, sizeof(payload),
-            "{\"status\":\"camera_%s\",\"timestamp\":%ld}",
-            status, now);
-        mqtt_publish_custom(topic, payload);
-    }
-}
-
 static SSL_CTX *init_ssl(void) {
     SSL_library_init();
     SSL_load_error_strings();
@@ -1093,7 +1059,6 @@ int main(void) {
         return 1;
     }
 
-    // Initialize last_frame_time for watchdog
     last_frame_time = time(NULL);
 
     pthread_t updater, telemetry_thread, watchdog_thread;
@@ -1101,7 +1066,6 @@ int main(void) {
     pthread_create(&telemetry_thread, NULL, telemetry_updater, NULL);
     pthread_create(&watchdog_thread, NULL, watchdog_monitor, NULL);
 
-    // Initialize MQTT from config (NOT hardcoded)
     if (strlen(g_mqtt_host) > 0) {
         mqtt_init(g_mqtt_host, g_mqtt_port, g_mqtt_user, g_mqtt_pass);
         mqtt_initialized = 1;
@@ -1151,7 +1115,6 @@ int main(void) {
     printf("HTTPS on %d\n", g_port_https);
     printf("Open: https://localhost:%d/\n", g_port_https);
 
-    // Publish initial telemetry
     if (mqtt_initialized) {
         pthread_mutex_lock(&telemetry_mutex);
         mqtt_publish_telemetry(cached_temp, cached_mem, cached_cpu);
