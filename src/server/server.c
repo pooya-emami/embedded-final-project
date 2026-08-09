@@ -769,30 +769,6 @@ void *frame_updater(void *arg) {
                 memcpy(current_frame, raw_buf, copy_len);
                 current_len = copy_len;
                 pthread_mutex_unlock(&frame_mutex);
-                
-                pthread_mutex_lock(&watchdog_mutex);
-                if (!first_frame_received) {
-                    memcpy(prev_frame, raw_buf, raw_len);
-                    prev_frame_len = raw_len;
-                    last_frame_time = time(NULL);
-                    frame_stuck_count = 0;
-                    first_frame_received = 1;
-                } else if (raw_len != prev_frame_len || memcmp(raw_buf, prev_frame, raw_len) != 0) {
-                    memcpy(prev_frame, raw_buf, raw_len);
-                    prev_frame_len = raw_len;
-                    last_frame_time = time(NULL);
-                    frame_stuck_count = 0;
-                    
-                    if (watchdog_alert_sent && !camera_restored_alert_sent) {
-                        camera_restored_alert_sent = 1;
-                        watchdog_alert_sent = 0;
-                        send_watchdog_alert("restored");
-                        printf("[WATCHDOG] Camera restored!\n");
-                    }
-                } else {
-                    frame_stuck_count++;
-                }
-                pthread_mutex_unlock(&watchdog_mutex);
             }
         }
 
@@ -819,6 +795,33 @@ void *watchdog_monitor(void *arg) {
         
         time_t now = time(NULL);
         
+        unsigned char test_buf[SHM_FRAME_BUF_SIZE];
+        size_t test_len = shared_frame_read(g_frame, test_buf, SHM_FRAME_BUF_SIZE);
+        
+        if (test_len > 0 && test_buf[0] == 0xFF && test_buf[1] == 0xD8) {
+            if (!first_frame_received) {
+                memcpy(prev_frame, test_buf, test_len);
+                prev_frame_len = test_len;
+                last_frame_time = now;
+                frame_stuck_count = 0;
+                first_frame_received = 1;
+            } else if (test_len != prev_frame_len || memcmp(test_buf, prev_frame, test_len) != 0) {
+                memcpy(prev_frame, test_buf, test_len);
+                prev_frame_len = test_len;
+                last_frame_time = now;
+                frame_stuck_count = 0;
+                
+                if (watchdog_alert_sent && !camera_restored_alert_sent) {
+                    camera_restored_alert_sent = 1;
+                    watchdog_alert_sent = 0;
+                    send_watchdog_alert("restored");
+                    printf("[WATCHDOG] Camera restored!\n");
+                }
+            } else {
+                frame_stuck_count++;
+            }
+        }
+        
         if (now - last_frame_time > timeout_seconds) {
             if (!watchdog_alert_sent) {
                 watchdog_alert_sent = 1;
@@ -826,8 +829,9 @@ void *watchdog_monitor(void *arg) {
                 send_watchdog_alert("offline");
                 printf("[WATCHDOG] No frames for %d seconds!\n", timeout_seconds);
                 
-                run_command("systemctl restart server.service 2>/dev/null &");
-                printf("[WATCHDOG] Server restart triggered\n");
+                run_command("systemctl restart relay.service 2>/dev/null &");
+                printf("[WATCHDOG] Relay restart triggered\n");
+                
                 running = 0;
             }
         }
@@ -838,8 +842,9 @@ void *watchdog_monitor(void *arg) {
                 send_watchdog_alert("stuck");
                 printf("[WATCHDOG] Camera STUCK! %d frames unchanged\n", frame_stuck_count);
                 
-                run_command("systemctl restart server.service 2>/dev/null &");
-                printf("[WATCHDOG] Server restart triggered\n");
+                run_command("systemctl restart relay.service 2>/dev/null &");
+                printf("[WATCHDOG] Relay restart triggered\n");
+                
                 running = 0;
             }
         }
@@ -911,6 +916,7 @@ static void *handle_https_thread(void *arg) {
     char *q = strchr(path, '?');
     if (q) *q = '\0';
 
+    // GET /
     if (strcmp(path, "/") == 0) {
         if (html_cache) {
             char header[512];
@@ -931,6 +937,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /stream or /api/v1/stream
     if (strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) {
         handle_mjpeg_stream(ssl);
         SSL_free(ssl);
@@ -938,6 +945,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /raw_stream
     if (strcmp(path, "/raw_stream") == 0) {
         int saved_mode = stream_mode;
         stream_mode = 1;
@@ -948,6 +956,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /snapshot or /api/v1/snapshot
     if (strcmp(path, "/snapshot") == 0 || strcmp(path, "/api/v1/snapshot") == 0) {
         pthread_mutex_lock(&frame_mutex);
         size_t len = current_len;
@@ -977,6 +986,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /telemetry or /api/v1/telemetry
     if (strcmp(path, "/telemetry") == 0 || strcmp(path, "/api/v1/telemetry") == 0) {
         pthread_mutex_lock(&telemetry_mutex);
         float temp = cached_temp;
@@ -1005,6 +1015,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /api/v1/persons
     if (strcmp(path, "/api/v1/persons") == 0) {
         int count = 0;
         pthread_mutex_lock(&person_mutex);
@@ -1032,6 +1043,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /api/v1/history
     if (strcmp(path, "/api/v1/history") == 0) {
         history_record_t *records = malloc(sizeof(history_record_t) * g_max_history);
         int n = history_db_get_last(records, g_max_history);
@@ -1068,6 +1080,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /api/v1/history_total
     if (strcmp(path, "/api/v1/history_total") == 0) {
         long total = history_db_total();
 
@@ -1090,6 +1103,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // POST /api/v1/stream_mode
     if (strcmp(path, "/api/v1/stream_mode") == 0) {
         if (strcmp(method, "POST") == 0) {
             char *body = strstr(req, "\r\n\r\n");
@@ -1098,30 +1112,18 @@ static void *handle_https_thread(void *arg) {
                 pthread_mutex_lock(&watchdog_mutex);
                 if (strstr(body, "\"mode\":\"idle\"")) {
                     stream_mode = 0;
-                    last_frame_time = time(NULL);
-                    frame_stuck_count = 0;
-                    watchdog_alert_sent = 0;
-                    camera_restored_alert_sent = 0;
                     no_detection_frame_count = 0;
                     last_person_count = 0;
                     active_detection_event = 0;
                     printf("[STREAM] Mode set to: IDLE (OFF)\n");
                 } else if (strstr(body, "\"mode\":\"raw\"")) {
                     stream_mode = 1;
-                    last_frame_time = time(NULL);
-                    frame_stuck_count = 0;
-                    watchdog_alert_sent = 0;
-                    camera_restored_alert_sent = 0;
                     no_detection_frame_count = 0;
                     last_person_count = 0;
                     active_detection_event = 0;
                     printf("[STREAM] Mode set to: RAW\n");
                 } else if (strstr(body, "\"mode\":\"processed\"")) {
                     stream_mode = 2;
-                    last_frame_time = time(NULL);
-                    frame_stuck_count = 0;
-                    watchdog_alert_sent = 0;
-                    camera_restored_alert_sent = 0;
                     no_detection_frame_count = 0;
                     last_person_count = 0;
                     active_detection_event = 0;
@@ -1154,6 +1156,24 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // GET /api/v1/stream_mode
+    if (strcmp(path, "/api/v1/stream_mode") == 0) {
+        const char *mode_str = stream_mode == 0 ? "idle" : (stream_mode == 1 ? "raw" : "processed");
+        char resp[256];
+        snprintf(resp, sizeof(resp),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"mode\":\"%s\"}",
+            mode_str);
+        SSL_write(ssl, resp, strlen(resp));
+        SSL_free(ssl);
+        close(fd);
+        return NULL;
+    }
+
+    // POST /api/v1/guard
     if (strcmp(path, "/api/v1/guard") == 0) {
         if (strcmp(method, "POST") == 0) {
             char *body = strstr(req, "\r\n\r\n");
@@ -1196,6 +1216,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // POST /api/v1/command
     if (strcmp(path, "/api/v1/command") == 0) {
         if (strcmp(method, "POST") == 0) {
             char *body = strstr(req, "\r\n\r\n");
@@ -1275,6 +1296,7 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
+    // 404 Not Found
     SSL_write(ssl, "HTTP/1.1 404 Not Found\r\n\r\n", 26);
     SSL_free(ssl);
     close(fd);
