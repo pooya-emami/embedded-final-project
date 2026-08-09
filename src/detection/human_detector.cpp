@@ -48,6 +48,9 @@ static void load_yolo()
 static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 {
     load_yolo();
+float scale = 1.0f;
+int pad_x = 0;
+int pad_y = 0;
 
     std::vector<cv::Rect> boxes;
     if (!yolo_loaded)
@@ -150,7 +153,6 @@ x1 /= scale;
 x2 /= scale;
 y1 /= scale;
 y2 /= scale;
-
         
         detections.push_back({x1, y1, x2, y2, best_score, best_class});
     }
