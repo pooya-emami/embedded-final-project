@@ -82,21 +82,24 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
         OrtArenaAllocator, OrtMemTypeDefault);
 
-    // Get input names and prepare inputs
+    // Get input names
     Ort::AllocatorWithDefaultOptions allocator;
     
     // Get all input names
     std::vector<const char*> input_names;
-    std::vector<std::unique_ptr<char, Ort::AllocatedFree>> input_names_alloc;
-    std::vector<Ort::Value> input_tensors;
+    std::vector<std::string> input_name_strings;
     
-    for (int i = 0; i < yolo_session->GetInputCount(); i++) {
-        auto name = yolo_session->GetInputNameAllocated(i, allocator);
-        input_names_alloc.push_back(std::move(name));
-        input_names.push_back(input_names_alloc.back().get());
+    size_t input_count = yolo_session->GetInputCount();
+    for (size_t i = 0; i < input_count; i++) {
+        char* name = yolo_session->GetInputName(i, allocator);
+        input_name_strings.push_back(std::string(name));
+        input_names.push_back(input_name_strings.back().c_str());
+        allocator.Free(name);
     }
 
     // Create input tensors for all inputs
+    std::vector<Ort::Value> input_tensors;
+    
     // 1. Image tensor
     Ort::Value image_tensor = Ort::Value::CreateTensor<float>(
         mem_info,
@@ -145,12 +148,14 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 
     // Get output names
     std::vector<const char*> output_names;
-    std::vector<std::unique_ptr<char, Ort::AllocatedFree>> output_names_alloc;
+    std::vector<std::string> output_name_strings;
     
-    for (int i = 0; i < yolo_session->GetOutputCount(); i++) {
-        auto name = yolo_session->GetOutputNameAllocated(i, allocator);
-        output_names_alloc.push_back(std::move(name));
-        output_names.push_back(output_names_alloc.back().get());
+    size_t output_count = yolo_session->GetOutputCount();
+    for (size_t i = 0; i < output_count; i++) {
+        char* name = yolo_session->GetOutputName(i, allocator);
+        output_name_strings.push_back(std::string(name));
+        output_names.push_back(output_name_strings.back().c_str());
+        allocator.Free(name);
     }
 
     // Run inference
@@ -231,7 +236,7 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         }
         
         // Get score
-        if (scores_data != nullptr && i < scores_shape[0]) {
+        if (scores_data != nullptr && !scores_shape.empty() && i < scores_shape[0]) {
             score = scores_data[i];
         } else {
             score = 1.0f;
