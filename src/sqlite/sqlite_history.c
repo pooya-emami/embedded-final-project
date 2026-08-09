@@ -6,10 +6,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define DEFAULT_MAX_RECORDS 100
-
 static sqlite3 *db = NULL;
-static int max_records = DEFAULT_MAX_RECORDS;
 
 int history_db_init(const char *path)
 {
@@ -34,18 +31,16 @@ int history_db_init(const char *path)
         return -1;
     }
 
-    // Enable foreign keys
     sqlite3_exec(db, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
 
-    // Create table
+    // Only one table for total count (persistent)
     const char *sql =
-        "CREATE TABLE IF NOT EXISTS history ("
-        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        " count INTEGER NOT NULL,"
-        " temp REAL NOT NULL,"
-        " timestamp INTEGER NOT NULL,"
-        " created_at DATETIME DEFAULT CURRENT_TIMESTAMP"
-        ");";
+        "CREATE TABLE IF NOT EXISTS total_count ("
+        " id INTEGER PRIMARY KEY CHECK (id = 1),"
+        " total INTEGER NOT NULL DEFAULT 0,"
+        " last_updated DATETIME DEFAULT CURRENT_TIMESTAMP"
+        ");"
+        "INSERT OR IGNORE INTO total_count (id, total) VALUES (1, 0);";
 
     char *err = NULL;
     if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
@@ -56,100 +51,29 @@ int history_db_init(const char *path)
         return -1;
     }
 
-    // Create index for faster queries
-    const char *index_sql = 
-        "CREATE INDEX IF NOT EXISTS idx_timestamp ON history(timestamp DESC);";
-    if (sqlite3_exec(db, index_sql, NULL, NULL, &err) != SQLITE_OK) {
-        fprintf(stderr, "SQLite create index failed: %s\n", err);
-        sqlite3_free(err);
-    }
-
     printf("[SQLITE] Database initialized: %s\n", path);
     return 0;
 }
 
-void history_db_set_max_records(int limit)
-{
-    if (limit > 0) {
-        max_records = limit;
-    }
-}
-
-int history_db_add(int count, float temp)
+int history_db_add(void)
 {
     if (!db) {
         fprintf(stderr, "SQLite: Database not initialized\n");
         return -1;
     }
 
-    const char *sql =
-        "INSERT INTO history (count, temp, timestamp) VALUES (?, ?, ?);";
-
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQLite prepare failed: %s\n", sqlite3_errmsg(db));
-        return -1;
-    }
-
-    sqlite3_bind_int(stmt, 1, count);
-    sqlite3_bind_double(stmt, 2, temp);
-    sqlite3_bind_int(stmt, 3, (int)time(NULL));
-
-    int rc = sqlite3_step(stmt);
-    sqlite3_finalize(stmt);
-    
-    if (rc != SQLITE_DONE) {
-        fprintf(stderr, "SQLite insert failed: %s\n", sqlite3_errmsg(db));
-        return -1;
-    }
-
-    // Keep only last N records (circular buffer)
-    char cleanup[256];
-    snprintf(cleanup, sizeof(cleanup),
-        "DELETE FROM history WHERE id NOT IN "
-        "(SELECT id FROM history ORDER BY id DESC LIMIT %d);",
-        max_records);
+    // Only increment total count (grows forever)
+    const char *update_total =
+        "UPDATE total_count SET total = total + 1, last_updated = CURRENT_TIMESTAMP WHERE id = 1;";
     
     char *err = NULL;
-    if (sqlite3_exec(db, cleanup, NULL, NULL, &err) != SQLITE_OK) {
-        fprintf(stderr, "SQLite cleanup failed: %s\n", err);
+    if (sqlite3_exec(db, update_total, NULL, NULL, &err) != SQLITE_OK) {
+        fprintf(stderr, "SQLite update total failed: %s\n", err);
         sqlite3_free(err);
-        // Don't return error - insert succeeded
+        return -1;
     }
 
     return 0;
-}
-
-int history_db_get_last(history_record_t *out, int max_records)
-{
-    if (!db) {
-        fprintf(stderr, "SQLite: Database not initialized\n");
-        return -1;
-    }
-
-    const char *sql =
-        "SELECT count, temp, timestamp "
-        "FROM history ORDER BY id DESC LIMIT ?;";
-
-    sqlite3_stmt *stmt;
-    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
-        fprintf(stderr, "SQLite prepare failed: %s\n", sqlite3_errmsg(db));
-        return -1;
-    }
-
-    sqlite3_bind_int(stmt, 1, max_records);
-
-    int idx = 0;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        out[idx].count = sqlite3_column_int(stmt, 0);
-        out[idx].temp = (float)sqlite3_column_double(stmt, 1);
-        out[idx].timestamp = sqlite3_column_int(stmt, 2);
-        idx++;
-        if (idx >= max_records) break;
-    }
-
-    sqlite3_finalize(stmt);
-    return idx;
 }
 
 long history_db_total(void)
@@ -159,7 +83,7 @@ long history_db_total(void)
         return -1;
     }
 
-    const char *sql = "SELECT COUNT(*) FROM history;";
+    const char *sql = "SELECT total FROM total_count WHERE id = 1;";
     sqlite3_stmt *stmt;
 
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
