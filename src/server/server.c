@@ -679,6 +679,9 @@ void *watchdog_monitor(void *arg) {
                 camera_restored_alert_sent = 0;
                 send_watchdog_alert("offline");
                 printf("[WATCHDOG] Camera offline/stuck! No change for %d seconds\n", timeout_seconds);
+                
+                system("systemctl restart server.service 2>/dev/null &");
+                printf("[WATCHDOG] Server restart triggered\n");
             }
         }
         
