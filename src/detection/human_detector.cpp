@@ -159,9 +159,15 @@ static std::vector<cv::Rect> detectFaces(const cv::Mat &img320)
         return boxes;
     }
 
-    // Parse output - shape is [1, 896, 16]
+    // Parse output - shape is either [1, 896, 16] (detections found) or [1, 16] (no detections)
     float* boxes_data = output_tensors[0].GetTensorMutableData<float>();
     auto boxes_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
+    
+    // Check if no detections (shape [1, 16])
+    if (boxes_shape.size() == 2 && boxes_shape[0] == 1 && boxes_shape[1] == 16) {
+        // No detections found, return empty
+        return boxes;
+    }
     
     // Shape should be [1, 896, 16]
     if (boxes_shape.size() != 3 || boxes_shape[0] != 1) {
