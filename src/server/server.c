@@ -374,7 +374,7 @@ void *frame_updater(void *arg) {
                 add_history(res.person_count, temp);
                 
                 // Send email alert (separate function)
-                send_email_alert(res.person_count, temp, buf, len);
+                send_email_alert(res.person_count, temp, current_frame, len);
                 
                 // Publish to MQTT (persons topic)
                 if (mqtt_initialized) {
