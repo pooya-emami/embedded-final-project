@@ -26,51 +26,23 @@ static void load_yolo()
     if (yolo_loaded)
         return;
 
-    // Try multiple paths for the model
-    const char* paths[] = {
-        "../../models/yolov8n.onnx",
-        "../models/yolov8n.onnx",
-        "models/yolov8n.onnx",
-        "/home/pooya/embproj/proj/models/yolov8n.onnx"
-    };
-    
-    bool found = false;
-    for (int i = 0; i < 4; i++) {
-        FILE* f = fopen(paths[i], "r");
-        if (f) {
-            fclose(f);
-            strcpy(model_path, paths[i]);
-            found = true;
-            printf("[YOLO] ✅ Model found at: %s\n", model_path);
-            break;
-        }
-    }
-    
-    if (!found) {
-        printf("[YOLO] ❌ Model NOT found!\n");
-        return;
-    }
+    snprintf(model_path, sizeof(model_path),
+             "%s%s", MODEL_BASE_PATH, YOLO_MODEL_FILE);
 
-    try {
-        Ort::SessionOptions session_options;
-        session_options.SetGraphOptimizationLevel(
-            GraphOptimizationLevel::ORT_ENABLE_ALL
-        );
-        session_options.SetIntraOpNumThreads(2);
-        session_options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+    Ort::SessionOptions session_options;
+    session_options.SetGraphOptimizationLevel(
+        GraphOptimizationLevel::ORT_ENABLE_ALL
+    );
+    session_options.SetIntraOpNumThreads(4);
+    session_options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
 
-        yolo_session = new Ort::Session(
-            ort_env,
-            model_path,
-            session_options
-        );
+    yolo_session = new Ort::Session(
+        ort_env,
+        model_path,
+        session_options
+    );
 
-        yolo_loaded = true;
-        printf("[YOLO] ✅ Model loaded successfully!\n");
-    } catch (const std::exception& e) {
-        printf("[YOLO] ❌ Failed to load: %s\n", e.what());
-        yolo_loaded = false;
-    }
+    yolo_loaded = true;
 }
 
 static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
@@ -78,10 +50,8 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     load_yolo();
 
     std::vector<cv::Rect> boxes;
-    if (!yolo_loaded) {
-        printf("[YOLO] ⚠️ Model not loaded\n");
+    if (!yolo_loaded)
         return boxes;
-    }
 
     cv::Mat rgb;
     cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
@@ -169,12 +139,6 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         float x2 = (x + w / 2.0f) * img320.cols / 320.0f;
         float y2 = (y + h / 2.0f) * img320.rows / 320.0f;
         
-        // Clamp to image bounds
-        x1 = std::max(0.0f, x1);
-        y1 = std::max(0.0f, y1);
-        x2 = std::min((float)img320.cols, x2);
-        y2 = std::min((float)img320.rows, y2);
-        
         detections.push_back({x1, y1, x2, y2, best_score, best_class});
     }
 
@@ -184,37 +148,20 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         std::vector<float> scores;
         
         for (const auto& det : detections) {
-            int width = (int)(det.x2 - det.x1);
-            int height = (int)(det.y2 - det.y1);
-            
-            // Only add valid boxes
-            if (width > 0 && height > 0) {
-                rects.emplace_back(
-                    (int)det.x1, 
-                    (int)det.y1,
-                    width,
-                    height
-                );
-                scores.push_back(det.confidence);
-            }
+            rects.emplace_back(
+                (int)det.x1, 
+                (int)det.y1,
+                (int)(det.x2 - det.x1),
+                (int)(det.y2 - det.y1)
+            );
+            scores.push_back(det.confidence);
         }
         
-        if (!rects.empty()) {
-            std::vector<int> indices;
-            cv::dnn::NMSBoxes(rects, scores, 0.25f, 0.45f, indices);
-            
-            for (int idx : indices) {
-                boxes.push_back(rects[idx]);
-            }
-        }
-    }
-
-    // Debug: print box info
-    if (!boxes.empty()) {
-        printf("[DRAW] Found %zu boxes\n", boxes.size());
-        for (size_t i = 0; i < boxes.size() && i < 3; i++) {
-            printf("[DRAW] Box %zu: x=%d y=%d w=%d h=%d\n", 
-                   i, boxes[i].x, boxes[i].y, boxes[i].width, boxes[i].height);
+        std::vector<int> indices;
+        cv::dnn::NMSBoxes(rects, scores, 0.25f, 0.45f, indices);
+        
+        for (int idx : indices) {
+            boxes.push_back(rects[idx]);
         }
     }
 
@@ -246,24 +193,9 @@ extern "C" DetectionResult process_frame(
 
     auto boxes = detectHumans(frame_detection);
 
-    // Draw boxes with BRIGHT GREEN color and thicker line
-    for (const auto &box : boxes) {
-        // Make sure box is within image bounds
-        if (box.x >= 0 && box.y >= 0 && 
-            box.x + box.width <= 320 && 
-            box.y + box.height <= 320 &&
-            box.width > 0 && box.height > 0) {
-            
-            // Draw with bright green, thicker line
-            cv::rectangle(frame_detection, box, cv::Scalar(0, 255, 0), 3);
-            
-            // Add "Person" label above the box
-            cv::putText(frame_detection, "Person",
-                        cv::Point(box.x, box.y - 5),
-                        cv::FONT_HERSHEY_SIMPLEX,
-                        0.5, cv::Scalar(0, 255, 0), 2);
-        }
-    }
+    // Draw boxes
+    for (const auto &box : boxes)
+        cv::rectangle(frame_detection, box, cv::Scalar(0, 255, 0), 2);
 
     // Add text overlays
     auto now = std::chrono::system_clock::now();
@@ -280,11 +212,9 @@ extern "C" DetectionResult process_frame(
                 cv::Point(10, 60), cv::FONT_HERSHEY_SIMPLEX,
                 0.6, cv::Scalar(255, 255, 255), 2);
 
-    // Show person count with bright color
-    std::string count_text = "Persons: " + std::to_string(boxes.size());
-    cv::putText(frame_detection, count_text,
+    cv::putText(frame_detection, "Persons: " + std::to_string(boxes.size()),
                 cv::Point(10, 90), cv::FONT_HERSHEY_SIMPLEX,
-                0.7, cv::Scalar(0, 255, 255), 2);
+                0.6, cv::Scalar(0, 255, 0), 2);
 
     // FPS counter
     static double fps = 0;
