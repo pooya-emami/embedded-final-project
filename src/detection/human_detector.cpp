@@ -215,7 +215,7 @@ int resized_h = int(h * scale);
 cv::Mat resized;
 cv::resize(frame_source, resized, cv::Size(resized_w, resized_h));
 
-cv::Mat frame_detection = cv::Mat::zeros(new_h, new_w, frame_source.type());
+frame_detection = cv::Mat::zeros(new_h, new_w, frame_source.type());
 int pad_x = (new_w - resized_w) / 2;
 int pad_y = (new_h - resized_h) / 2;
 
