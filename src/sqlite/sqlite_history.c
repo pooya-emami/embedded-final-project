@@ -31,16 +31,13 @@ int history_db_init(const char *path)
         return -1;
     }
 
-    sqlite3_exec(db, "PRAGMA foreign_keys = ON;", NULL, NULL, NULL);
-
-    // Only one table for total count (persistent)
     const char *sql =
-        "CREATE TABLE IF NOT EXISTS total_count ("
-        " id INTEGER PRIMARY KEY CHECK (id = 1),"
-        " total INTEGER NOT NULL DEFAULT 0,"
-        " last_updated DATETIME DEFAULT CURRENT_TIMESTAMP"
-        ");"
-        "INSERT OR IGNORE INTO total_count (id, total) VALUES (1, 0);";
+        "CREATE TABLE IF NOT EXISTS history ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " count INTEGER NOT NULL,"
+        " temp REAL NOT NULL,"
+        " timestamp INTEGER NOT NULL"
+        ");";
 
     char *err = NULL;
     if (sqlite3_exec(db, sql, NULL, NULL, &err) != SQLITE_OK) {
@@ -55,21 +52,31 @@ int history_db_init(const char *path)
     return 0;
 }
 
-int history_db_add(void)
+int history_db_add(int count, float temp)
 {
     if (!db) {
         fprintf(stderr, "SQLite: Database not initialized\n");
         return -1;
     }
 
-    // Only increment total count (grows forever)
-    const char *update_total =
-        "UPDATE total_count SET total = total + 1, last_updated = CURRENT_TIMESTAMP WHERE id = 1;";
+    const char *sql =
+        "INSERT INTO history (count, temp, timestamp) VALUES (?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQLite prepare failed: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+
+    sqlite3_bind_int(stmt, 1, count);
+    sqlite3_bind_double(stmt, 2, temp);
+    sqlite3_bind_int(stmt, 3, (int)time(NULL));
+
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
     
-    char *err = NULL;
-    if (sqlite3_exec(db, update_total, NULL, NULL, &err) != SQLITE_OK) {
-        fprintf(stderr, "SQLite update total failed: %s\n", err);
-        sqlite3_free(err);
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "SQLite insert failed: %s\n", sqlite3_errmsg(db));
         return -1;
     }
 
@@ -83,7 +90,7 @@ long history_db_total(void)
         return -1;
     }
 
-    const char *sql = "SELECT total FROM total_count WHERE id = 1;";
+    const char *sql = "SELECT COUNT(*) FROM history;";
     sqlite3_stmt *stmt;
 
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
@@ -98,6 +105,38 @@ long history_db_total(void)
 
     sqlite3_finalize(stmt);
     return total;
+}
+
+int history_db_get_last(history_record_t *out, int max_records)
+{
+    if (!db) {
+        fprintf(stderr, "SQLite: Database not initialized\n");
+        return -1;
+    }
+
+    const char *sql =
+        "SELECT count, temp, timestamp "
+        "FROM history ORDER BY id DESC LIMIT ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "SQLite prepare failed: %s\n", sqlite3_errmsg(db));
+        return -1;
+    }
+
+    sqlite3_bind_int(stmt, 1, max_records);
+
+    int idx = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        out[idx].count = sqlite3_column_int(stmt, 0);
+        out[idx].temp = (float)sqlite3_column_double(stmt, 1);
+        out[idx].timestamp = sqlite3_column_int(stmt, 2);
+        idx++;
+        if (idx >= max_records) break;
+    }
+
+    sqlite3_finalize(stmt);
+    return idx;
 }
 
 void history_db_close(void)
