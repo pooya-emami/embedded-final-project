@@ -265,6 +265,24 @@ static float read_cpu_usage(void) {
     return (1.0f - ((float)diff_idle / diff_total)) * 100.0f;
 }
 
+// ============================================================
+// add_history - Only called from email thread (async)
+// ============================================================
+void add_history(int count, float temp)
+{
+    pthread_mutex_lock(&history_mutex);
+    if (history_count >= g_max_history) {
+        memmove(&history[0], &history[1], (g_max_history - 1) * sizeof(detection_record_t));
+        history_count = g_max_history - 1;
+    }
+    history[history_count].count = count;
+    history[history_count].timestamp = time(NULL);
+    history[history_count].temp = temp;
+    history_count++;
+    history_db_add(count, temp);
+    pthread_mutex_unlock(&history_mutex);
+}
+
 static void *telemetry_updater(void *arg) {
     (void)arg;
     while (running) {
@@ -293,21 +311,34 @@ static void *telemetry_updater(void *arg) {
     return NULL;
 }
 
-void add_history(int count, float temp)
+// ============================================================
+// WATCHDOG ALERT - Only for tampering (offline/stuck)
+// ============================================================
+static void send_watchdog_alert(const char *status)
 {
-    pthread_mutex_lock(&history_mutex);
-    if (history_count >= g_max_history) {
-        memmove(&history[0], &history[1], (g_max_history - 1) * sizeof(detection_record_t));
-        history_count = g_max_history - 1;
+    time_t now = time(NULL);
+    
+    if (strcmp(status, "offline") == 0 || strcmp(status, "stuck") == 0) {
+        email_send_alert_watchdog(cached_temp);
+        printf("[WATCHDOG] Camera %s - tamper alert sent\n", status);
+    } else {
+        printf("[WATCHDOG] Camera %s (no email sent)\n", status);
     }
-    history[history_count].count = count;
-    history[history_count].timestamp = time(NULL);
-    history[history_count].temp = temp;
-    history_count++;
-    history_db_add(count, temp);
-    pthread_mutex_unlock(&history_mutex);
+    
+    if (mqtt_initialized) {
+        char topic[128];
+        snprintf(topic, sizeof(topic), "alarm/%s/home", STUDENT_ID);
+        char payload[256];
+        snprintf(payload, sizeof(payload),
+            "{\"status\":\"camera_%s\",\"timestamp\":%ld}",
+            status, now);
+        mqtt_publish_custom(topic, payload);
+    }
 }
 
+// ============================================================
+// EMAIL THREAD FUNCTION - Waits for signal, sends email + history
+// ============================================================
 static void *email_thread_func(void *arg) {
     (void)arg;
     
@@ -342,6 +373,14 @@ static void *email_thread_func(void *arg) {
         }
         pthread_mutex_unlock(&email_mutex);
         
+        // ============================================================
+        // ADD TO HISTORY (async - in email thread)
+        // ============================================================
+        add_history(count, temp);
+        
+        // ============================================================
+        // SEND EMAIL (async - in email thread)
+        // ============================================================
         unsigned char *frame_copy = NULL;
         if (has_frame && frame_len > 0) {
             frame_copy = malloc(frame_len);
@@ -378,6 +417,9 @@ static void *email_thread_func(void *arg) {
     return NULL;
 }
 
+// ============================================================
+// SIGNAL EMAIL THREAD - Non-blocking
+// ============================================================
 static void send_detection_email(int count, float temp, const unsigned char *buf, size_t len, int immediate)
 {
     pthread_mutex_lock(&email_mutex);
@@ -398,31 +440,6 @@ static void send_detection_email(int count, float temp, const unsigned char *buf
     
     pthread_cond_signal(&email_cond);
     pthread_mutex_unlock(&email_mutex);
-}
-
-// ============================================================
-// WATCHDOG ALERT - Only for tampering (offline/stuck)
-// ============================================================
-static void send_watchdog_alert(const char *status)
-{
-    time_t now = time(NULL);
-    
-    if (strcmp(status, "offline") == 0 || strcmp(status, "stuck") == 0) {
-        email_send_alert_watchdog(cached_temp);
-        printf("[WATCHDOG] Camera %s - tamper alert sent\n", status);
-    } else {
-        printf("[WATCHDOG] Camera %s (no email sent)\n", status);
-    }
-    
-    if (mqtt_initialized) {
-        char topic[128];
-        snprintf(topic, sizeof(topic), "alarm/%s/home", STUDENT_ID);
-        char payload[256];
-        snprintf(payload, sizeof(payload),
-            "{\"status\":\"camera_%s\",\"timestamp\":%ld}",
-            status, now);
-        mqtt_publish_custom(topic, payload);
-    }
 }
 
 // ============================================================
@@ -503,10 +520,9 @@ void *frame_updater(void *arg) {
                 }
                 last_person_count = res.person_count;
                 
-                // Add to history
-                add_history(res.person_count, temp);
-                
-                // Publish MQTT
+                // ============================================================
+                // MQTT (fast - non-blocking)
+                // ============================================================
                 if (mqtt_initialized) {
                     mqtt_publish_persons(res.person_count, temp);
                     if (guard_enabled) {
@@ -514,6 +530,9 @@ void *frame_updater(void *arg) {
                     }
                 }
                 
+                // ============================================================
+                // SIGNAL EMAIL THREAD (non-blocking - returns immediately!)
+                // ============================================================
                 int immediate = guard_enabled && is_new_event;
                 send_detection_email(res.person_count, temp, buf, len, immediate);
                 
