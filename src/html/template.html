@@ -8,7 +8,7 @@
         h1 { background: #222; color: #fff; padding: 15px; }
         .container { display: flex; flex-wrap: wrap; gap: 20px; }
         .card { background: #fff; padding: 15px; border-radius: 5px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-        #stream { border: 3px solid #333; border-radius: 5px; max-width: 640px; }
+        #stream { border: 3px solid #333; border-radius: 5px; max-width: 640px; background: #ddd; min-height: 200px; }
         #tele { font-size: 1.1em; }
         .status { font-size: 0.9em; color: #666; }
         .guard-toggle { margin: 10px 0; }
@@ -21,6 +21,32 @@
         }
         .guard-on { background: #4CAF50; color: white; }
         .guard-off { background: #f44336; color: white; }
+        .person-count { font-size: 2em; color: #2196F3; }
+        .person-count.active { color: #f44336; }
+        
+        .mode-selector { margin: 10px 0; }
+        .mode-selector button {
+            padding: 8px 16px;
+            margin: 0 5px;
+            border: 2px solid #ccc;
+            border-radius: 5px;
+            background: white;
+            cursor: pointer;
+            font-size: 0.9em;
+        }
+        .mode-selector button.active {
+            border-color: #2196F3;
+            background: #e3f2fd;
+            font-weight: bold;
+        }
+        .mode-selector button:hover {
+            background: #f0f0f0;
+        }
+        .mode-indicator {
+            margin: 5px 0;
+            font-size: 0.85em;
+            color: #666;
+        }
     </style>
 </head>
 <body>
@@ -30,13 +56,21 @@
 <div class="container">
     <div class="card">
         <h3>Live Stream</h3>
-        <img id="stream" src="/stream" width="640" alt="Live Stream">
-        <div class="status" id="streamStatus">Stream: Loading...</div>
+        
+        <div class="mode-selector">
+            <button id="modeOff" class="active" onclick="setMode('off')">Off</button>
+            <button id="modeStream" onclick="setMode('stream')">Stream</button>
+            <button id="modeDetection" onclick="setMode('detection')">Detection</button>
+        </div>
+        <div class="mode-indicator" id="modeIndicator">Mode: Off</div>
+        
+        <img id="stream" src="" width="640" alt="Live Stream">
+        <div class="status" id="streamStatus">Stream: Off</div>
     </div>
 
     <div class="card">
         <h3>Detection Status</h3>
-        <div id="personCount" style="font-size: 2em; color: #2196F3;">0 persons</div>
+        <div id="personCount" class="person-count">0 persons</div>
         
         <h3>Guard Mode</h3>
         <div class="guard-toggle">
@@ -51,13 +85,58 @@
 
 <script>
 let guardEnabled = false;
+let currentMode = 'off';
+let streamInterval = null;
+
+function setMode(mode) {
+    currentMode = mode;
+    
+    // Update button styles
+    document.getElementById('modeOff').className = (mode === 'off') ? 'active' : '';
+    document.getElementById('modeStream').className = (mode === 'stream') ? 'active' : '';
+    document.getElementById('modeDetection').className = (mode === 'detection') ? 'active' : '';
+    
+    const modeNames = {
+        'off': 'Off (No Stream)',
+        'stream': 'Raw Camera Feed',
+        'detection': 'Detection (Processed)'
+    };
+    document.getElementById('modeIndicator').textContent = 'Mode: ' + modeNames[mode];
+    
+    const img = document.getElementById('stream');
+    const status = document.getElementById('streamStatus');
+    
+    // Clear existing interval
+    if (streamInterval) {
+        clearInterval(streamInterval);
+        streamInterval = null;
+    }
+    
+    if (mode === 'off') {
+        img.src = '';
+        img.alt = 'Stream Off';
+        status.textContent = 'Stream: Off';
+        return;
+    }
+    
+    // Choose endpoint based on mode
+    let endpoint = (mode === 'stream') ? '/raw_stream' : '/stream';
+    img.src = endpoint + '?t=' + Date.now();
+    img.alt = (mode === 'stream') ? 'Raw Stream' : 'Detection Stream';
+    status.textContent = 'Stream: ' + ((mode === 'stream') ? 'Raw' : 'Detection');
+    
+    // Refresh stream periodically
+    streamInterval = setInterval(function() {
+        img.src = endpoint + '?t=' + Date.now();
+    }, 100);
+}
 
 function updateTelemetry() {
     fetch('/api/v1/telemetry')
         .then(response => response.json())
         .then(data => {
             document.getElementById('tele').innerHTML = 
-                "CPU Temp: " + (data.temp || 0).toFixed(1) + " °C<br>" +
+                "CPU Temp: " + (data.temp || 0).toFixed(1) + " C<br>" +
                 "Free Memory: " + (data.mem || 0) + " kB<br>" +
                 "CPU Load: " + (data.cpu || 0).toFixed(1) + " %";
         })
@@ -73,7 +152,7 @@ function updatePersonCount() {
             const el = document.getElementById('personCount');
             const count = data.count || 0;
             el.textContent = count + " person" + (count !== 1 ? "s" : "");
-            el.style.color = count > 0 ? '#f44336' : '#2196F3';
+            el.className = 'person-count' + (count > 0 ? ' active' : '');
         })
         .catch(() => {
             document.getElementById('personCount').textContent = "Error";
@@ -113,9 +192,12 @@ function updateGuardUI() {
     }
 }
 
-// Update telemetry every 2 seconds
+// Start with Off mode
+setMode('off');
+
 setInterval(updateTelemetry, 2000);
-setInterval(updatePersonCount, 5000);  // Update person count less frequently
+setInterval(updatePersonCount, 3000);
+
 updateTelemetry();
 updatePersonCount();
 </script>
