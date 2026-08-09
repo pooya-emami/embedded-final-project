@@ -82,19 +82,15 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
         OrtArenaAllocator, OrtMemTypeDefault);
 
-    // Get input names
-    Ort::AllocatorWithDefaultOptions allocator;
-    
-    // Get all input names
+    // Get input names using the correct API
     std::vector<const char*> input_names;
     std::vector<std::string> input_name_strings;
     
     size_t input_count = yolo_session->GetInputCount();
     for (size_t i = 0; i < input_count; i++) {
-        char* name = yolo_session->GetInputName(i, allocator);
-        input_name_strings.push_back(std::string(name));
+        std::string name = yolo_session->GetInputNameAllocated(i, Ort::AllocatorWithDefaultOptions()).get();
+        input_name_strings.push_back(name);
         input_names.push_back(input_name_strings.back().c_str());
-        allocator.Free(name);
     }
 
     // Create input tensors for all inputs
@@ -152,10 +148,9 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
     
     size_t output_count = yolo_session->GetOutputCount();
     for (size_t i = 0; i < output_count; i++) {
-        char* name = yolo_session->GetOutputName(i, allocator);
-        output_name_strings.push_back(std::string(name));
+        std::string name = yolo_session->GetOutputNameAllocated(i, Ort::AllocatorWithDefaultOptions()).get();
+        output_name_strings.push_back(name);
         output_names.push_back(output_name_strings.back().c_str());
-        allocator.Free(name);
     }
 
     // Run inference
@@ -236,7 +231,7 @@ static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
         }
         
         // Get score
-        if (scores_data != nullptr && !scores_shape.empty() && i < scores_shape[0]) {
+        if (scores_data != nullptr && !scores_shape.empty() && i < (int)scores_shape[0]) {
             score = scores_data[i];
         } else {
             score = 1.0f;
