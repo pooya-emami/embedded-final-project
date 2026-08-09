@@ -15,12 +15,17 @@
 #include <iomanip>
 #include <algorithm>
 #include <cmath>
+
 #include "human_detector.hpp"
 
 static char model_path[256] = {0};
 static Ort::Env ort_env(ORT_LOGGING_LEVEL_WARNING, "BlazeFace");
 static Ort::Session* blaze_session = nullptr;
 static bool blaze_loaded = false;
+
+// Store input/output names as static strings
+static std::vector<std::string> input_names_str;
+static std::vector<std::string> output_names_str;
 
 // BlazeFace configuration
 static const float CONF_THRESH = 0.5f;
@@ -50,6 +55,21 @@ static void load_blaze()
     );
 
     blaze_loaded = true;
+    
+    // Store input names
+    Ort::AllocatorWithDefaultOptions allocator;
+    for (size_t i = 0; i < blaze_session->GetInputCount(); i++) {
+        auto name_allocated = blaze_session->GetInputNameAllocated(i, allocator);
+        input_names_str.push_back(std::string(name_allocated.get()));
+        printf("Input %zu name: '%s'\n", i, input_names_str.back().c_str());
+    }
+    
+    // Store output names
+    for (size_t i = 0; i < blaze_session->GetOutputCount(); i++) {
+        auto name_allocated = blaze_session->GetOutputNameAllocated(i, allocator);
+        output_names_str.push_back(std::string(name_allocated.get()));
+        printf("Output %zu name: '%s'\n", i, output_names_str.back().c_str());
+    }
     
     // Print model info for debugging
     printf("BlazeFace model loaded successfully!\n");
@@ -130,74 +150,61 @@ static std::vector<cv::Rect> detectFaces(const cv::Mat &img320)
     Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
         OrtArenaAllocator, OrtMemTypeDefault);
 
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
+    // Prepare input tensors
+    std::vector<Ort::Value> input_tensors;
+    
+    // Create image tensor
+    Ort::Value image_tensor = Ort::Value::CreateTensor<float>(
         mem_info,
         input_tensor_values.data(),
         input_tensor_values.size(),
         input_shape.data(),
         input_shape.size()
     );
-
-    // Prepare input names and values
-    Ort::AllocatorWithDefaultOptions allocator;
+    input_tensors.push_back(std::move(image_tensor));
     
-    // Get input and output names
+    // Create conf_threshold tensor (float)
+    std::vector<float> conf_data = {CONF_THRESH};
+    Ort::Value conf_tensor = Ort::Value::CreateTensor<float>(
+        mem_info,
+        conf_data.data(),
+        conf_data.size(),
+        std::array<int64_t, 1>{1}.data(),
+        1
+    );
+    input_tensors.push_back(std::move(conf_tensor));
+    
+    // Create max_detections tensor (int64)
+    std::vector<int64_t> max_data = {MAX_DET};
+    Ort::Value max_tensor = Ort::Value::CreateTensor<int64_t>(
+        mem_info,
+        max_data.data(),
+        max_data.size(),
+        std::array<int64_t, 1>{1}.data(),
+        1
+    );
+    input_tensors.push_back(std::move(max_tensor));
+    
+    // Create iou_threshold tensor (float)
+    std::vector<float> iou_data = {IOU_THRESH};
+    Ort::Value iou_tensor = Ort::Value::CreateTensor<float>(
+        mem_info,
+        iou_data.data(),
+        iou_data.size(),
+        std::array<int64_t, 1>{1}.data(),
+        1
+    );
+    input_tensors.push_back(std::move(iou_tensor));
+
+    // Prepare input/output name arrays (using static strings)
     std::vector<const char*> input_names;
+    for (const auto& name : input_names_str) {
+        input_names.push_back(name.c_str());
+    }
+    
     std::vector<const char*> output_names;
-    
-    for (size_t i = 0; i < blaze_session->GetInputCount(); i++) {
-        auto name = blaze_session->GetInputNameAllocated(i, allocator);
-        input_names.push_back(name.get());
-    }
-    
-    for (size_t i = 0; i < blaze_session->GetOutputCount(); i++) {
-        auto name = blaze_session->GetOutputNameAllocated(i, allocator);
-        output_names.push_back(name.get());
-    }
-
-    // Prepare input tensors
-    std::vector<Ort::Value> input_tensors;
-    input_tensors.push_back(std::move(input_tensor));
-    
-    // Check if model expects additional inputs (conf_threshold, max_detections, iou_threshold)
-    int num_inputs = blaze_session->GetInputCount();
-    if (num_inputs > 1) {
-        // Add conf_threshold
-        std::vector<float> conf_thresh = {CONF_THRESH};
-        Ort::Value conf_tensor = Ort::Value::CreateTensor<float>(
-            mem_info,
-            conf_thresh.data(),
-            conf_thresh.size(),
-            std::array<int64_t, 1>{1}.data(),
-            1
-        );
-        input_tensors.push_back(std::move(conf_tensor));
-        
-        if (num_inputs > 2) {
-            // Add max_detections
-            std::vector<int64_t> max_det = {MAX_DET};
-            Ort::Value max_tensor = Ort::Value::CreateTensor<int64_t>(
-                mem_info,
-                max_det.data(),
-                max_det.size(),
-                std::array<int64_t, 1>{1}.data(),
-                1
-            );
-            input_tensors.push_back(std::move(max_tensor));
-            
-            if (num_inputs > 3) {
-                // Add iou_threshold
-                std::vector<float> iou_thresh = {IOU_THRESH};
-                Ort::Value iou_tensor = Ort::Value::CreateTensor<float>(
-                    mem_info,
-                    iou_thresh.data(),
-                    iou_thresh.size(),
-                    std::array<int64_t, 1>{1}.data(),
-                    1
-                );
-                input_tensors.push_back(std::move(iou_tensor));
-            }
-        }
+    for (const auto& name : output_names_str) {
+        output_names.push_back(name.c_str());
     }
 
     // Run inference
@@ -213,7 +220,7 @@ static std::vector<cv::Rect> detectFaces(const cv::Mat &img320)
             return boxes;
         }
 
-        // Get boxes and scores
+        // Get boxes
         float* boxes_data = output_tensors[0].GetTensorMutableData<float>();
         auto boxes_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
         
@@ -225,6 +232,7 @@ static std::vector<cv::Rect> detectFaces(const cv::Mat &img320)
 
         // Get scores if available
         float* scores_data = nullptr;
+        size_t num_scores = 0;
         if (output_tensors.size() > 1) {
             scores_data = output_tensors[1].GetTensorMutableData<float>();
             auto scores_shape = output_tensors[1].GetTensorTypeAndShapeInfo().GetShape();
@@ -233,52 +241,17 @@ static std::vector<cv::Rect> detectFaces(const cv::Mat &img320)
                 printf("%lld%s", (long long)scores_shape[i], i < scores_shape.size()-1 ? "," : "");
             }
             printf("]\n");
+            if (scores_shape.size() > 0) {
+                num_scores = scores_shape[0];
+            }
         }
 
-        // Parse detections based on shape
-        int num_detections = 0;
-        if (boxes_shape.size() == 2 && boxes_shape[0] == 1) {
-            // Shape: (1, 16) - single detection
-            num_detections = 1;
+        // Parse detections - shape is [1, 896, 16]
+        if (boxes_shape.size() == 3 && boxes_shape[0] == 1) {
+            int num_detections = boxes_shape[1];
+            int coord_size = boxes_shape[2];
             
-            // Check if this is a valid detection
-            float y1 = boxes_data[0];
-            float x1 = boxes_data[1];
-            float y2 = boxes_data[2];
-            float x2 = boxes_data[3];
-            
-            if ((y2 - y1) > 0.1f && (x2 - x1) > 0.1f) {
-                // Valid detection
-                struct Detection {
-                    cv::Rect rect;
-                    float score;
-                };
-                std::vector<Detection> detections;
-                
-                float score = 1.0f;
-                if (scores_data) {
-                    score = scores_data[0];
-                }
-                
-                if (score >= CONF_THRESH) {
-                    int px1 = static_cast<int>(x1 * img320.cols);
-                    int py1 = static_cast<int>(y1 * img320.rows);
-                    int px2 = static_cast<int>(x2 * img320.cols);
-                    int py2 = static_cast<int>(y2 * img320.rows);
-                    
-                    if (px1 < px2 && py1 < py2) {
-                        detections.push_back({cv::Rect(px1, py1, px2 - px1, py2 - py1), score});
-                    }
-                }
-                
-                // Add to boxes
-                for (const auto& det : detections) {
-                    boxes.push_back(det.rect);
-                }
-            }
-        } else if (boxes_shape.size() == 3 && boxes_shape[0] == 1) {
-            // Shape: (1, N, 16) - multiple detections
-            num_detections = boxes_shape[1];
+            printf("Processing %d detections with %d coordinates each\n", num_detections, coord_size);
             
             struct Detection {
                 cv::Rect rect;
@@ -287,19 +260,20 @@ static std::vector<cv::Rect> detectFaces(const cv::Mat &img320)
             std::vector<Detection> detections;
             
             for (int i = 0; i < num_detections; i++) {
-                int idx = i * 16;
+                int idx = i * coord_size;
                 float y1 = boxes_data[idx + 0];
                 float x1 = boxes_data[idx + 1];
                 float y2 = boxes_data[idx + 2];
                 float x2 = boxes_data[idx + 3];
                 
                 // Skip invalid boxes
-                if ((y2 - y1) < 0.1f || (x2 - x1) < 0.1f) {
+                if ((y2 - y1) < 0.01f || (x2 - x1) < 0.01f) {
                     continue;
                 }
                 
+                // Get score
                 float score = 1.0f;
-                if (scores_data && i < output_tensors[1].GetTensorTypeAndShapeInfo().GetShape()[1]) {
+                if (scores_data && i < num_scores) {
                     score = scores_data[i];
                 }
                 
@@ -307,6 +281,7 @@ static std::vector<cv::Rect> detectFaces(const cv::Mat &img320)
                     continue;
                 }
                 
+                // Scale from normalized [0,1] to image coordinates
                 int px1 = static_cast<int>(x1 * img320.cols);
                 int py1 = static_cast<int>(y1 * img320.rows);
                 int px2 = static_cast<int>(x2 * img320.cols);
@@ -316,6 +291,8 @@ static std::vector<cv::Rect> detectFaces(const cv::Mat &img320)
                     detections.push_back({cv::Rect(px1, py1, px2 - px1, py2 - py1), score});
                 }
             }
+            
+            printf("Found %zu valid detections before NMS\n", detections.size());
             
             // Apply NMS
             if (!detections.empty()) {
@@ -335,10 +312,10 @@ static std::vector<cv::Rect> detectFaces(const cv::Mat &img320)
                 }
             }
         } else {
-            printf("Unexpected output shape!\n");
+            printf("Unexpected output shape! Expected [1, N, 16]\n");
         }
         
-        printf("Detected %zu faces\n", boxes.size());
+        printf("Final face count: %zu\n", boxes.size());
 
     } catch (const std::exception& e) {
         printf("Inference error: %s\n", e.what());
