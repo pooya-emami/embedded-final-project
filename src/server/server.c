@@ -383,9 +383,6 @@ void *frame_updater(void *arg) {
         unsigned char buf[BUFFER_SIZE];
         size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
 
-        // ============================================================
-        // WATCHDOG: Check if frame changed
-        // ============================================================
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             pthread_mutex_lock(&watchdog_mutex);
             
@@ -412,9 +409,6 @@ void *frame_updater(void *arg) {
             pthread_mutex_unlock(&watchdog_mutex);
         }
 
-        // ============================================================
-        // Detection logic
-        // ============================================================
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
             
@@ -641,34 +635,6 @@ static void *handle_https_thread(void *arg) {
     // GET /stream or /api/v1/stream
     if (strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) {
         handle_mjpeg_stream(ssl);
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // ============================================================
-    // GET /raw_stream - Raw camera feed (no detection overlay)
-    // ============================================================
-    if (strcmp(path, "/raw_stream") == 0) {
-        unsigned char raw_buf[BUFFER_SIZE];
-        size_t raw_len = shared_frame_read(g_frame, raw_buf, BUFFER_SIZE);
-        
-        if (raw_len > 0 && raw_buf[0] == 0xFF && raw_buf[1] == 0xD8) {
-            char header[256];
-            snprintf(header, sizeof(header),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: image/jpeg\r\n"
-                "Content-Length: %zu\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Connection: close\r\n"
-                "\r\n",
-                raw_len);
-            SSL_write(ssl, header, strlen(header));
-            SSL_write(ssl, raw_buf, raw_len);
-        } else {
-            const char *resp = "HTTP/1.1 503 Service Unavailable\r\n\r\n";
-            SSL_write(ssl, resp, strlen(resp));
-        }
         SSL_free(ssl);
         close(fd);
         return NULL;
@@ -942,6 +908,7 @@ static void *handle_https_thread(void *arg) {
     close(fd);
     return NULL;
 }
+
 void *watchdog_monitor(void *arg) {
     (void)arg;
     
