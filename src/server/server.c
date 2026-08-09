@@ -64,12 +64,20 @@ static int current_interval_ms = 100;
 static int guard_enabled = 0;
 static int mqtt_initialized = 0;
 
-// ============================================================
-// NEW: Global person count (single source of truth)
-// ============================================================
 static int g_person_count = 0;
 static time_t g_last_detection_time = 0;
 static pthread_mutex_t person_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// ============================================================
+// WATCHDOG GLOBALS
+// ============================================================
+static time_t last_frame_time = 0;
+static int watchdog_alert_sent = 0;
+static int camera_restored_alert_sent = 0;
+static pthread_mutex_t watchdog_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Email debounce global
+static time_t last_email_time = 0;
 
 static void trim(char *str) {
     char *start = str;
@@ -252,12 +260,12 @@ static void *telemetry_updater(void *arg) {
         }
         
         if (cached_temp > g_temp_throttle_c && current_interval_ms > g_min_interval_ms) {
-            printf("[THERMAL] Temp %.1f°C > %d°C, throttling to %dms\n", 
+            printf("[THERMAL] Temp %.1f C > %d C, throttling to %dms\n", 
                    cached_temp, g_temp_throttle_c, g_min_interval_ms);
             current_interval_ms = g_min_interval_ms;
         } else if (cached_temp <= g_temp_throttle_c - 5 && current_interval_ms != g_frame_interval_ms) {
             current_interval_ms = g_frame_interval_ms;
-            printf("[THERMAL] Temp %.1f°C, restoring to %dms\n", 
+            printf("[THERMAL] Temp %.1f C, restoring to %dms\n", 
                    cached_temp, current_interval_ms);
         }
         
@@ -281,47 +289,56 @@ void add_history(int count, float temp)
     pthread_mutex_unlock(&history_mutex);
 }
 
-static void send_email_alert(int count, float temp, const unsigned char *frame, size_t frame_len)
+// ============================================================
+// Send camera tampering alert
+// ============================================================
+static void send_watchdog_alert(const char *status)
 {
-    if (!guard_enabled || count <= 0) {
-        return;
-    }
-    
     time_t now = time(NULL);
-    static time_t last_email_time = 0;
-    static int last_email_count = 0;
     
-    // Debounce: at most 1 email per 30 seconds
-    if (now - last_email_time < 30) {
-        printf("[DEBOUNCE] Alert suppressed, next in %lds\n", 
-               30 - (now - last_email_time));
-        return;
+    // Send email alert (regardless of guard mode)
+    email_send_alert(0, cached_temp, NULL, 0);
+    
+    // Publish to MQTT alarm topic
+    if (mqtt_initialized) {
+        char topic[128];
+        snprintf(topic, sizeof(topic), "alarm/%s/home", STUDENT_ID);
+        char payload[256];
+        snprintf(payload, sizeof(payload),
+            "{\"status\":\"camera_%s\",\"timestamp\":%ld}",
+            status, now);
+        mqtt_publish_custom(topic, payload);
     }
     
-    // Only send if count changed or enough time passed
-    if (count == last_email_count && (now - last_email_time) < 60) {
+    printf("[WATCHDOG] Camera %s alert sent\n", status);
+}
+
+// ============================================================
+// Helper function to send detection email with proper debounce
+// ============================================================
+static void send_detection_email(int count, float temp, const unsigned char *buf, size_t len, int immediate)
+{
+    time_t now = time(NULL);
+    
+    // Always check debounce for Guard OFF
+    // Guard ON: immediate sends bypass debounce, then sets last_email_time
+    if (!immediate && (now - last_email_time < 30)) {
+        printf("[EMAIL] Suppressed (debounce): %d person(s)\n", count);
         return;
     }
-    
-    last_email_time = now;
-    last_email_count = count;
     
     // Copy frame for email
     unsigned char *frame_copy = NULL;
     size_t copy_len = 0;
     
-    if (frame && frame_len > 0 && frame[0] == 0xFF && frame[1] == 0xD8) {
-        frame_copy = malloc(frame_len);
+    if (buf && len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
+        frame_copy = malloc(len);
         if (frame_copy) {
-            memcpy(frame_copy, frame, frame_len);
-            copy_len = frame_len;
-            printf("[EMAIL] Using frame: %zu bytes\n", copy_len);
+            memcpy(frame_copy, buf, len);
+            copy_len = len;
         }
-    } else {
-        printf("[EMAIL] No valid frame provided\n");
     }
     
-    // Send email
     if (frame_copy && copy_len > 0) {
         email_send_alert(count, temp, frame_copy, copy_len);
         free(frame_copy);
@@ -329,24 +346,59 @@ static void send_email_alert(int count, float temp, const unsigned char *frame, 
         email_send_alert(count, temp, NULL, 0);
     }
     
-    // Publish alarm to MQTT
-    if (mqtt_initialized) {
-        mqtt_publish_alarm(count, temp);
-    }
+    last_email_time = now;
     
-    printf("[ALERT] Email sent: %d person(s), temp: %.1f°C\n", count, temp);
+    if (immediate) {
+        printf("[GUARD] Immediate email sent: %d person(s)\n", count);
+    } else {
+        printf("[EMAIL] Email sent: %d person(s)\n", count);
+    }
 }
 
-
+// ============================================================
+// frame_updater - Complete implementation with your mechanism
+// ============================================================
 void *frame_updater(void *arg) {
     (void)arg;
 
     struct timespec next_time;
     clock_gettime(CLOCK_MONOTONIC, &next_time);
 
+    int no_detection_frame_count = 0;
+    int last_person_count = 0;
+    int active_detection_event = 0;
+
     while (running) {
         unsigned char buf[BUFFER_SIZE];
         size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
+
+        // ============================================================
+        // SIMPLE WATCHDOG: Compare frame directly
+        // ============================================================
+        if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
+            pthread_mutex_lock(&watchdog_mutex);
+            
+            if (!first_frame_received) {
+                memcpy(prev_frame, buf, len);
+                prev_frame_len = len;
+                last_frame_time = time(NULL);
+                first_frame_received = 1;
+            } else if (len != prev_frame_len || memcmp(buf, prev_frame, len) != 0) {
+                // Frame changed - reset watchdog
+                memcpy(prev_frame, buf, len);
+                prev_frame_len = len;
+                last_frame_time = time(NULL);
+                
+                if (watchdog_alert_sent && !camera_restored_alert_sent) {
+                    camera_restored_alert_sent = 1;
+                    watchdog_alert_sent = 0;
+                    send_watchdog_alert("restored");
+                    printf("[WATCHDOG] Camera restored!\n");
+                }
+            }
+            
+            pthread_mutex_unlock(&watchdog_mutex);
+        }
 
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
@@ -365,20 +417,51 @@ void *frame_updater(void *arg) {
             }
             pthread_mutex_unlock(&frame_mutex);
             
+            pthread_mutex_lock(&telemetry_mutex);
+            float temp = cached_temp;
+            pthread_mutex_unlock(&telemetry_mutex);
+            
             if (res.person_count > 0) {
-                pthread_mutex_lock(&telemetry_mutex);
-                float temp = cached_temp;
-                pthread_mutex_unlock(&telemetry_mutex);
-                
-                // Add to history (with the original frame for the image)
+                no_detection_frame_count = 0;
                 add_history(res.person_count, temp);
                 
-                // Send email alert (separate function)
-                send_email_alert(res.person_count, temp, buf, len);
-                
-                // Publish to MQTT (persons topic)
                 if (mqtt_initialized) {
                     mqtt_publish_persons(res.person_count, temp);
+                }
+                
+                if (guard_enabled) {
+                    int is_new_event = 0;
+                    
+                    if (no_detection_frame_count > 100 || 
+                        res.person_count != last_person_count ||
+                        active_detection_event == 0) {
+                        is_new_event = 1;
+                        active_detection_event = 1;
+                        printf("[GUARD] New detection event started (count: %d)\n", res.person_count);
+                    }
+                    
+                    last_person_count = res.person_count;
+                    
+                    if (mqtt_initialized) {
+                        mqtt_publish_alarm(res.person_count, temp);
+                    }
+                    
+                    if (is_new_event) {
+                        send_detection_email(res.person_count, temp, buf, len, 1);
+                    } else {
+                        send_detection_email(res.person_count, temp, buf, len, 0);
+                    }
+                    
+                } else {
+                    send_detection_email(res.person_count, temp, buf, len, 0);
+                }
+                
+            } else {
+                no_detection_frame_count++;
+                
+                if (no_detection_frame_count > 100 && active_detection_event) {
+                    active_detection_event = 0;
+                    printf("[GUARD] Person left, resetting detection event\n");
                 }
             }
             
@@ -817,23 +900,35 @@ static void *handle_https_thread(void *arg) {
     return NULL;
 }
 
+// ============================================================
+// watchdog_monitor - Camera tamper detection
+// ============================================================
 void *watchdog_monitor(void *arg) {
     (void)arg;
-    time_t last_frame_time = time(NULL);
     
     while (running) {
-        pthread_mutex_lock(&frame_mutex);
-        if (current_len > 0) last_frame_time = time(NULL);
-        pthread_mutex_unlock(&frame_mutex);
-
+        pthread_mutex_lock(&watchdog_mutex);
+        
         int timeout_seconds = g_watchdog_timeout_ms / 1000;
         if (timeout_seconds <= 0) timeout_seconds = 30;
         
-        if (time(NULL) - last_frame_time > timeout_seconds) {
-            printf("[WATCHDOG] No frame for %d seconds, restarting detection\n", timeout_seconds);
-            system("systemctl restart detection.service 2>/dev/null || true");
-            last_frame_time = time(NULL);
+        time_t now = time(NULL);
+        
+        // Check if no frame received for timeout period
+        if (now - last_frame_time > timeout_seconds) {
+            if (!watchdog_alert_sent) {
+                watchdog_alert_sent = 1;
+                camera_restored_alert_sent = 0;
+                send_watchdog_alert("offline");
+                printf("[WATCHDOG] Camera offline! No frame for %d seconds\n", timeout_seconds);
+                
+                // Optionally restart the server (commented out for now)
+                // system("systemctl restart server.service 2>/dev/null || true");
+                // printf("[WATCHDOG] Server restart triggered\n");
+            }
         }
+        
+        pthread_mutex_unlock(&watchdog_mutex);
         sleep(1);
     }
     return NULL;
@@ -874,7 +969,7 @@ int main(void) {
     printf("Frame size: %dx%d\n", g_frame_width, g_frame_height);
     printf("HTTP port: %d, HTTPS port: %d\n", g_port_http, g_port_https);
     printf("Max history: %d\n", g_max_history);
-    printf("Thermal throttle: %d°C, min interval: %dms\n", g_temp_throttle_c, g_min_interval_ms);
+    printf("Thermal throttle: %d C, min interval: %dms\n", g_temp_throttle_c, g_min_interval_ms);
     printf("Watchdog timeout: %dms\n", g_watchdog_timeout_ms);
     printf("Send SIGHUP (kill -HUP %d) to reload config\n", getpid());
     printf("========================\n\n");
@@ -903,6 +998,9 @@ int main(void) {
         printf("Failed to open shared frame\n");
         return 1;
     }
+
+    // Initialize last_frame_time for watchdog
+    last_frame_time = time(NULL);
 
     pthread_t updater, telemetry_thread, watchdog_thread;
     pthread_create(&updater, NULL, frame_updater, NULL);
