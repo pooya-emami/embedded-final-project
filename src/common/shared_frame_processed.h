@@ -14,9 +14,12 @@ typedef struct {
     float cpu_temp;
     time_t timestamp;
     unsigned char frame_buffer[SHM_PROCESSED_BUF_SIZE];
-    int thermal_throttle_active;
-    int target_width;
-    int target_height;
+    int thermal_throttle_active;    
+    int target_width;               
+    int target_height;              
+    int target_fps;                 
+    float current_temp;             
+    float last_updated_temp;        
 } processed_frame_t;
 
 processed_frame_t *processed_frame_open(void);

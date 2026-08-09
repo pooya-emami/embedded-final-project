@@ -44,13 +44,15 @@ int main(void) {
     }
     printf("[DETECTION] Processed shared memory opened\n");
 
-    FILE *temp_file = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
-    float cpu_temp = -1;
     int frame_count = 0;
     
     int target_width = 320;
     int target_height = 240;
     int throttle_active = 0;
+    float current_temp = -1;
+    int last_fps_update = 0;
+    int target_fps = 30;
+    int sleep_us = 33000;
     
     while (running) {
         unsigned char buf[SHM_FRAME_BUF_SIZE];
@@ -59,25 +61,33 @@ int main(void) {
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             if (g_processed) {
                 processed_frame_t *pf = (processed_frame_t*)g_processed;
+                
+                current_temp = pf->current_temp;
+                
                 if (pf->thermal_throttle_active != throttle_active) {
                     throttle_active = pf->thermal_throttle_active;
+                    target_width = pf->target_width;
+                    target_height = pf->target_height;
+                    
                     if (throttle_active) {
-                        target_width = pf->target_width;
-                        target_height = pf->target_height;
-                        printf("[DETECTION] Thermal throttling: %dx%d\n", target_width, target_height);
+                        printf("[DETECTION] Thermal throttling: %dx%d (FPS: %d)\n", 
+                               target_width, target_height, pf->target_fps);
                     } else {
-                        target_width = 320;
-                        target_height = 240;
-                        printf("[DETECTION] Thermal restored: %dx%d\n", target_width, target_height);
+                        printf("[DETECTION] Thermal restored: %dx%d (FPS: %d)\n", 
+                               target_width, target_height, pf->target_fps);
                     }
                 }
-            }
-            
-            if (temp_file) {
-                rewind(temp_file);
-                int t = 0;
-                if (fscanf(temp_file, "%d", &t) == 1) {
-                    cpu_temp = t / 1000.0f;
+                
+                if (pf->target_fps != last_fps_update && pf->target_fps > 0) {
+                    last_fps_update = pf->target_fps;
+                    target_fps = pf->target_fps;
+                    if (target_fps > 0) {
+                        sleep_us = 1000000 / target_fps;
+                    } else {
+                        sleep_us = 33000;
+                    }
+                    printf("[DETECTION] Target FPS updated: %d (sleep: %d us)\n", 
+                           target_fps, sleep_us);
                 }
             }
 
@@ -85,22 +95,21 @@ int main(void) {
             
             if (res.jpeg_output && res.jpeg_length > 0) {
                 processed_frame_write(g_processed, res.jpeg_output, res.jpeg_length, 
-                                      res.person_count, cpu_temp);
+                                      res.person_count, current_temp);
             }
             
             free_detection_result(&res);
             
             frame_count++;
-            if (frame_count % 30 == 0) {
-                printf("[DETECTION] Frames: %d, Resolution: %dx%d, Throttle: %d\n", 
-                       frame_count, target_width, target_height, throttle_active);
+            if (frame_count % 60 == 0) {
+                printf("[DETECTION] Frames: %d, Resolution: %dx%d, FPS: %d, Temp: %.1f C\n", 
+                       frame_count, target_width, target_height, target_fps, current_temp);
             }
         }
 
-        usleep(33000);
+        usleep(sleep_us);
     }
 
     printf("[DETECTION] Shutting down...\n");
-    if (temp_file) fclose(temp_file);
     return 0;
 }

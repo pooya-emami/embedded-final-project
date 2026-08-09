@@ -333,6 +333,13 @@ static void *telemetry_updater(void *arg) {
         cached_cpu = read_cpu_usage();
         pthread_mutex_unlock(&telemetry_mutex);
         
+        if (g_processed) {
+            processed_frame_t *pf = (processed_frame_t*)g_processed;
+            pf->current_temp = cached_temp;
+            pf->last_updated_temp = time(NULL);
+            pf->target_fps = (int)(1000.0 / current_interval_ms);
+        }
+        
         if (cached_temp > g_temp_throttle_c) {
             if (!throttled) {
                 current_interval_ms = (int)(g_frame_interval_ms * 1.5);
@@ -350,6 +357,7 @@ static void *telemetry_updater(void *arg) {
                     pf->thermal_throttle_active = 1;
                     pf->target_width = g_frame_width;
                     pf->target_height = g_frame_height;
+                    pf->target_fps = (int)(1000.0 / current_interval_ms);
                 }
                 
                 printf("[THERMAL] Temp %.1f C > %d C, throttling:\n", 
@@ -378,6 +386,7 @@ static void *telemetry_updater(void *arg) {
                 pf->thermal_throttle_active = 0;
                 pf->target_width = g_frame_width;
                 pf->target_height = g_frame_height;
+                pf->target_fps = (int)(1000.0 / current_interval_ms);
             }
             
             printf("[THERMAL] Temp %.1f C <= %d C, restored:\n", 
