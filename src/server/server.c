@@ -877,7 +877,7 @@ int main(void) {
 
     srand(time(NULL));
 
-    if (history_db_init("/home/pi/security_history.db") != 0) {
+    if (history_db_init("/home/pooya/embproj/proj/security_history.db") != 0) {
         printf("Failed to initialize SQLite history DB\n");
     }
 

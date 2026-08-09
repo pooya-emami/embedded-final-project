@@ -1,10 +1,7 @@
-#!/usr/bin/env python3
-
-from fastapi import FastAPI, Response, StreamingResponse
+from fastapi import FastAPI, Response
 from fastapi.responses import RedirectResponse
 import requests
 import urllib3
-import time
 
 app = FastAPI(
     title="Embedded Security System API",
@@ -12,7 +9,7 @@ app = FastAPI(
     version="1.0.0"
 )
 
-BASE_URL = "http://localhost:8443"  # Use HTTP since we're proxying
+BASE_URL = "https://localhost:8443"
 VERIFY_SSL = False
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -31,9 +28,7 @@ async def get_telemetry():
 
 @app.get("/api/v1/stream", tags=["Stream"])
 async def get_stream():
-    """Get single frame snapshot (not the infinite stream)."""
     try:
-        # Use snapshot endpoint instead of streaming
         resp = requests.get(f"{BASE_URL}/snapshot", verify=VERIFY_SSL, timeout=5)
         return Response(content=resp.content, media_type="image/jpeg")
     except Exception as e:
@@ -69,10 +64,18 @@ async def post_command(cmd: dict):
 @app.get("/api/v1/health", tags=["System"])
 async def health_check():
     try:
-        resp = requests.get(f"{BASE_URL}/", verify=VERIFY_SSL, timeout=5)
+        resp = requests.get(f"{BASE_URL}/api/v1/health", verify=VERIFY_SSL, timeout=5)
         return {"status": "ok", "message": "Server is running"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+@app.get("/api/v1/guard", tags=["System"])
+async def get_guard():
+    try:
+        resp = requests.get(f"{BASE_URL}/api/v1/guard", verify=VERIFY_SSL, timeout=5)
+        return resp.json()
+    except Exception as e:
+        return {"error": str(e), "guard_enabled": False}
 
 if __name__ == "__main__":
     import uvicorn
