@@ -18,65 +18,25 @@ int email_send_alert(int persons, float cpu_temp,
 {
     time_t now = time(NULL);
     
-    // Debounce
+    // Debounce: at most 1 email per 30 seconds
     if (now - last_email_time < 30) {
-        printf("[EMAIL] Debounced: %lds since last email\n", now - last_email_time);
         return 0;
     }
     
     // Check SMTP config
     if (strlen(g_smtp_server) == 0 || strlen(g_smtp_user) == 0 || 
         strlen(g_smtp_pass) == 0 || strlen(g_smtp_to) == 0) {
-        printf("[EMAIL] ❌ SMTP not configured!\n");
+        printf("[EMAIL] SMTP not configured\n");
         return -1;
-    }
-
-    printf("[EMAIL] Sending alert: %d persons, temp=%.1f, jpeg_len=%zu\n", 
-           persons, cpu_temp, jpeg_len);
-
-    // ============================================================
-    // DEBUG: Save JPEG to file for verification
-    // ============================================================
-    if (jpeg_buf && jpeg_len > 100) {
-        // Save to /tmp for debugging
-        FILE *f = fopen("/tmp/email_frame_debug.jpg", "wb");
-        if (f) {
-            size_t written = fwrite(jpeg_buf, 1, jpeg_len, f);
-            fclose(f);
-            printf("[EMAIL] Saved %zu bytes to /tmp/email_frame_debug.jpg\n", written);
-        }
-        
-        // Verify JPEG header
-        if (jpeg_buf[0] == 0xFF && jpeg_buf[1] == 0xD8) {
-            printf("[EMAIL] ✅ Valid JPEG header (FF D8)\n");
-        } else {
-            printf("[EMAIL] ❌ Invalid JPEG header: %02X %02X\n", jpeg_buf[0], jpeg_buf[1]);
-            printf("[EMAIL] First 16 bytes: ");
-            for (int i = 0; i < 16 && i < jpeg_len; i++) {
-                printf("%02X ", jpeg_buf[i]);
-            }
-            printf("\n");
-        }
-        
-        // Check for EOF marker
-        if (jpeg_len > 4) {
-            printf("[EMAIL] Last bytes: %02X %02X %02X %02X\n", 
-                   jpeg_buf[jpeg_len-4], jpeg_buf[jpeg_len-3], 
-                   jpeg_buf[jpeg_len-2], jpeg_buf[jpeg_len-1]);
-        }
-    } else {
-        printf("[EMAIL] No JPEG to attach (len=%zu)\n", jpeg_len);
     }
 
     CURL *curl = curl_easy_init();
     if (!curl) {
-        printf("[EMAIL] ❌ Failed to initialize curl\n");
+        printf("[EMAIL] Failed to initialize curl\n");
         return -1;
     }
 
-    // ============================================================
-    // Setup SMTP with proper SSL/TLS
-    // ============================================================
+    // Setup SMTP
     curl_easy_setopt(curl, CURLOPT_USERNAME, g_smtp_user);
     curl_easy_setopt(curl, CURLOPT_PASSWORD, g_smtp_pass);
     curl_easy_setopt(curl, CURLOPT_URL, g_smtp_server);
@@ -85,15 +45,12 @@ int email_send_alert(int persons, float cpu_temp,
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
     curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L);  // Debug SMTP conversation
 
     struct curl_slist *recipients = NULL;
     recipients = curl_slist_append(recipients, g_smtp_to);
     curl_easy_setopt(curl, CURLOPT_MAIL_RCPT, recipients);
 
-    // ============================================================
     // Create MIME message
-    // ============================================================
     curl_mime *mime = curl_mime_init(curl);
     curl_mimepart *part;
 
@@ -108,7 +65,7 @@ int email_send_alert(int persons, float cpu_temp,
         "Security Alert - Human Detected!\n"
         "Timestamp: %s\n"
         "Persons: %d\n"
-        "CPU Temp: %.1f°C\n\n"
+        "CPU Temp: %.1f C\n\n"
         "Attached: alert.jpg\n",
         timestamp, persons, cpu_temp);
 
@@ -125,38 +82,26 @@ int email_send_alert(int persons, float cpu_temp,
     curl_mime_data(part, json_body, CURL_ZERO_TERMINATED);
     curl_mime_type(part, "application/json");
 
-    // ============================================================
-    // JPEG attachment with proper encoding
-    // ============================================================
+    // JPEG attachment (if provided)
     if (jpeg_buf && jpeg_len > 100) {
-        // Verify JPEG header
         if (jpeg_buf[0] == 0xFF && jpeg_buf[1] == 0xD8) {
-            printf("[EMAIL] Attaching JPEG: %zu bytes\n", jpeg_len);
-            
             part = curl_mime_addpart(mime);
             curl_mime_data(part, (const char *)jpeg_buf, jpeg_len);
             curl_mime_filename(part, "alert.jpg");
             curl_mime_type(part, "image/jpeg");
-            curl_mime_encoder(part, "base64");  // ✅ Add base64 encoding for binary data
-            
-            printf("[EMAIL] JPEG attached with base64 encoding\n");
-        } else {
-            printf("[EMAIL] ⚠️ Invalid JPEG header: %02X %02X\n", jpeg_buf[0], jpeg_buf[1]);
+            curl_mime_encoder(part, "base64");
         }
-    } else {
-        printf("[EMAIL] No JPEG attachment (len=%zu)\n", jpeg_len);
     }
 
     curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
 
-    printf("[EMAIL] Sending email...\n");
     CURLcode res = curl_easy_perform(curl);
 
-    if (res != CURLE_OK) {
-        printf("[EMAIL] ❌ Failed: %s\n", curl_easy_strerror(res));
-    } else {
-        printf("[EMAIL] ✅ Alert sent successfully!\n");
+    if (res == CURLE_OK) {
+        printf("[EMAIL] Alert sent successfully\n");
         last_email_time = now;
+    } else {
+        printf("[EMAIL] Failed to send: %s\n", curl_easy_strerror(res));
     }
 
     curl_slist_free_all(recipients);
