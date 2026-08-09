@@ -12,7 +12,7 @@ void mqtt_init(const char *host, int port,
 void mqtt_publish_persons(int count, float temp);
 void mqtt_publish_telemetry(float temp, long mem, float cpu);
 void mqtt_publish_alarm(int count, float temp);
-void mqtt_publish_custom(const char *topic, const char *payload);  // NEW
+void mqtt_publish_custom(const char *topic, const char *payload);
 void mqtt_cleanup(void);
 
 #endif
