@@ -45,7 +45,7 @@ static void load_yolo()
     yolo_loaded = true;
 }
 
-static std::vector<cv::Rect> detectHumansBlaze(const cv::Mat &img320)
+static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
 {
     load_yolo(); // reuse your loader but point YOLO_MODEL_FILE to blaze.onnx
 
