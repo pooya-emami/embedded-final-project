@@ -89,6 +89,9 @@ static int pending_is_guard_event = 0;
 static int pending_processed = 0;
 static pthread_mutex_t pending_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Guard event tracking
+static int active_detection_event = 0;
+
 static void trim(char *str) {
     char *start = str;
     char *end;
@@ -300,9 +303,6 @@ static void send_detection_email(int count, float temp, const unsigned char *buf
     last_email_time = now;
 }
 
-// ============================================================
-// WATCHDOG ALERT - Only for tampering (offline/stuck)
-// ============================================================
 static void send_watchdog_alert(const char *status)
 {
     time_t now = time(NULL);
@@ -328,9 +328,6 @@ static void send_watchdog_alert(const char *status)
     }
 }
 
-// ============================================================
-// Process pending detection (called from telemetry_updater)
-// ============================================================
 static void process_pending_detection(void)
 {
     int count = 0;
@@ -362,11 +359,13 @@ static void process_pending_detection(void)
         mqtt_publish_persons(count, temp);
     }
     
-    if (is_guard_event && guard_enabled) {
+    if (is_guard_event) {
+        // MQTT alarm - ALWAYS send on every detection
         if (mqtt_initialized) {
             mqtt_publish_alarm(count, temp);
         }
         
+        // Email - ONLY on NEW events (person just appeared)
         if (frame_len > 0) {
             email_send_alert_guard(count, temp, frame, frame_len);
         } else {
@@ -374,7 +373,8 @@ static void process_pending_detection(void)
         }
         printf("[PROCESS] GUARD email sent: %d person(s)\n", count);
         
-    } else if (count > 0) {
+    } else {
+        // Normal mode: send email with 30-second debounce
         send_detection_email(count, temp, frame, frame_len, 0);
     }
 }
@@ -417,7 +417,6 @@ void *frame_updater(void *arg) {
 
     int no_detection_frame_count = 0;
     int last_person_count = 0;
-    int active_detection_event = 0;
 
     while (running) {
         unsigned char buf[BUFFER_SIZE];
@@ -473,12 +472,12 @@ void *frame_updater(void *arg) {
             if (res.person_count > 0) {
                 no_detection_frame_count = 0;
                 
+                // Check if this is a NEW event (person just appeared)
                 int is_new_event = 0;
-                if (no_detection_frame_count > 100 || 
-                    res.person_count != last_person_count ||
-                    active_detection_event == 0) {
+                if (active_detection_event == 0) {
                     is_new_event = 1;
                     active_detection_event = 1;
+                    printf("[GUARD] New detection event started\n");
                 }
                 last_person_count = res.person_count;
                 
@@ -497,6 +496,7 @@ void *frame_updater(void *arg) {
             } else {
                 no_detection_frame_count++;
                 
+                // Person left - reset event after 100+ frames (~3 seconds)
                 if (no_detection_frame_count > 100 && active_detection_event) {
                     active_detection_event = 0;
                     printf("[GUARD] Person left, resetting detection event\n");
