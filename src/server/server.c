@@ -310,9 +310,6 @@ void add_history(int count, float temp)
     pthread_mutex_unlock(&history_mutex);
 }
 
-// ============================================================
-// Send camera tampering alert
-// ============================================================
 static void send_watchdog_alert(const char *status)
 {
     time_t now = time(NULL);
@@ -334,9 +331,6 @@ static void send_watchdog_alert(const char *status)
     printf("[WATCHDOG] Camera %s alert sent\n", status);
 }
 
-// ============================================================
-// Helper function to send detection email with proper debounce
-// ============================================================
 static void send_detection_email(int count, float temp, const unsigned char *buf, size_t len, int immediate)
 {
     time_t now = time(NULL);
@@ -344,7 +338,6 @@ static void send_detection_email(int count, float temp, const unsigned char *buf
     // Always check debounce for Guard OFF
     // Guard ON: immediate sends bypass debounce, then sets last_email_time
     if (!immediate && (now - last_email_time < 30)) {
-        printf("[EMAIL] Suppressed (debounce): %d person(s)\n", count);
         return;
     }
     
