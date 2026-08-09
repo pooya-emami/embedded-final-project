@@ -359,7 +359,6 @@ static void *history_thread_func(void *arg) {
         }
         pthread_mutex_unlock(&history_mutex_signal);
         
-        // Add to history (in separate thread)
         add_history_internal(count, temp);
     }
     return NULL;
@@ -373,6 +372,28 @@ static void signal_history(int count, float temp)
     history_pending = 1;
     pthread_cond_signal(&history_cond);
     pthread_mutex_unlock(&history_mutex_signal);
+}
+
+static void signal_email(int count, float temp, const unsigned char *buf, size_t len, int immediate)
+{
+    pthread_mutex_lock(&email_mutex);
+    
+    email_count = count;
+    email_temp = temp;
+    email_immediate = immediate;
+    email_pending = 1;
+    
+    if (buf && len > 0 && len < BUFFER_SIZE) {
+        memcpy(email_frame, buf, len);
+        email_frame_len = len;
+        email_has_frame = 1;
+    } else {
+        email_frame_len = 0;
+        email_has_frame = 0;
+    }
+    
+    pthread_cond_signal(&email_cond);
+    pthread_mutex_unlock(&email_mutex);
 }
 
 static void *email_thread_func(void *arg) {
@@ -409,24 +430,33 @@ static void *email_thread_func(void *arg) {
         }
         pthread_mutex_unlock(&email_mutex);
         
-        // Send email
-        unsigned char *frame_copy = NULL;
-        if (has_frame && frame_len > 0) {
-            frame_copy = malloc(frame_len);
-            if (frame_copy) {
-                memcpy(frame_copy, frame, frame_len);
+        if (guard_enabled) {
+            if (immediate) {
+                unsigned char *frame_copy = NULL;
+                if (has_frame && frame_len > 0) {
+                    frame_copy = malloc(frame_len);
+                    if (frame_copy) {
+                        memcpy(frame_copy, frame, frame_len);
+                    }
+                }
+                
+                if (frame_copy && frame_len > 0) {
+                    email_send_alert_guard(count, temp, frame_copy, frame_len);
+                } else {
+                    email_send_alert_guard(count, temp, NULL, 0);
+                }
+                free(frame_copy);
+                printf("[EMAIL] Guard email sent: %d person(s)\n", count);
             }
-        }
-        
-        if (immediate) {
-            if (frame_copy && frame_len > 0) {
-                email_send_alert_guard(count, temp, frame_copy, frame_len);
-            } else {
-                email_send_alert_guard(count, temp, NULL, 0);
-            }
-            free(frame_copy);
-            printf("[EMAIL] Guard email sent: %d person(s)\n", count);
         } else {
+            unsigned char *frame_copy = NULL;
+            if (has_frame && frame_len > 0) {
+                frame_copy = malloc(frame_len);
+                if (frame_copy) {
+                    memcpy(frame_copy, frame, frame_len);
+                }
+            }
+            
             time_t now = time(NULL);
             if (now - last_email_time >= 30) {
                 if (frame_copy && frame_len > 0) {
@@ -443,28 +473,6 @@ static void *email_thread_func(void *arg) {
         }
     }
     return NULL;
-}
-
-static void send_detection_email(int count, float temp, const unsigned char *buf, size_t len, int immediate)
-{
-    pthread_mutex_lock(&email_mutex);
-    
-    email_count = count;
-    email_temp = temp;
-    email_immediate = immediate;
-    email_pending = 1;
-    
-    if (buf && len > 0 && len < BUFFER_SIZE) {
-        memcpy(email_frame, buf, len);
-        email_frame_len = len;
-        email_has_frame = 1;
-    } else {
-        email_frame_len = 0;
-        email_has_frame = 0;
-    }
-    
-    pthread_cond_signal(&email_cond);
-    pthread_mutex_unlock(&email_mutex);
 }
 
 void *frame_updater(void *arg) {
@@ -552,7 +560,7 @@ void *frame_updater(void *arg) {
                 signal_history(res.person_count, temp);
                 
                 int immediate = guard_enabled && is_new_event;
-                send_detection_email(res.person_count, temp, buf, len, immediate);
+                signal_email(res.person_count, temp, buf, len, immediate);
                 
             } else {
                 no_detection_frame_count++;
