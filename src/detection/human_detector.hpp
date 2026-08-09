@@ -9,7 +9,7 @@ extern "C" {
 #endif
 
 #define MODEL_BASE_PATH "../../models/"
-#define YOLO_MODEL_FILE "yolov5n.onnx"
+#define YOLO_MODEL_FILE "yolov8n.onnx"
 
 typedef struct DetectionResult {
     uint8_t* jpeg_output;
