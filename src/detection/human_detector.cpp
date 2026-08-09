@@ -14,6 +14,7 @@
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
+#include <cmath>
 #include "human_detector.hpp"
 
 static char model_path[256] = {0};
@@ -21,21 +22,19 @@ static Ort::Env ort_env(ORT_LOGGING_LEVEL_WARNING, "BlazeFace");
 static Ort::Session* blaze_session = nullptr;
 static bool blaze_loaded = false;
 
-// BlazeFace constants
-const int INPUT_SIZE = 128;
-const float CONF_THRESH = 0.5f;
-const float IOU_THRESH = 0.3f;
-const int MAX_DETECTIONS = 25;
+// BlazeFace configuration
+static const float CONF_THRESH = 0.5f;
+static const float IOU_THRESH = 0.3f;
+static const int MAX_DET = 25;
+static const int INPUT_SIZE = 128;  // BlazeFace expects 128x128
 
-static void load_model()
+static void load_blaze()
 {
     if (blaze_loaded)
         return;
 
     snprintf(model_path, sizeof(model_path),
-             "%s%s", MODEL_BASE_PATH, MODEL_FILE);
-
-    printf("Loading BlazeFace model from: %s\n", model_path);
+             "%s%s", MODEL_BASE_PATH, "blaze.onnx");
 
     Ort::SessionOptions session_options;
     session_options.SetGraphOptimizationLevel(
@@ -44,39 +43,80 @@ static void load_model()
     session_options.SetIntraOpNumThreads(4);
     session_options.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
 
-    try {
-        blaze_session = new Ort::Session(
-            ort_env,
-            model_path,
-            session_options
-        );
-        blaze_loaded = true;
-        printf("Model loaded successfully!\n");
-    } catch (const Ort::Exception& e) {
-        printf("Error loading model: %s\n", e.what());
-        blaze_loaded = false;
+    blaze_session = new Ort::Session(
+        ort_env,
+        model_path,
+        session_options
+    );
+
+    blaze_loaded = true;
+    
+    // Print model info for debugging
+    printf("BlazeFace model loaded successfully!\n");
+    printf("Inputs:\n");
+    for (size_t i = 0; i < blaze_session->GetInputCount(); i++) {
+        auto info = blaze_session->GetInputTypeInfo(i);
+        auto shape_info = info.GetTensorTypeAndShapeInfo();
+        auto shape = shape_info.GetShape();
+        printf("  Input %zu: shape=[", i);
+        for (size_t j = 0; j < shape.size(); j++) {
+            printf("%lld%s", (long long)shape[j], j < shape.size()-1 ? "," : "");
+        }
+        printf("]\n");
     }
+    printf("Outputs:\n");
+    for (size_t i = 0; i < blaze_session->GetOutputCount(); i++) {
+        auto info = blaze_session->GetOutputTypeInfo(i);
+        auto shape_info = info.GetTensorTypeAndShapeInfo();
+        auto shape = shape_info.GetShape();
+        printf("  Output %zu: shape=[", i);
+        for (size_t j = 0; j < shape.size(); j++) {
+            printf("%lld%s", (long long)shape[j], j < shape.size()-1 ? "," : "");
+        }
+        printf("]\n");
+    }
+}
+
+// Helper function: Letterbox to square (maintains aspect ratio)
+static cv::Mat letterbox_to_square(const cv::Mat& img, int size = INPUT_SIZE) {
+    int h = img.rows;
+    int w = img.cols;
+    float scale = static_cast<float>(size) / std::max(h, w);
+    int new_w = static_cast<int>(std::round(w * scale));
+    int new_h = static_cast<int>(std::round(h * scale));
+    
+    cv::Mat resized;
+    cv::resize(img, resized, cv::Size(new_w, new_h));
+    
+    cv::Mat canvas = cv::Mat::ones(size, size, CV_8UC3) * 114;  // Pad color 114,114,114
+    int top = (size - new_h) / 2;
+    int left = (size - new_w) / 2;
+    resized.copyTo(canvas(cv::Rect(left, top, new_w, new_h)));
+    
+    return canvas;
 }
 
 static std::vector<cv::Rect> detectFaces(const cv::Mat &img320)
 {
-    load_model();
+    load_blaze();
 
     std::vector<cv::Rect> boxes;
-    if (!blaze_loaded)
+    if (!blaze_loaded) {
+        printf("BlazeFace not loaded!\n");
         return boxes;
+    }
 
-    // Convert to 128x128 for BlazeFace
-    cv::Mat img128;
-    cv::resize(img320, img128, cv::Size(INPUT_SIZE, INPUT_SIZE));
+    // Resize to 128x128 with letterboxing
+    cv::Mat img128 = letterbox_to_square(img320, INPUT_SIZE);
     
+    // Convert BGR to RGB (BlazeFace expects RGB)
     cv::Mat rgb;
     cv::cvtColor(img128, rgb, cv::COLOR_BGR2RGB);
     rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f);
 
     // Prepare input tensor (1, 3, 128, 128)
     std::vector<float> input_tensor_values(1 * 3 * INPUT_SIZE * INPUT_SIZE);
-
+    
     for (int y = 0; y < INPUT_SIZE; y++) {
         for (int x = 0; x < INPUT_SIZE; x++) {
             cv::Vec3f p = rgb.at<cv::Vec3f>(y, x);
@@ -90,163 +130,222 @@ static std::vector<cv::Rect> detectFaces(const cv::Mat &img320)
     Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
         OrtArenaAllocator, OrtMemTypeDefault);
 
-    // Create input tensors in the exact order expected by the model
-    std::vector<const char*> input_names = {"image", "conf_threshold", "max_detections", "iou_threshold"};
-    std::vector<Ort::Value> input_tensors;
-
-    // 1. Image tensor
-    Ort::Value image_tensor = Ort::Value::CreateTensor<float>(
+    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
         mem_info,
         input_tensor_values.data(),
         input_tensor_values.size(),
         input_shape.data(),
         input_shape.size()
     );
-    input_tensors.push_back(std::move(image_tensor));
-    
-    // 2. conf_threshold
-    float conf_thresh = CONF_THRESH;
-    std::array<int64_t, 1> conf_shape = {1};
-    Ort::Value conf_tensor = Ort::Value::CreateTensor<float>(
-        mem_info,
-        &conf_thresh,
-        1,
-        conf_shape.data(),
-        conf_shape.size()
-    );
-    input_tensors.push_back(std::move(conf_tensor));
-    
-    // 3. max_detections
-    int64_t max_det = MAX_DETECTIONS;
-    std::array<int64_t, 1> max_shape = {1};
-    Ort::Value max_tensor = Ort::Value::CreateTensor<int64_t>(
-        mem_info,
-        &max_det,
-        1,
-        max_shape.data(),
-        max_shape.size()
-    );
-    input_tensors.push_back(std::move(max_tensor));
-    
-    // 4. iou_threshold
-    float iou_thresh = IOU_THRESH;
-    std::array<int64_t, 1> iou_shape = {1};
-    Ort::Value iou_tensor = Ort::Value::CreateTensor<float>(
-        mem_info,
-        &iou_thresh,
-        1,
-        iou_shape.data(),
-        iou_shape.size()
-    );
-    input_tensors.push_back(std::move(iou_tensor));
 
-    // Output names
-    const char* output_names[] = {"selectedBoxes"};
+    // Prepare input names and values
+    Ort::AllocatorWithDefaultOptions allocator;
+    
+    // Get input and output names
+    std::vector<const char*> input_names;
+    std::vector<const char*> output_names;
+    
+    for (size_t i = 0; i < blaze_session->GetInputCount(); i++) {
+        auto name = blaze_session->GetInputNameAllocated(i, allocator);
+        input_names.push_back(name.get());
+    }
+    
+    for (size_t i = 0; i < blaze_session->GetOutputCount(); i++) {
+        auto name = blaze_session->GetOutputNameAllocated(i, allocator);
+        output_names.push_back(name.get());
+    }
+
+    // Prepare input tensors
+    std::vector<Ort::Value> input_tensors;
+    input_tensors.push_back(std::move(input_tensor));
+    
+    // Check if model expects additional inputs (conf_threshold, max_detections, iou_threshold)
+    int num_inputs = blaze_session->GetInputCount();
+    if (num_inputs > 1) {
+        // Add conf_threshold
+        std::vector<float> conf_thresh = {CONF_THRESH};
+        Ort::Value conf_tensor = Ort::Value::CreateTensor<float>(
+            mem_info,
+            conf_thresh.data(),
+            conf_thresh.size(),
+            std::array<int64_t, 1>{1}.data(),
+            1
+        );
+        input_tensors.push_back(std::move(conf_tensor));
+        
+        if (num_inputs > 2) {
+            // Add max_detections
+            std::vector<int64_t> max_det = {MAX_DET};
+            Ort::Value max_tensor = Ort::Value::CreateTensor<int64_t>(
+                mem_info,
+                max_det.data(),
+                max_det.size(),
+                std::array<int64_t, 1>{1}.data(),
+                1
+            );
+            input_tensors.push_back(std::move(max_tensor));
+            
+            if (num_inputs > 3) {
+                // Add iou_threshold
+                std::vector<float> iou_thresh = {IOU_THRESH};
+                Ort::Value iou_tensor = Ort::Value::CreateTensor<float>(
+                    mem_info,
+                    iou_thresh.data(),
+                    iou_thresh.size(),
+                    std::array<int64_t, 1>{1}.data(),
+                    1
+                );
+                input_tensors.push_back(std::move(iou_tensor));
+            }
+        }
+    }
 
     // Run inference
-    std::vector<Ort::Value> output_tensors;
     try {
-        output_tensors = blaze_session->Run(
+        auto output_tensors = blaze_session->Run(
             Ort::RunOptions{nullptr},
             input_names.data(), input_tensors.data(), input_tensors.size(),
-            output_names, 1);
-    } catch (const Ort::Exception& e) {
+            output_names.data(), output_names.size());
+
+        // Process outputs
+        if (output_tensors.size() < 1) {
+            printf("No output tensors!\n");
+            return boxes;
+        }
+
+        // Get boxes and scores
+        float* boxes_data = output_tensors[0].GetTensorMutableData<float>();
+        auto boxes_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
+        
+        printf("Boxes shape: [");
+        for (size_t i = 0; i < boxes_shape.size(); i++) {
+            printf("%lld%s", (long long)boxes_shape[i], i < boxes_shape.size()-1 ? "," : "");
+        }
+        printf("]\n");
+
+        // Get scores if available
+        float* scores_data = nullptr;
+        if (output_tensors.size() > 1) {
+            scores_data = output_tensors[1].GetTensorMutableData<float>();
+            auto scores_shape = output_tensors[1].GetTensorTypeAndShapeInfo().GetShape();
+            printf("Scores shape: [");
+            for (size_t i = 0; i < scores_shape.size(); i++) {
+                printf("%lld%s", (long long)scores_shape[i], i < scores_shape.size()-1 ? "," : "");
+            }
+            printf("]\n");
+        }
+
+        // Parse detections based on shape
+        int num_detections = 0;
+        if (boxes_shape.size() == 2 && boxes_shape[0] == 1) {
+            // Shape: (1, 16) - single detection
+            num_detections = 1;
+            
+            // Check if this is a valid detection
+            float y1 = boxes_data[0];
+            float x1 = boxes_data[1];
+            float y2 = boxes_data[2];
+            float x2 = boxes_data[3];
+            
+            if ((y2 - y1) > 0.1f && (x2 - x1) > 0.1f) {
+                // Valid detection
+                struct Detection {
+                    cv::Rect rect;
+                    float score;
+                };
+                std::vector<Detection> detections;
+                
+                float score = 1.0f;
+                if (scores_data) {
+                    score = scores_data[0];
+                }
+                
+                if (score >= CONF_THRESH) {
+                    int px1 = static_cast<int>(x1 * img320.cols);
+                    int py1 = static_cast<int>(y1 * img320.rows);
+                    int px2 = static_cast<int>(x2 * img320.cols);
+                    int py2 = static_cast<int>(y2 * img320.rows);
+                    
+                    if (px1 < px2 && py1 < py2) {
+                        detections.push_back({cv::Rect(px1, py1, px2 - px1, py2 - py1), score});
+                    }
+                }
+                
+                // Add to boxes
+                for (const auto& det : detections) {
+                    boxes.push_back(det.rect);
+                }
+            }
+        } else if (boxes_shape.size() == 3 && boxes_shape[0] == 1) {
+            // Shape: (1, N, 16) - multiple detections
+            num_detections = boxes_shape[1];
+            
+            struct Detection {
+                cv::Rect rect;
+                float score;
+            };
+            std::vector<Detection> detections;
+            
+            for (int i = 0; i < num_detections; i++) {
+                int idx = i * 16;
+                float y1 = boxes_data[idx + 0];
+                float x1 = boxes_data[idx + 1];
+                float y2 = boxes_data[idx + 2];
+                float x2 = boxes_data[idx + 3];
+                
+                // Skip invalid boxes
+                if ((y2 - y1) < 0.1f || (x2 - x1) < 0.1f) {
+                    continue;
+                }
+                
+                float score = 1.0f;
+                if (scores_data && i < output_tensors[1].GetTensorTypeAndShapeInfo().GetShape()[1]) {
+                    score = scores_data[i];
+                }
+                
+                if (score < CONF_THRESH) {
+                    continue;
+                }
+                
+                int px1 = static_cast<int>(x1 * img320.cols);
+                int py1 = static_cast<int>(y1 * img320.rows);
+                int px2 = static_cast<int>(x2 * img320.cols);
+                int py2 = static_cast<int>(y2 * img320.rows);
+                
+                if (px1 < px2 && py1 < py2) {
+                    detections.push_back({cv::Rect(px1, py1, px2 - px1, py2 - py1), score});
+                }
+            }
+            
+            // Apply NMS
+            if (!detections.empty()) {
+                std::vector<cv::Rect> rects;
+                std::vector<float> scores;
+                
+                for (const auto& det : detections) {
+                    rects.push_back(det.rect);
+                    scores.push_back(det.score);
+                }
+                
+                std::vector<int> indices;
+                cv::dnn::NMSBoxes(rects, scores, CONF_THRESH, IOU_THRESH, indices);
+                
+                for (int idx : indices) {
+                    boxes.push_back(rects[idx]);
+                }
+            }
+        } else {
+            printf("Unexpected output shape!\n");
+        }
+        
+        printf("Detected %zu faces\n", boxes.size());
+
+    } catch (const std::exception& e) {
         printf("Inference error: %s\n", e.what());
         return boxes;
     }
 
-    if (output_tensors.empty()) {
-        return boxes;
-    }
-
-    // Parse output - shape is either [1, 896, 16] (detections found) or [1, 16] (no detections)
-    float* boxes_data = output_tensors[0].GetTensorMutableData<float>();
-    auto boxes_shape = output_tensors[0].GetTensorTypeAndShapeInfo().GetShape();
-    
-    // Check if no detections (shape [1, 16])
-    if (boxes_shape.size() == 2 && boxes_shape[0] == 1 && boxes_shape[1] == 16) {
-        // No detections found, return empty
-        return boxes;
-    }
-    
-    // Shape should be [1, 896, 16]
-    if (boxes_shape.size() != 3 || boxes_shape[0] != 1) {
-        printf("Unexpected output shape\n");
-        return boxes;
-    }
-
-    int num_predictions = boxes_shape[1]; // 896
-    int num_values = boxes_shape[2];      // 16
-
-    // Parse detections
-    struct Detection {
-        float x1, y1, x2, y2;
-        float confidence;
-    };
-    std::vector<Detection> detections;
-
-    // Each detection has 16 values: [y1, x1, y2, x2, landmarks...]
-    // The first 4 are the box coordinates, and value at index 15 is the confidence
-    for (int i = 0; i < num_predictions; i++) {
-        int offset = i * num_values;
-        
-        float y1 = boxes_data[offset + 0];
-        float x1 = boxes_data[offset + 1];
-        float y2 = boxes_data[offset + 2];
-        float x2 = boxes_data[offset + 3];
-        
-        // Confidence is at index 15 (last value)
-        float score = boxes_data[offset + 15];
-        
-        // Apply confidence threshold
-        if (score < CONF_THRESH) continue;
-        
-        // Validate detection
-        if (x1 < 0 || x1 > 1 || x2 < 0 || x2 > 1 ||
-            y1 < 0 || y1 > 1 || y2 < 0 || y2 > 1 ||
-            x2 <= x1 || y2 <= y1) {
-            continue;
-        }
-        
-        // Convert from normalized to pixel coordinates (320x320)
-        float px1 = x1 * img320.cols;
-        float py1 = y1 * img320.rows;
-        float px2 = x2 * img320.cols;
-        float py2 = y2 * img320.rows;
-        
-        detections.push_back({px1, py1, px2, py2, score});
-    }
-
-    // Apply NMS
-    if (!detections.empty()) {
-        std::vector<cv::Rect> rects;
-        std::vector<float> scores;
-        
-        for (const auto& det : detections) {
-            rects.emplace_back(
-                (int)det.x1, 
-                (int)det.y1,
-                (int)(det.x2 - det.x1),
-                (int)(det.y2 - det.y1)
-            );
-            scores.push_back(det.confidence);
-        }
-        
-        std::vector<int> indices;
-        cv::dnn::NMSBoxes(rects, scores, CONF_THRESH, IOU_THRESH, indices);
-        
-        for (int idx : indices) {
-            boxes.push_back(rects[idx]);
-        }
-    }
-
     return boxes;
-}
-
-// Keep the function name for compatibility
-static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
-{
-    return detectFaces(img320);
 }
 
 extern "C" DetectionResult process_frame(
@@ -266,13 +365,14 @@ extern "C" DetectionResult process_frame(
     cv::Mat frame_source = cv::imdecode(buf, cv::IMREAD_COLOR);
 
     if (frame_source.empty()) {
+        printf("Failed to decode JPEG\n");
         return result;
     }
 
     cv::Mat frame_detection;
     cv::resize(frame_source, frame_detection, cv::Size(320, 320));
 
-    auto boxes = detectHumans(frame_detection);
+    auto boxes = detectFaces(frame_detection);
 
     // Draw boxes
     for (const auto &box : boxes)
