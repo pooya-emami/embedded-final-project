@@ -45,96 +45,90 @@ static void load_yolo()
     yolo_loaded = true;
 }
 
-static std::vector<cv::Rect> detectHumans(const cv::Mat &img320)
+DetectionResult detectHumans(const cv::Mat& frame)
 {
-    load_yolo(); // but YOLO_MODEL_FILE must point to blaze.onnx
+    DetectionResult result;
+    result.person_count = 0;
 
-    std::vector<cv::Rect> boxes;
-    if (!yolo_loaded)
-        return boxes;
-
-    // BlazeFace expects 128x128 RGB normalized
-    cv::Mat rgb;
-    cv::cvtColor(img320, rgb, cv::COLOR_BGR2RGB);
-    rgb.convertTo(rgb, CV_32F, 1.0f / 255.0f);
-
+    // Resize to 128x128
     cv::Mat resized;
-    cv::resize(rgb, resized, cv::Size(128, 128));
+    cv::resize(frame, resized, cv::Size(128, 128));
 
-    std::vector<float> input_tensor_values(1 * 3 * 128 * 128);
-    int idx = 0;
+    // Convert to float32
+    cv::Mat input;
+    resized.convertTo(input, CV_32F, 1.0 / 255.0);
+
+    // CHW
+    std::vector<float> chw(128 * 128 * 3);
     for (int c = 0; c < 3; c++)
         for (int y = 0; y < 128; y++)
             for (int x = 0; x < 128; x++)
-                input_tensor_values[idx++] = resized.at<cv::Vec3f>(y, x)[c];
-
-    std::array<int64_t, 4> input_shape = {1, 3, 128, 128};
-    Ort::MemoryInfo mem_info = Ort::MemoryInfo::CreateCpu(
-        OrtArenaAllocator, OrtMemTypeDefault);
-
-    Ort::Value input_tensor = Ort::Value::CreateTensor<float>(
-        mem_info,
-        input_tensor_values.data(),
-        input_tensor_values.size(),
-        input_shape.data(),
-        input_shape.size()
-    );
+                chw[c * 128 * 128 + y * 128 + x] = input.at<cv::Vec3f>(y, x)[c];
 
     Ort::AllocatorWithDefaultOptions allocator;
 
-    auto input_name = yolo_session->GetInputNameAllocated(0, allocator);
+    // Prepare inputs
+    std::array<int64_t, 4> img_shape = {1, 3, 128, 128};
+    Ort::Value img_tensor = Ort::Value::CreateTensor<float>(
+        allocator, chw.data(), chw.size(), img_shape.data(), img_shape.size());
 
-    // BlazeFace has 3 outputs
-    auto scores_name = yolo_session->GetOutputNameAllocated(0, allocator);
-    auto boxes_name  = yolo_session->GetOutputNameAllocated(1, allocator);
-    auto nms_name    = yolo_session->GetOutputNameAllocated(2, allocator);
+    float conf_thr = 0.5f;
+    int64_t max_det = 50;
+    float iou_thr = 0.3f;
 
-    const char* input_names[] = {input_name.get()};
-    const char* output_names[] = {
-        scores_name.get(),
-        boxes_name.get(),
-        nms_name.get()
+    Ort::Value conf_tensor = Ort::Value::CreateTensor<float>(
+        allocator, &conf_thr, 1, std::array<int64_t,1>{1}.data(), 1);
+
+    Ort::Value maxdet_tensor = Ort::Value::CreateTensor<int64_t>(
+        allocator, &max_det, 1, std::array<int64_t,1>{1}.data(), 1);
+
+    Ort::Value iou_tensor = Ort::Value::CreateTensor<float>(
+        allocator, &iou_thr, 1, std::array<int64_t,1>{1}.data(), 1);
+
+    const char* input_names[] = {
+        "image",
+        "conf_threshold",
+        "max_detections",
+        "iou_threshold"
     };
 
-    auto output_tensors = yolo_session->Run(
+    const char* output_names[] = {"selectedBoxes"};
+
+    auto output = yolo_session->Run(
         Ort::RunOptions{nullptr},
-        input_names, &input_tensor, 1,
-        output_names, 3
+        input_names,
+        (const Ort::Value*[]) { &img_tensor, &conf_tensor, &maxdet_tensor, &iou_tensor },
+        4,
+        output_names,
+        1
     );
 
-    // Use BlazeFace NMS output
-    float* selected = output_tensors[2].GetTensorMutableData<float>();
+    // Parse selectedBoxes
+    auto& boxes_tensor = output[0];
+    auto info = boxes_tensor.GetTensorTypeAndShapeInfo();
+    auto shape = info.GetShape();
 
-    auto shape = output_tensors[2]
-        .GetTensorTypeAndShapeInfo()
-        .GetShape();
+    int num_boxes = shape[1]; // 896
+    int fields = shape[2];    // 16
 
-    int num_selected = shape[1];   // N detections
-    int fields = shape[2];         // 16 fields per detection
+    const float* data = boxes_tensor.GetTensorData<float>();
 
-    for (int i = 0; i < num_selected; i++) {
-        float* det = selected + i * fields;
+    for (int i = 0; i < num_boxes; i++) {
+        float score = data[i * fields + 4];
+        if (score < 0.5f) continue;
 
-        float y1 = det[0];
-        float x1 = det[1];
-        float y2 = det[2];
-        float x2 = det[3];
+        float xmin = data[i * fields + 0] * frame.cols;
+        float ymin = data[i * fields + 1] * frame.rows;
+        float xmax = data[i * fields + 2] * frame.cols;
+        float ymax = data[i * fields + 3] * frame.rows;
 
-        int X1 = x1 * img320.cols;
-        int Y1 = y1 * img320.rows;
-        int X2 = x2 * img320.cols;
-        int Y2 = y2 * img320.rows;
-
-        boxes.emplace_back(
-            X1,
-            Y1,
-            X2 - X1,
-            Y2 - Y1
-        );
+        result.boxes.push_back({xmin, ymin, xmax, ymax});
     }
 
-    return boxes;
+    result.person_count = result.boxes.size();
+    return result;
 }
+
 
 
 extern "C" DetectionResult process_frame(
