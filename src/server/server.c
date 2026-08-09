@@ -61,8 +61,15 @@ static long cached_mem = -1;
 static float cached_cpu = 0;
 static pthread_mutex_t telemetry_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int current_interval_ms = 100;
-static int guard_enabled = 0;  // SINGLE declaration at file scope
+static int guard_enabled = 0;
 static int mqtt_initialized = 0;
+
+// ============================================================
+// NEW: Global person count (single source of truth)
+// ============================================================
+static int g_person_count = 0;
+static time_t g_last_detection_time = 0;
+static pthread_mutex_t person_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void trim(char *str) {
     char *start = str;
@@ -199,27 +206,6 @@ static float read_temp(void) {
         }
         fclose(f);
     }
-
-    f = fopen("/mnt/d/Users/ASUS/Documents/Virtual Machines/shared/cpu.txt", "r");
-    if (f) {
-        float t = -1;
-        if (fscanf(f, "%f", &t) == 1) {
-            fclose(f);
-            return t;
-        }
-        fclose(f);
-    }
-
-    f = fopen("/mnt/hgfs/shared/cpu.txt", "r");
-    if (f) {
-        float t = -1;
-        if (fscanf(f, "%f", &t) == 1) {
-            fclose(f);
-            return t;
-        }
-        fclose(f);
-    }
-
     return -1;
 }
 
@@ -280,7 +266,7 @@ static void *telemetry_updater(void *arg) {
     return NULL;
 }
 
-void add_history(int count, float temp, const unsigned char *frame, size_t frame_len)
+void add_history(int count, float temp)
 {
     pthread_mutex_lock(&history_mutex);
     if (history_count >= g_max_history) {
@@ -293,67 +279,64 @@ void add_history(int count, float temp, const unsigned char *frame, size_t frame
     history_count++;
     history_db_add(count, temp);
     pthread_mutex_unlock(&history_mutex);
-    
-    // ALWAYS publish person count
-    if (mqtt_initialized) {
-        mqtt_publish_persons(count, temp);
-    }
-    
-    // Only send alerts if guard mode is enabled
-    if (guard_enabled && count > 0) {
-        time_t now = time(NULL);
-        static time_t last_alert_time = 0;
-        static int last_alert_count = 0;
-        
-        int should_alert = 0;
-        if (now - last_alert_time >= 30) {
-            should_alert = 1;
-        } else if (count != last_alert_count) {
-            should_alert = 1;
-        }
-        
-        if (should_alert) {
-            last_alert_time = now;
-            last_alert_count = count;
-            
-            // Use the frame passed to this function
-            unsigned char *frame_copy = NULL;
-            size_t copy_len = 0;
-            
-            if (frame && frame_len > 0) {
-                // Verify JPEG header
-                if (frame[0] == 0xFF && frame[1] == 0xD8) {
-                    frame_copy = malloc(frame_len);
-                    if (frame_copy) {
-                        memcpy(frame_copy, frame, frame_len);
-                        copy_len = frame_len;
-                        printf("[EMAIL] Using frame from detection: %zu bytes\n", copy_len);
-                    }
-                } else {
-                    printf("[EMAIL] ⚠️ Invalid JPEG header in provided frame\n");
-                }
-            }
-            
-            // Send email with frame
-            if (frame_copy && copy_len > 0) {
-                email_send_alert(count, temp, frame_copy, copy_len);
-                free(frame_copy);
-            } else {
-                printf("[EMAIL] No valid frame, sending without attachment\n");
-                email_send_alert(count, temp, NULL, 0);
-            }
-            
-            if (mqtt_initialized) {
-                mqtt_publish_alarm(count, temp);
-            }
-            
-            printf("[ALERT] %d person(s) detected, temp: %.1f°C\n", count, temp);
-        } else {
-            printf("[DEBOUNCE] Alert suppressed: %d person(s), next in %lds\n",
-                   count, 30 - (now - last_alert_time));
-        }
-    }
 }
+
+static void send_email_alert(int count, float temp, const unsigned char *frame, size_t frame_len)
+{
+    if (!guard_enabled || count <= 0) {
+        return;
+    }
+    
+    time_t now = time(NULL);
+    static time_t last_email_time = 0;
+    static int last_email_count = 0;
+    
+    // Debounce: at most 1 email per 30 seconds
+    if (now - last_email_time < 30) {
+        printf("[DEBOUNCE] Alert suppressed, next in %lds\n", 
+               30 - (now - last_email_time));
+        return;
+    }
+    
+    // Only send if count changed or enough time passed
+    if (count == last_email_count && (now - last_email_time) < 60) {
+        return;
+    }
+    
+    last_email_time = now;
+    last_email_count = count;
+    
+    // Copy frame for email
+    unsigned char *frame_copy = NULL;
+    size_t copy_len = 0;
+    
+    if (frame && frame_len > 0 && frame[0] == 0xFF && frame[1] == 0xD8) {
+        frame_copy = malloc(frame_len);
+        if (frame_copy) {
+            memcpy(frame_copy, frame, frame_len);
+            copy_len = frame_len;
+            printf("[EMAIL] Using frame: %zu bytes\n", copy_len);
+        }
+    } else {
+        printf("[EMAIL] No valid frame provided\n");
+    }
+    
+    // Send email
+    if (frame_copy && copy_len > 0) {
+        email_send_alert(count, temp, frame_copy, copy_len);
+        free(frame_copy);
+    } else {
+        email_send_alert(count, temp, NULL, 0);
+    }
+    
+    // Publish alarm to MQTT
+    if (mqtt_initialized) {
+        mqtt_publish_alarm(count, temp);
+    }
+    
+    printf("[ALERT] Email sent: %d person(s), temp: %.1f°C\n", count, temp);
+}
+
 
 void *frame_updater(void *arg) {
     (void)arg;
@@ -368,7 +351,11 @@ void *frame_updater(void *arg) {
         if (len > 0 && buf[0] == 0xFF && buf[1] == 0xD8) {
             DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
             
-            // Update current_frame for streaming
+            pthread_mutex_lock(&person_mutex);
+            g_person_count = res.person_count;
+            g_last_detection_time = time(NULL);
+            pthread_mutex_unlock(&person_mutex);
+            
             pthread_mutex_lock(&frame_mutex);
             size_t copy_len = res.jpeg_length;
             if (copy_len > BUFFER_SIZE) copy_len = BUFFER_SIZE;
@@ -377,6 +364,23 @@ void *frame_updater(void *arg) {
                 current_len = copy_len;
             }
             pthread_mutex_unlock(&frame_mutex);
+            
+            if (res.person_count > 0) {
+                pthread_mutex_lock(&telemetry_mutex);
+                float temp = cached_temp;
+                pthread_mutex_unlock(&telemetry_mutex);
+                
+                // Add to history (with the original frame for the image)
+                add_history(res.person_count, temp);
+                
+                // Send email alert (separate function)
+                send_email_alert(res.person_count, temp, buf, len);
+                
+                // Publish to MQTT (persons topic)
+                if (mqtt_initialized) {
+                    mqtt_publish_persons(res.person_count, temp);
+                }
+            }
             
             free_detection_result(&res);
         }
@@ -603,48 +607,35 @@ static void *handle_https_thread(void *arg) {
         return NULL;
     }
 
-    // GET /api/v1/persons
-if (strcmp(path, "/api/v1/persons") == 0) {
-    unsigned char buf[BUFFER_SIZE];
-    size_t len = shared_frame_read(g_frame, buf, BUFFER_SIZE);
-    
-    int count = 0;
-    if (len > 0) {
-        DetectionResult res = process_frame(buf, len, g_frame_width, g_frame_height);
-        count = res.person_count;
-        
-        pthread_mutex_lock(&telemetry_mutex);
-        float temp = cached_temp;
-        pthread_mutex_unlock(&telemetry_mutex);
-        
-        if (count > 0) {
-            // Pass the SAME frame (buf) to add_history
-            add_history(count, temp, buf, len);
-        }
-        
-        free_detection_result(&res);
+    // ============================================================
+    // GET /api/v1/persons - Just return the global count
+    // ============================================================
+    if (strcmp(path, "/api/v1/persons") == 0) {
+        int count = 0;
+        pthread_mutex_lock(&person_mutex);
+        count = g_person_count;
+        pthread_mutex_unlock(&person_mutex);
+
+        char json[128];
+        snprintf(json, sizeof(json),
+                 "{\"count\":%d,\"timestamp\":%ld}",
+                 count, time(NULL));
+
+        char header[512];
+        snprintf(header, sizeof(header),
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: %zu\r\n"
+            "Cache-Control: no-cache\r\n"
+            "Connection: close\r\n"
+            "\r\n%s",
+            strlen(json), json);
+
+        SSL_write(ssl, header, strlen(header));
+        SSL_free(ssl);
+        close(fd);
+        return NULL;
     }
-
-    char json[128];
-    snprintf(json, sizeof(json),
-             "{\"count\":%d,\"timestamp\":%ld}",
-             count, time(NULL));
-
-    char header[512];
-    snprintf(header, sizeof(header),
-        "HTTP/1.1 200 OK\r\n"
-        "Content-Type: application/json\r\n"
-        "Content-Length: %zu\r\n"
-        "Cache-Control: no-cache\r\n"
-        "Connection: close\r\n"
-        "\r\n%s",
-        strlen(json), json);
-
-    SSL_write(ssl, header, strlen(header));
-    SSL_free(ssl);
-    close(fd);
-    return NULL;
-}
 
     // GET /api/v1/history
     if (strcmp(path, "/api/v1/history") == 0) {
