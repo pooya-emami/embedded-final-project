@@ -28,7 +28,7 @@ static std::vector<std::string> input_names_str;
 static std::vector<std::string> output_names_str;
 
 // BlazeFace configuration
-static const float CONF_THRESH = 0.5f;
+static const float CONF_THRESH = 0.1f;
 static const float IOU_THRESH = 0.3f;
 static const int MAX_DET = 25;
 static const int INPUT_SIZE = 128;  // BlazeFace expects 128x128
