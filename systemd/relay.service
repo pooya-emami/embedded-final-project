@@ -5,7 +5,7 @@ After=network.target
 [Service]
 Type=simple
 User=pooya
-WorkingDirectory=/home/pooya/embproj/proj
+WorkingDirectory=/home/pooya/embproj/proj/src/relay
 ExecStart=/usr/local/bin/security_relay
 Restart=always
 RestartSec=5

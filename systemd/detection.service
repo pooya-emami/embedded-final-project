@@ -6,7 +6,7 @@ Requires=relay.service
 [Service]
 Type=simple
 User=pooya
-WorkingDirectory=/home/pooya/embproj/proj
+WorkingDirectory=/home/pooya/embproj/proj/src/detection
 ExecStart=/usr/local/bin/detection_server
 Restart=always
 RestartSec=5
