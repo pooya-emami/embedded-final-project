@@ -1,0 +1,21 @@
+=========================================
+Experiment 2-3: 50 Concurrent API Requests
+Student: Pooya Emami (404300409)
+=========================================
+
+Sending 50 concurrent requests for 30 seconds...
+
+
+All 50 concurrent requests completed!
+Total time: 29.590335200 seconds
+
+Sample response:
+{
+    "temp": 77.0,
+    "mem": 3138844,
+    "cpu": 99.47
+}
+
+=========================================
+Experiment 2-3 Complete!
+=========================================
