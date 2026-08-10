@@ -6,16 +6,23 @@
 #include <sys/socket.h>
 #include <pthread.h>
 #include <errno.h>
+#include <signal.h>
 
 #include "mjpeg_relay.h"
-#include "shared_frame.h"
+#include "../common/shared_frame.h"
 
-static shared_frame_t *g_frame;
+static shared_frame_t *g_frame = NULL;
+static volatile int running = 1;
+
+static void signal_handler(int sig) {
+    (void)sig;
+    running = 0;
+}
 
 int find_marker(const unsigned char *buf, size_t len, unsigned char m1, unsigned char m2) {
     for (size_t i = 0; i + 1 < len; i++) {
         if (buf[i] == m1 && buf[i+1] == m2)
-            return i;
+            return (int)i;
     }
     return -1;
 }
@@ -51,29 +58,30 @@ void *receiver_thread(void *arg) {
         return NULL;
     }
 
-    printf("MJPEG relay listening on port %d\n", RELAY_PORT);
+    printf("[RELAY] Listening on port %d\n", RELAY_PORT);
 
     unsigned char buf[RELAY_BUF_SIZE];
     unsigned char jpeg[RELAY_BUF_SIZE];
     size_t jpeg_len = 0;
 
-    while (1) {
+    while (running) {
         client_fd = accept(server_fd, (struct sockaddr*)&addr, &addr_len);
         if (client_fd < 0) {
+            if (!running) break;
             perror("accept");
             continue;
         }
         
-        printf("Client connected from %s:%d\n", 
+        printf("[RELAY] Client connected from %s:%d\n", 
                inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 
         jpeg_len = 0;
 
-        while (1) {
+        while (running) {
             ssize_t n = read(client_fd, buf, RELAY_BUF_SIZE);
             if (n <= 0) {
                 if (n == 0) {
-                    printf("Client closed connection\n");
+                    printf("[RELAY] Client closed connection\n");
                 } else {
                     perror("read");
                 }
@@ -84,7 +92,7 @@ void *receiver_thread(void *arg) {
                 memcpy(jpeg + jpeg_len, buf, n);
                 jpeg_len += n;
             } else {
-                printf("Buffer full, resetting\n");
+                printf("[RELAY] Buffer full, resetting\n");
                 jpeg_len = 0;
                 continue;
             }
@@ -93,8 +101,11 @@ void *receiver_thread(void *arg) {
             int eoi = find_marker(jpeg, jpeg_len, 0xFF, 0xD9);
 
             if (soi >= 0 && eoi > soi) {
-                size_t frame_size = eoi + 2; 
-                shared_frame_write(g_frame, jpeg + soi, frame_size - soi);
+                size_t frame_size = eoi + 2;
+                
+                if (g_frame && g_frame->relay_enabled) {
+                    shared_frame_write(g_frame, jpeg + soi, frame_size - soi);
+                }
 
                 if (frame_size < jpeg_len) {
                     memmove(jpeg, jpeg + frame_size, jpeg_len - frame_size);
@@ -106,21 +117,25 @@ void *receiver_thread(void *arg) {
         }
 
         close(client_fd);
-        printf("Client disconnected\n");
+        printf("[RELAY] Client disconnected\n");
     }
 
+    close(server_fd);
     return NULL;
 }
 
-int main() {
-    printf("Starting MJPEG Relay...\n");
+int main(void) {
+    printf("[RELAY] Starting MJPEG Relay...\n");
+    
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
     
     g_frame = shared_frame_open();
     if (!g_frame) {
-        fprintf(stderr, "Failed to open shared frame buffer\n");
+        fprintf(stderr, "[RELAY] Failed to open shared frame buffer\n");
         return 1;
     }
-    printf("Shared frame buffer opened successfully\n");
+    printf("[RELAY] Shared frame buffer opened successfully\n");
 
     pthread_t tid;
     if (pthread_create(&tid, NULL, receiver_thread, NULL) != 0) {
@@ -128,7 +143,9 @@ int main() {
         return 1;
     }
 
-    printf("Relay thread started. Press Ctrl+C to stop.\n");
+    printf("[RELAY] Relay thread started. Press Ctrl+C to stop.\n");
     pthread_join(tid, NULL);
+    
+    printf("[RELAY] Stopped.\n");
     return 0;
 }

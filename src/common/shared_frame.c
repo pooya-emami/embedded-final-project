@@ -5,7 +5,6 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
-
 #include "shared_frame.h"
 
 static sem_t *g_lock = NULL;
@@ -31,12 +30,15 @@ shared_frame_t *shared_frame_open(void) {
 
     shared_frame_t *sf = mmap(NULL, sizeof(shared_frame_t),
                                PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-    close(fd); /* fd not needed once mapped */
+    close(fd);
 
     if (sf == MAP_FAILED) {
         perror("mmap");
         return NULL;
     }
+
+    sf->relay_enabled = 1;
+    sf->stream_mode = 1;
 
     return sf;
 }

@@ -55,6 +55,11 @@ int main(void) {
     int sleep_us = 33000;
     
     while (running) {
+        if (g_frame && !g_frame->relay_enabled) {
+            usleep(100000);
+            continue;
+        }
+
         unsigned char buf[SHM_FRAME_BUF_SIZE];
         size_t len = shared_frame_read(g_frame, buf, SHM_FRAME_BUF_SIZE);
 

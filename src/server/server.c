@@ -815,58 +815,66 @@ void *watchdog_monitor(void *arg) {
         
         time_t now = time(NULL);
         
-        unsigned char test_buf[SHM_FRAME_BUF_SIZE];
-        size_t test_len = shared_frame_read(g_frame, test_buf, SHM_FRAME_BUF_SIZE);
-        
-        if (test_len > 0 && test_buf[0] == 0xFF && test_buf[1] == 0xD8) {
-            if (!first_frame_received) {
-                memcpy(prev_frame, test_buf, test_len);
-                prev_frame_len = test_len;
-                last_frame_time = now;
-                frame_stuck_count = 0;
-                first_frame_received = 1;
-            } else if (test_len != prev_frame_len || memcmp(test_buf, prev_frame, test_len) != 0) {
-                memcpy(prev_frame, test_buf, test_len);
-                prev_frame_len = test_len;
-                last_frame_time = now;
-                frame_stuck_count = 0;
-                
-                if (watchdog_alert_sent && !camera_restored_alert_sent) {
-                    camera_restored_alert_sent = 1;
-                    watchdog_alert_sent = 0;
-                    send_watchdog_alert("restored");
-                    printf("[WATCHDOG] Camera restored!\n");
+        if (stream_mode != 0) {
+            unsigned char test_buf[SHM_FRAME_BUF_SIZE];
+            size_t test_len = shared_frame_read(g_frame, test_buf, SHM_FRAME_BUF_SIZE);
+            
+            if (test_len > 0 && test_buf[0] == 0xFF && test_buf[1] == 0xD8) {
+                if (!first_frame_received) {
+                    memcpy(prev_frame, test_buf, test_len);
+                    prev_frame_len = test_len;
+                    last_frame_time = now;
+                    frame_stuck_count = 0;
+                    first_frame_received = 1;
+                } else if (test_len != prev_frame_len || memcmp(test_buf, prev_frame, test_len) != 0) {
+                    memcpy(prev_frame, test_buf, test_len);
+                    prev_frame_len = test_len;
+                    last_frame_time = now;
+                    frame_stuck_count = 0;
+                    
+                    if (watchdog_alert_sent && !camera_restored_alert_sent) {
+                        camera_restored_alert_sent = 1;
+                        watchdog_alert_sent = 0;
+                        send_watchdog_alert("restored");
+                        printf("[WATCHDOG] Camera restored!\n");
+                    }
+                } else {
+                    frame_stuck_count++;
                 }
-            } else {
-                frame_stuck_count++;
             }
-        }
-        
-        if (now - last_frame_time > timeout_seconds) {
-            if (!watchdog_alert_sent) {
-                watchdog_alert_sent = 1;
-                camera_restored_alert_sent = 0;
-                send_watchdog_alert("offline");
-                printf("[WATCHDOG] No frames for %d seconds!\n", timeout_seconds);
-                
-                run_command("systemctl restart relay.service 2>/dev/null &");
-                printf("[WATCHDOG] Relay restart triggered\n");
-                
-                running = 0;
+            
+            if (now - last_frame_time > timeout_seconds) {
+                if (!watchdog_alert_sent) {
+                    watchdog_alert_sent = 1;
+                    camera_restored_alert_sent = 0;
+                    send_watchdog_alert("offline");
+                    printf("[WATCHDOG] No frames for %d seconds!\n", timeout_seconds);
+                    
+                    run_command("systemctl restart relay.service 2>/dev/null &");
+                    printf("[WATCHDOG] Relay restart triggered\n");
+                    
+                    running = 0;
+                }
             }
-        }
-        else if (frame_stuck_count > 100) {
-            if (!watchdog_alert_sent) {
-                watchdog_alert_sent = 1;
-                camera_restored_alert_sent = 0;
-                send_watchdog_alert("stuck");
-                printf("[WATCHDOG] Camera STUCK! %d frames unchanged\n", frame_stuck_count);
-                
-                run_command("systemctl restart relay.service 2>/dev/null &");
-                printf("[WATCHDOG] Relay restart triggered\n");
-                
-                running = 0;
+            else if (frame_stuck_count > 100) {
+                if (!watchdog_alert_sent) {
+                    watchdog_alert_sent = 1;
+                    camera_restored_alert_sent = 0;
+                    send_watchdog_alert("stuck");
+                    printf("[WATCHDOG] Camera STUCK! %d frames unchanged\n", frame_stuck_count);
+                    
+                    run_command("systemctl restart relay.service 2>/dev/null &");
+                    printf("[WATCHDOG] Relay restart triggered\n");
+                    
+                    running = 0;
+                }
             }
+        } else {
+            // Idle mode - reset watchdog state
+            watchdog_alert_sent = 0;
+            camera_restored_alert_sent = 0;
+            frame_stuck_count = 0;
+            first_frame_received = 0;
         }
         
         pthread_mutex_unlock(&watchdog_mutex);
@@ -1129,28 +1137,48 @@ static void *handle_https_thread(void *arg) {
             char *body = strstr(req, "\r\n\r\n");
             if (body) {
                 body += 4;
-                pthread_mutex_lock(&watchdog_mutex);
+                pthread_mutex_lock(&frame_mutex);
+                
                 if (strstr(body, "\"mode\":\"idle\"")) {
                     stream_mode = 0;
                     no_detection_frame_count = 0;
                     last_person_count = 0;
                     active_detection_event = 0;
-                    printf("[STREAM] Mode set to: IDLE (OFF)\n");
+                    
+                    if (g_frame) {
+                        g_frame->relay_enabled = 0;
+                        g_frame->stream_mode = 0;
+                    }
+                    printf("[STREAM] Mode set to: IDLE (OFF) - Relay disabled\n");
+                    
                 } else if (strstr(body, "\"mode\":\"raw\"")) {
                     stream_mode = 1;
                     no_detection_frame_count = 0;
                     last_person_count = 0;
                     active_detection_event = 0;
-                    printf("[STREAM] Mode set to: RAW\n");
+                    
+                    if (g_frame) {
+                        g_frame->relay_enabled = 1;
+                        g_frame->stream_mode = 1;
+                    }
+                    printf("[STREAM] Mode set to: RAW - Relay enabled\n");
+                    
                 } else if (strstr(body, "\"mode\":\"processed\"")) {
                     stream_mode = 2;
                     no_detection_frame_count = 0;
                     last_person_count = 0;
                     active_detection_event = 0;
-                    printf("[STREAM] Mode set to: PROCESSED\n");
+                    
+                    if (g_frame) {
+                        g_frame->relay_enabled = 1;
+                        g_frame->stream_mode = 2;
+                    }
+                    printf("[STREAM] Mode set to: PROCESSED - Relay enabled\n");
                 }
-                pthread_mutex_unlock(&watchdog_mutex);
+                
+                pthread_mutex_unlock(&frame_mutex);
             }
+            
             const char *mode_str = stream_mode == 0 ? "idle" : (stream_mode == 1 ? "raw" : "processed");
             char resp[256];
             snprintf(resp, sizeof(resp),
@@ -1201,12 +1229,24 @@ static void *handle_https_thread(void *arg) {
                 body += 4;
                 if (strstr(body, "\"enabled\":true")) {
                     guard_enabled = 1;
+                    
+                    // Auto-switch to processed mode if not already
+                    if (stream_mode != 2) {
+                        stream_mode = 2;
+                        if (g_frame) {
+                            g_frame->relay_enabled = 1;
+                            g_frame->stream_mode = 2;
+                        }
+                        printf("[GUARD] Guard enabled - auto-switched to PROCESSED mode\n");
+                    }
+                    
                     pthread_mutex_lock(&watchdog_mutex);
                     active_detection_event = 0;
                     no_detection_frame_count = 0;
                     last_person_count = 0;
                     pthread_mutex_unlock(&watchdog_mutex);
                     printf("[GUARD] Guard ENABLED - event state reset\n");
+                    
                 } else if (strstr(body, "\"enabled\":false")) {
                     guard_enabled = 0;
                     printf("[GUARD] Guard DISABLED\n");
