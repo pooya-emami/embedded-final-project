@@ -5,15 +5,41 @@ Student: Pooya Emami (404300409)
 
 Sending 50 concurrent requests for 30 seconds...
 
+Request at 0s: 0m0.122s
+Request at 0s: 0m0.117s
+Request at 0s: 0m0.102s
+Request at 0s: 0m0.076s
+Request at 5s: 0m0.070s
+Request at 5s: 0m0.041s
+Request at 5s: 0m0.051s
+Request at 5s: 0m0.039s
+Request at 5s: 0m0.029s
+Request at 10s: 0m0.050s
+Request at 10s: 0m0.029s
+Request at 10s: 0m0.047s
+Request at 10s: 0m0.066s
+Request at 15s: 0m0.044s
+Request at 15s: 0m0.063s
+Request at 15s: 0m0.026s
+Request at 15s: 0m0.025s
+Request at 15s: 0m0.056s
+Request at 20s: 0m0.018s
+Request at 20s: 0m0.029s
+Request at 20s: 0m0.067s
+Request at 25s: 0m0.095s
+Request at 25s: 0m0.024s
+Request at 25s: 0m0.069s
+Request at 25s: 0m0.078s
+Request at 30s: 0m0.029s
 
 All 50 concurrent requests completed!
-Total time: 29.590335200 seconds
+Total time: 30.003874962 seconds
 
 Sample response:
 {
     "temp": 77.0,
-    "mem": 3138844,
-    "cpu": 99.47
+    "mem": 3126732,
+    "cpu": 99.03
 }
 
 =========================================
