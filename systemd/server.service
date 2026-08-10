@@ -1,7 +1,7 @@
 [Unit]
 Description=Security Server
-After=relay.service detection.service
-Requires=relay.service detection.service
+After=relay.service detection.service mosquitto.service
+Requires=relay.service detection.service mosquitto.service
 
 [Service]
 Type=simple

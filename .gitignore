@@ -50,8 +50,7 @@ pylib/
 lib/
 
 # Test files
-test_*
-*.test
+test/
 
 # Temporary files
 temp/
