@@ -50,7 +50,7 @@ pylib/
 lib/
 
 # Test files
-test/
+pycode/
 
 # Temporary files
 temp/
