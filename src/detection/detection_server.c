@@ -25,6 +25,9 @@ static void signal_handler(int sig) {
 }
 
 int main(void) {
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
     printf("[DETECTION] Starting Detection Service...\n");
     
     signal(SIGINT, signal_handler);

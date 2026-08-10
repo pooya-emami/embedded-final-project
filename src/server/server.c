@@ -1381,6 +1381,9 @@ static SSL_CTX *init_ssl(void) {
 }
 
 int main(void) {
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
     printf("Starting Security Server...\n");
     printf("Config path: %s\n", CONFIG_PATH);
 

@@ -125,6 +125,9 @@ void *receiver_thread(void *arg) {
 }
 
 int main(void) {
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
     printf("[RELAY] Starting MJPEG Relay...\n");
     
     signal(SIGINT, signal_handler);
