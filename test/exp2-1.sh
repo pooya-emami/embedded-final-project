@@ -14,12 +14,10 @@ for i in "${!MODES[@]}"; do
     echo "Mode: ${MODE_NAMES[$i]}"
     echo "========================================="
     
-    # Set mode
     curl -s -X POST https://localhost:8443/api/v1/stream_mode -k \
         -H "Content-Type: application/json" \
         -d "{\"mode\":\"${MODES[$i]}\"}" > /dev/null
     
-    # Record temperature every 30 seconds for 5 minutes (10 samples)
     echo "Recording temperature every 30 seconds for 5 minutes..."
     for j in {1..10}; do
         TEMP=$(curl -s -k https://localhost:8443/api/v1/telemetry | python3 -c "import sys, json; print(json.load(sys.stdin).get('temp', 'N/A'))")
