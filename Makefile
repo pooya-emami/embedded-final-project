@@ -1,7 +1,7 @@
 CC = gcc
 CXX = g++
 SUBDIRS = src/server src/relay src/detection
-SERVICE_FILES = systemd/relay.service systemd/server.service systemd/detection.service
+SERVICE_FILES = systemd/relay.service systemd/server.service systemd/detection.service systemd/swagger.service
 INSTALL_DIR = /usr/local/bin
 
 .PHONY: all clean install uninstall $(SUBDIRS)
