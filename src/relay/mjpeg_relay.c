@@ -4,6 +4,7 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <pthread.h>
 #include <errno.h>
 #include <signal.h>
@@ -72,6 +73,15 @@ void *receiver_thread(void *arg) {
             continue;
         }
         
+        // ============================================================
+        // FIX: Set socket timeout to detect network disconnection
+        // ============================================================
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
         printf("[RELAY] Client connected from %s:%d\n", 
                inet_ntoa(addr.sin_addr), ntohs(addr.sin_port));
 
@@ -79,13 +89,16 @@ void *receiver_thread(void *arg) {
 
         while (running) {
             ssize_t n = read(client_fd, buf, RELAY_BUF_SIZE);
+            
             if (n <= 0) {
                 if (n == 0) {
                     printf("[RELAY] Client closed connection\n");
+                } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    printf("[RELAY] Read timeout - reconnecting...\n");
                 } else {
                     perror("read");
                 }
-                break;
+                break;  // Exit inner loop and wait for new connection
             }
 
             if (jpeg_len + n < RELAY_BUF_SIZE) {
@@ -117,7 +130,7 @@ void *receiver_thread(void *arg) {
         }
 
         close(client_fd);
-        printf("[RELAY] Client disconnected\n");
+        printf("[RELAY] Client disconnected, waiting for new connection...\n");
     }
 
     close(server_fd);
