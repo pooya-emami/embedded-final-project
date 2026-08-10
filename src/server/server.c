@@ -313,6 +313,20 @@ static void add_history_internal(int count, float temp)
     pthread_mutex_unlock(&history_mutex);
 }
 
+static void check_mqtt_connection(void)
+{
+    if (!mqtt_initialized) {
+        // Try to initialize MQTT if not already
+        if (strlen(g_mqtt_host) > 0) {
+            mqtt_init(g_mqtt_host, g_mqtt_port, g_mqtt_user, g_mqtt_pass);
+            mqtt_initialized = 1;
+            printf("[MQTT] Re-initialized with host: %s\n", g_mqtt_host);
+        }
+        return;
+    }
+
+}
+
 static void *telemetry_updater(void *arg) {
     (void)arg;
     
@@ -332,6 +346,8 @@ static void *telemetry_updater(void *arg) {
         cached_mem = read_mem_available();
         cached_cpu = read_cpu_usage();
         pthread_mutex_unlock(&telemetry_mutex);
+
+        check_mqtt_connection();
         
         if (g_processed) {
             processed_frame_t *pf = (processed_frame_t*)g_processed;
