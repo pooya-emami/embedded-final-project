@@ -1,4 +1,4 @@
- #!/bin/bash
+#!/bin/bash
 
 echo "========================================="
 echo "Experiment 2-2: Memory Usage Monitoring"
