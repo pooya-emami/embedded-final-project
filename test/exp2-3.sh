@@ -12,19 +12,34 @@ INTERVAL=5
 
 echo ""
 echo "Sending $CONCURRENT concurrent requests for $DURATION seconds..."
-echo "Each process sends one request every $INTERVAL seconds"
 echo ""
 
 START=$(date +%s.%N)
 END_TIME=$((SECONDS + DURATION))
 
+# Start 50 concurrent curl processes
 for i in $(seq 1 $CONCURRENT); do
     (
         while [ $SECONDS -lt $END_TIME ]; do
-            curl -s -k -w "Process $i: %{time_total} seconds\n" $URL > /dev/null
-            sleep $INTERVAL
+            curl -s -k $URL > /dev/null 2>&1
         done
     ) &
+done
+
+# Sample curl every 5 seconds
+echo ""
+echo "Sample Response Times:"
+echo "Time     | Response Time"
+echo "---------|--------------"
+for i in $(seq 1 $((DURATION / INTERVAL))); do
+    sleep $INTERVAL
+    
+    START_SAMPLE=$(date +%s.%N)
+    curl -s -k $URL > /dev/null 2>&1
+    END_SAMPLE=$(date +%s.%N)
+    ELAPSED=$(echo "$END_SAMPLE - $START_SAMPLE" | bc)
+    
+    echo "$(date +%H:%M:%S) | $(printf "%.4f" $ELAPSED) s"
 done
 
 wait
@@ -32,14 +47,8 @@ wait
 ELAPSED=$(echo "$(date +%s.%N) - $START" | bc)
 
 echo ""
-echo "All requests completed!"
+echo "All $CONCURRENT concurrent requests completed!"
 echo "Total time: ${ELAPSED} seconds"
-echo ""
-
-# Sample response
-echo "Sample response:"
-curl -s -k $URL | python3 -m json.tool
-
 echo ""
 echo "========================================="
 echo "Experiment 2-3 Complete!"
