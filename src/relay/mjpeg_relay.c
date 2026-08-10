@@ -73,9 +73,6 @@ void *receiver_thread(void *arg) {
             continue;
         }
         
-        // ============================================================
-        // FIX: Set socket timeout to detect network disconnection
-        // ============================================================
         struct timeval tv;
         tv.tv_sec = 5;
         tv.tv_usec = 0;
@@ -98,7 +95,7 @@ void *receiver_thread(void *arg) {
                 } else {
                     perror("read");
                 }
-                break;  // Exit inner loop and wait for new connection
+                break;
             }
 
             if (jpeg_len + n < RELAY_BUF_SIZE) {
