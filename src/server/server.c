@@ -870,7 +870,6 @@ void *watchdog_monitor(void *arg) {
                 }
             }
         } else {
-            // Idle mode - reset watchdog state
             watchdog_alert_sent = 0;
             camera_restored_alert_sent = 0;
             frame_stuck_count = 0;

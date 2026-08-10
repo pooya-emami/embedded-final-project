@@ -55,7 +55,7 @@ int main(void) {
     int sleep_us = 33000;
     
     while (running) {
-        if (g_frame && !g_frame->relay_enabled) {
+        if (!g_frame || !g_frame->relay_enabled || g_frame->stream_mode != 2) {
             usleep(100000);
             continue;
         }
