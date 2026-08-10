@@ -5,12 +5,10 @@ After=network.target
 [Service]
 Type=simple
 User=pooya
-WorkingDirectory=/home/pooya/embproj/proj/src/relay
-ExecStart=/usr/local/bin/mjpeg_relay
+WorkingDirectory=/home/pooya/embproj/proj
+ExecStart=/usr/local/bin/security_relay
 Restart=always
 RestartSec=5
-StandardOutput=journal
-StandardError=journal
 
 [Install]
 WantedBy=multi-user.target

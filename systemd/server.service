@@ -1,13 +1,13 @@
 [Unit]
-Description=Embedded Web Server
+Description=Security Server
 After=relay.service detection.service
 Requires=relay.service detection.service
 
 [Service]
 Type=simple
 User=pooya
-WorkingDirectory=/home/pooya/embproj/proj/src/server
-ExecStart=/usr/local/bin/server
+WorkingDirectory=/home/pooya/embproj/proj
+ExecStart=/usr/local/bin/security_server
 Restart=always
 RestartSec=5
 StandardOutput=journal
