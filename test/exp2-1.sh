@@ -1,6 +1,7 @@
 <<<<<<< HEAD
 #!/bin/bash
 
+
 echo "========================================="
 echo "Experiment 2-1: Temperature Monitoring"
 echo "Student: Pooya Emami (404300409)"
