@@ -17,16 +17,13 @@ echo ""
 START=$(date +%s.%N)
 END_TIME=$((SECONDS + DURATION))
 
-# Main while loop for 30 seconds
 while [ $SECONDS -lt $END_TIME ]; do
-    # Start 50 concurrent curl processes
     for i in $(seq 1 $CONCURRENT); do
         (
             curl -s -k $URL > /dev/null 2>&1
         ) &
     done
     
-    # Check if 5 seconds have passed, then measure time for one request
     if [ $((SECONDS % INTERVAL)) -eq 0 ]; then
         echo -n "Request at ${SECONDS}s: "
         { time curl -s -k $URL > /dev/null 2>&1; } 2>&1 | grep real | awk '{print $2}'

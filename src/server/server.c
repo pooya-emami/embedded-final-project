@@ -911,452 +911,79 @@ void send_redirect(int fd, const char *host_header) {
     send(fd, msg, strlen(msg), 0);
 }
 
-static void *handle_https_thread(void *arg) {
-    int fd = *(int*)arg;
-    free(arg);
-
-    int nodelay = 1;
-    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &nodelay, sizeof(nodelay));
-
-    SSL *ssl = SSL_new(ssl_ctx);
-    SSL_set_fd(ssl, fd);
-
-    if (SSL_accept(ssl) <= 0) {
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    char req[4096];
-    int n = SSL_read(ssl, req, sizeof(req) - 1);
-    if (n <= 0) {
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    req[n] = '\0';
-
-    char method[16], path[256];
-    sscanf(req, "%15s %255s", method, path);
-
-    char *q = strchr(path, '?');
-    if (q) *q = '\0';
-
-    // GET /
-    if (strcmp(path, "/") == 0) {
-        if (html_cache) {
-            char header[512];
-            snprintf(header, sizeof(header),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: text/html\r\n"
-                "Content-Length: %zu\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Connection: close\r\n"
-                "\r\n",
-                strlen(html_cache));
-
-            SSL_write(ssl, header, strlen(header));
-            SSL_write(ssl, html_cache, strlen(html_cache));
-        }
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // GET /stream or /api/v1/stream
-    if (strcmp(path, "/stream") == 0 || strcmp(path, "/api/v1/stream") == 0) {
-        handle_mjpeg_stream(ssl);
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // GET /raw_stream
-    if (strcmp(path, "/raw_stream") == 0) {
-        int saved_mode = stream_mode;
-        stream_mode = 1;
-        handle_mjpeg_stream(ssl);
-        stream_mode = saved_mode;
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // GET /snapshot or /api/v1/snapshot
-    if (strcmp(path, "/snapshot") == 0 || strcmp(path, "/api/v1/snapshot") == 0) {
-        pthread_mutex_lock(&frame_mutex);
-        size_t len = current_len;
-        unsigned char *copy = NULL;
-        if (len > 0) {
-            copy = malloc(len);
-            if (copy) memcpy(copy, current_frame, len);
-        }
-        pthread_mutex_unlock(&frame_mutex);
-
-        if (copy && len > 0) {
-            char header[256];
-            snprintf(header, sizeof(header),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: image/jpeg\r\n"
-                "Content-Length: %zu\r\n"
-                "Cache-Control: no-cache\r\n"
-                "Connection: close\r\n"
-                "\r\n",
-                len);
-            SSL_write(ssl, header, strlen(header));
-            SSL_write(ssl, copy, len);
-            free(copy);
-        }
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // GET /telemetry or /api/v1/telemetry
-    if (strcmp(path, "/telemetry") == 0 || strcmp(path, "/api/v1/telemetry") == 0) {
-        pthread_mutex_lock(&telemetry_mutex);
-        float temp = cached_temp;
-        long mem = cached_mem;
-        float cpu = cached_cpu;
-        pthread_mutex_unlock(&telemetry_mutex);
-
-        char json[256];
-        snprintf(json, sizeof(json),
-                 "{\"temp\":%.2f,\"mem\":%ld,\"cpu\":%.2f}",
-                 temp, mem, cpu);
-
-        char header[512];
-        snprintf(header, sizeof(header),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: %zu\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: close\r\n"
-            "\r\n%s",
-            strlen(json), json);
-
-        SSL_write(ssl, header, strlen(header));
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // GET /api/v1/persons
-    if (strcmp(path, "/api/v1/persons") == 0) {
-        int count = 0;
-        pthread_mutex_lock(&person_mutex);
-        count = g_person_count;
-        pthread_mutex_unlock(&person_mutex);
-
-        char json[128];
-        snprintf(json, sizeof(json),
-                 "{\"count\":%d,\"timestamp\":%ld}",
-                 count, time(NULL));
-
-        char header[512];
-        snprintf(header, sizeof(header),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: %zu\r\n"
-            "Cache-Control: no-cache\r\n"
-            "Connection: close\r\n"
-            "\r\n%s",
-            strlen(json), json);
-
-        SSL_write(ssl, header, strlen(header));
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // GET /api/v1/history
-    if (strcmp(path, "/api/v1/history") == 0) {
-        history_record_t *records = malloc(sizeof(history_record_t) * g_max_history);
-        int n = history_db_get_last(records, g_max_history);
-
-        char json[2048];
-        char *p = json;
-        p += sprintf(p, "{\"history\":[");
-
-        for (int i = 0; i < n; i++) {
-            p += sprintf(p,
-                "{\"count\":%d,\"temp\":%.2f,\"timestamp\":%ld}",
-                records[i].count,
-                records[i].temp,
-                records[i].timestamp
-            );
-            if (i < n - 1) p += sprintf(p, ",");
-        }
-
-        p += sprintf(p, "]}");
-        free(records);
-
-        char header[4096];
-        snprintf(header, sizeof(header),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: %zu\r\n"
-            "Connection: close\r\n"
-            "\r\n%s",
-            strlen(json), json);
-
-        SSL_write(ssl, header, strlen(header));
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // GET /api/v1/history_total
-    if (strcmp(path, "/api/v1/history_total") == 0) {
-        long total = history_db_total();
-
-        char json[128];
-        snprintf(json, sizeof(json),
-                 "{\"total\":%ld}", total);
-
-        char header[256];
-        snprintf(header, sizeof(header),
-            "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Content-Length: %zu\r\n"
-            "Connection: close\r\n"
-            "\r\n%s",
-            strlen(json), json);
-
-        SSL_write(ssl, header, strlen(header));
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // POST /api/v1/stream_mode
-    if (strcmp(path, "/api/v1/stream_mode") == 0) {
-        if (strcmp(method, "POST") == 0) {
-            char *body = strstr(req, "\r\n\r\n");
-            if (body) {
-                body += 4;
-                pthread_mutex_lock(&frame_mutex);
-                
-                if (strstr(body, "\"mode\":\"idle\"")) {
-                    stream_mode = 0;
-                    no_detection_frame_count = 0;
-                    last_person_count = 0;
-                    active_detection_event = 0;
+// POST /api/v1/command
+if (strcmp(path, "/api/v1/command") == 0) {
+    if (strcmp(method, "POST") == 0) {
+        char *body = strstr(req, "\r\n\r\n");
+        char json_resp[256];
+        
+        if (body) {
+            body += 4;
+            char *cmd_start = strstr(body, "\"cmd\":\"");
+            if (cmd_start) {
+                cmd_start += 7;
+                char *cmd_end = strchr(cmd_start, '"');
+                if (cmd_end) {
+                    *cmd_end = '\0';
+                    char command[64];
+                    strncpy(command, cmd_start, sizeof(command) - 1);
+                    command[sizeof(command) - 1] = '\0';
                     
-                    if (g_frame) {
-                        g_frame->relay_enabled = 0;
-                        g_frame->stream_mode = 0;
+                    if (strcmp(command, "reboot") == 0) {
+                        printf("[CMD] Executing reboot\n");
+                        snprintf(json_resp, sizeof(json_resp),
+                                 "{\"status\":\"success\",\"cmd\":\"reboot\"}");
+                        if (fork() == 0) {
+                            run_command("shutdown -r now");
+                            exit(0);
+                        }
+                    } else if (strcmp(command, "shutdown") == 0) {
+                        printf("[CMD] Executing shutdown\n");
+                        snprintf(json_resp, sizeof(json_resp),
+                                 "{\"status\":\"success\",\"cmd\":\"shutdown\"}");
+                        if (fork() == 0) {
+                            run_command("shutdown -h now");
+                            exit(0);
+                        }
+                    } else {
+                        snprintf(json_resp, sizeof(json_resp),
+                                 "{\"status\":\"success\",\"cmd\":\"%s\"}", command);
                     }
-                    printf("[STREAM] Mode set to: IDLE (OFF) - Relay disabled\n");
                     
-                } else if (strstr(body, "\"mode\":\"raw\"")) {
-                    stream_mode = 1;
-                    no_detection_frame_count = 0;
-                    last_person_count = 0;
-                    active_detection_event = 0;
-                    
-                    if (g_frame) {
-                        g_frame->relay_enabled = 1;
-                        g_frame->stream_mode = 1;
-                    }
-                    printf("[STREAM] Mode set to: RAW - Relay enabled\n");
-                    
-                } else if (strstr(body, "\"mode\":\"processed\"")) {
-                    stream_mode = 2;
-                    no_detection_frame_count = 0;
-                    last_person_count = 0;
-                    active_detection_event = 0;
-                    
-                    if (g_frame) {
-                        g_frame->relay_enabled = 1;
-                        g_frame->stream_mode = 2;
-                    }
-                    printf("[STREAM] Mode set to: PROCESSED - Relay enabled\n");
+                    char header[512];
+                    snprintf(header, sizeof(header),
+                        "HTTP/1.1 200 OK\r\n"
+                        "Content-Type: application/json\r\n"
+                        "Content-Length: %zu\r\n"
+                        "Connection: close\r\n"
+                        "\r\n%s",
+                        strlen(json_resp), json_resp);
+                    SSL_write(ssl, header, strlen(header));
+                    SSL_free(ssl);
+                    close(fd);
+                    return NULL;
                 }
-                
-                pthread_mutex_unlock(&frame_mutex);
             }
-            
-            const char *mode_str = stream_mode == 0 ? "idle" : (stream_mode == 1 ? "raw" : "processed");
-            char resp[256];
-            snprintf(resp, sizeof(resp),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/json\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "{\"mode\":\"%s\"}",
-                mode_str);
-            SSL_write(ssl, resp, strlen(resp));
-        } else {
-            const char *resp = 
-                "HTTP/1.1 405 Method Not Allowed\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: 36\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "{\"error\":\"Method not allowed\"}";
-            SSL_write(ssl, resp, strlen(resp));
         }
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // GET /api/v1/stream_mode
-    if (strcmp(path, "/api/v1/stream_mode") == 0) {
-        const char *mode_str = stream_mode == 0 ? "idle" : (stream_mode == 1 ? "raw" : "processed");
-        char resp[256];
-        snprintf(resp, sizeof(resp),
-            "HTTP/1.1 200 OK\r\n"
+        
+        const char *resp = 
+            "HTTP/1.1 400 Bad Request\r\n"
             "Content-Type: application/json\r\n"
+            "Content-Length: 42\r\n"
             "Connection: close\r\n"
             "\r\n"
-            "{\"mode\":\"%s\"}",
-            mode_str);
+            "{\"error\":\"Invalid or missing command\"}";
         SSL_write(ssl, resp, strlen(resp));
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
+    } else {
+        const char *resp = 
+            "HTTP/1.1 405 Method Not Allowed\r\n"
+            "Content-Type: application/json\r\n"
+            "Content-Length: 36\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+            "{\"error\":\"Method not allowed\"}";
+        SSL_write(ssl, resp, strlen(resp));
     }
-
-    // POST /api/v1/guard
-    if (strcmp(path, "/api/v1/guard") == 0) {
-        if (strcmp(method, "POST") == 0) {
-            char *body = strstr(req, "\r\n\r\n");
-            if (body) {
-                body += 4;
-                if (strstr(body, "\"enabled\":true")) {
-                    guard_enabled = 1;
-                    
-                    // Auto-switch to processed mode if not already
-                    if (stream_mode != 2) {
-                        stream_mode = 2;
-                        if (g_frame) {
-                            g_frame->relay_enabled = 1;
-                            g_frame->stream_mode = 2;
-                        }
-                        printf("[GUARD] Guard enabled - auto-switched to PROCESSED mode\n");
-                    }
-                    
-                    pthread_mutex_lock(&watchdog_mutex);
-                    active_detection_event = 0;
-                    no_detection_frame_count = 0;
-                    last_person_count = 0;
-                    pthread_mutex_unlock(&watchdog_mutex);
-                    printf("[GUARD] Guard ENABLED - event state reset\n");
-                    
-                } else if (strstr(body, "\"enabled\":false")) {
-                    guard_enabled = 0;
-                    printf("[GUARD] Guard DISABLED\n");
-                }
-            }
-            char resp[256];
-            snprintf(resp, sizeof(resp),
-                "HTTP/1.1 200 OK\r\n"
-                "Content-Type: application/json\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "{\"guard_enabled\":%s}",
-                guard_enabled ? "true" : "false");
-            SSL_write(ssl, resp, strlen(resp));
-        } else {
-            const char *resp = 
-                "HTTP/1.1 405 Method Not Allowed\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: 36\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "{\"error\":\"Method not allowed\"}";
-            SSL_write(ssl, resp, strlen(resp));
-        }
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // POST /api/v1/command
-    if (strcmp(path, "/api/v1/command") == 0) {
-        if (strcmp(method, "POST") == 0) {
-            char *body = strstr(req, "\r\n\r\n");
-            char json_resp[256];
-            
-            if (body) {
-                body += 4;
-                char *cmd_start = strstr(body, "\"cmd\":\"");
-                if (cmd_start) {
-                    cmd_start += 7;
-                    char *cmd_end = strchr(cmd_start, '"');
-                    if (cmd_end) {
-                        *cmd_end = '\0';
-                        char command[64];
-                        strncpy(command, cmd_start, sizeof(command) - 1);
-                        command[sizeof(command) - 1] = '\0';
-                        
-                        if (strcmp(command, "reboot") == 0) {
-                            printf("[CMD] Executing reboot\n");
-                            snprintf(json_resp, sizeof(json_resp),
-                                     "{\"status\":\"success\",\"cmd\":\"reboot\"}");
-                            run_command("shutdown -r now &");
-                        } else if (strcmp(command, "shutdown") == 0) {
-                            printf("[CMD] Executing shutdown\n");
-                            snprintf(json_resp, sizeof(json_resp),
-                                     "{\"status\":\"success\",\"cmd\":\"shutdown\"}");
-                            run_command("shutdown -h now &");
-                        } else if (strcmp(command, "restart_detection") == 0) {
-                            printf("[CMD] Restarting detection\n");
-                            snprintf(json_resp, sizeof(json_resp),
-                                     "{\"status\":\"success\",\"cmd\":\"restart_detection\"}");
-                            run_command("systemctl restart detection.service 2>/dev/null &");
-                        } else {
-                            snprintf(json_resp, sizeof(json_resp),
-                                     "{\"status\":\"success\",\"cmd\":\"%s\"}", command);
-                            char sys_cmd[128];
-                            snprintf(sys_cmd, sizeof(sys_cmd), "%s &", command);
-                            run_command(sys_cmd);
-                        }
-                        
-                        char header[512];
-                        snprintf(header, sizeof(header),
-                            "HTTP/1.1 200 OK\r\n"
-                            "Content-Type: application/json\r\n"
-                            "Content-Length: %zu\r\n"
-                            "Connection: close\r\n"
-                            "\r\n%s",
-                            strlen(json_resp), json_resp);
-                        SSL_write(ssl, header, strlen(header));
-                        SSL_free(ssl);
-                        close(fd);
-                        return NULL;
-                    }
-                }
-            }
-            
-            const char *resp = 
-                "HTTP/1.1 400 Bad Request\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: 42\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "{\"error\":\"Invalid or missing command\"}";
-            SSL_write(ssl, resp, strlen(resp));
-        } else {
-            const char *resp = 
-                "HTTP/1.1 405 Method Not Allowed\r\n"
-                "Content-Type: application/json\r\n"
-                "Content-Length: 36\r\n"
-                "Connection: close\r\n"
-                "\r\n"
-                "{\"error\":\"Method not allowed\"}";
-            SSL_write(ssl, resp, strlen(resp));
-        }
-        SSL_free(ssl);
-        close(fd);
-        return NULL;
-    }
-
-    // 404 Not Found
-    SSL_write(ssl, "HTTP/1.1 404 Not Found\r\n\r\n", 26);
     SSL_free(ssl);
     close(fd);
     return NULL;
