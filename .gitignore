@@ -1,0 +1,66 @@
+# Binaries
+server
+relay
+detection_server
+*.o
+*.so
+*.a
+
+# SSL certificates
+cert.pem
+key.pem
+
+# Database
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+.env/
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Logs
+*.log
+*.tmp
+
+# Shared memory
+/dev/shm/guard_*
+
+# Core dumps
+core.*
+*.core
+
+# Virtual environment
+pylib/
+lib/
+
+# Test files
+test_*
+*.test
+
+# Temporary files
+temp/
+tmp/
+*.tmp
+
+# Makefile generated
+.deps/
+.dirstamp
+
+# Systemd service files (if copied)
+*.service
