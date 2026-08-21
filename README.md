@@ -52,8 +52,8 @@ Camera → Relay → Detection → Server → HTTPS API
 ```bash
 # Install dependencies
 sudo apt install -y build-essential cmake git pkg-config \
-    libssl-dev libmosquitto-dev mosquitto libcurl4-openssl-dev \
-    libsqlite3-dev libopencv-dev
+    libssl-dev libmosquitto-dev mosquitto libpaho-mqtt-dev libcurl4-openssl-dev \
+    libsqlite3-dev libopencv-dev 
 
 # Install ONNX Runtime
 cd /tmp && wget https://github.com/microsoft/onnxruntime/releases/download/v1.17.1/onnxruntime-linux-x64-1.17.1.tgz
