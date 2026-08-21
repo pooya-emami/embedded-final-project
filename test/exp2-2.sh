@@ -6,7 +6,7 @@ echo "Student: Pooya Emami (404300409)"
 echo "========================================="
 
 # Get server PID
-PID=$(pgrep -f "security_server|server" | head -1)
+PID=$(pgrep -f "security_server" | head -1)
 
 if [ -z "$PID" ]; then
     echo "Error: Server not running!"
